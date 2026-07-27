@@ -36,6 +36,7 @@ from custom_components.meshnet.const import (  # noqa: E402
     CONF_BLE_ADDRESS,
     CONF_MQTT_TOPIC,
     CONF_SERIAL_PATH,
+    CONF_TRANSPORT,
     PROTOCOL_MESHCORE,
     PROTOCOL_MESHTASTIC,
     TRANSPORT_BLUETOOTH,
