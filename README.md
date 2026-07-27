@@ -55,6 +55,8 @@ radio platform -> connection method -> relevant fields -> connection test -> add
 
 No YAML or gateway JSON is needed. Later, choose **Configure** on the MeshNet integration to add, edit, or remove gateways.
 
+For USB serial, the setup form lists local devices visible to Home Assistant. Choose one from the dropdown, or type an advanced path such as `/dev/serial/by-id/usb-YOUR_RADIO` or a custom container mapping.
+
 ## Pick the easiest connection
 
 | Radio | Connection | When to use it |
@@ -81,7 +83,7 @@ devices:
   - /dev/serial/by-id/usb-YOUR_RADIO:/dev/mesh-radio
 ```
 
-Then enter `/dev/mesh-radio` in MeshNet.
+Then type `/dev/mesh-radio` into MeshNet's USB picker.
 
 For local Bluetooth, Home Assistant Container needs BlueZ on the host plus D-Bus and Bluetooth capabilities:
 

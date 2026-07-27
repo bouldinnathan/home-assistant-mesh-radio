@@ -27,7 +27,7 @@
           "name": "Gateway name",
           "host": "Host name or IP address",
           "port": "TCP port",
-          "serial_path": "Serial device path",
+          "serial_path": "USB device or advanced path",
           "ble_address": "Bluetooth address",
           "mqtt_topic": "MQTT subscribe topic",
           "publish_topic": "MQTT downlink topic (optional)",
@@ -42,7 +42,7 @@
         },
         "data_description": {
           "host": "This address is reached from Home Assistant, which may be inside a container.",
-          "serial_path": "Use the path visible inside Home Assistant. Prefer /dev/serial/by-id when available.",
+          "serial_path": "Choose a detected USB device. For an advanced mapping, type the exact Home Assistant-visible path, such as /dev/serial/by-id/usb-YOUR_RADIO.",
           "ble_address": "Direct SDK Bluetooth requires a local adapter; remote Bluetooth proxies are not supported.",
           "mqtt_topic": "Meshtastic must point to its /json/ topic. MeshCore requires a compatible decoded-JSON bridge.",
           "publish_topic": "For Meshtastic, use the exact .../2/json/mqtt/ downlink topic. Leave blank for receive-only.",
@@ -106,7 +106,7 @@
           "name": "Gateway name",
           "host": "Host name or IP address",
           "port": "TCP port",
-          "serial_path": "Serial device path",
+          "serial_path": "USB device or advanced path",
           "ble_address": "Bluetooth address",
           "mqtt_topic": "MQTT subscribe topic",
           "publish_topic": "MQTT downlink topic (optional)",
@@ -118,6 +118,9 @@
           "debug": "SDK debug logging",
           "pin": "Bluetooth PIN (optional)",
           "verify_connection": "Test before saving"
+        },
+        "data_description": {
+          "serial_path": "Choose a detected local USB device, or type the exact Home Assistant-visible path for an advanced mapping."
         }
       },
       "edit_gateway": {
@@ -133,7 +136,7 @@
           "name": "Gateway name",
           "host": "Host name or IP address",
           "port": "TCP port",
-          "serial_path": "Serial device path",
+          "serial_path": "USB device or advanced path",
           "ble_address": "Bluetooth address",
           "mqtt_topic": "MQTT subscribe topic",
           "publish_topic": "MQTT downlink topic (optional)",
@@ -145,6 +148,9 @@
           "debug": "SDK debug logging",
           "pin": "Bluetooth PIN (optional)",
           "verify_connection": "Test before saving"
+        },
+        "data_description": {
+          "serial_path": "Choose a detected local USB device, or retain or type the exact Home Assistant-visible path for an advanced mapping."
         }
       },
       "remove_gateway": {

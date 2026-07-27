@@ -20,7 +20,7 @@
           "name": "Gateway name",
           "host": "Host name or IP address",
           "port": "TCP port",
-          "serial_path": "Serial device path",
+          "serial_path": "USB device or advanced path",
           "ble_address": "Bluetooth address",
           "mqtt_topic": "MQTT subscribe topic",
           "publish_topic": "MQTT downlink topic (optional)",
@@ -32,6 +32,9 @@
           "debug": "SDK debug logging",
           "pin": "Bluetooth PIN (optional)",
           "verify_connection": "Test before saving"
+        },
+        "data_description": {
+          "serial_path": "Choose a detected USB device. For an advanced mapping, type the exact Home Assistant-visible path, such as /dev/serial/by-id/usb-YOUR_RADIO."
         }
       },
       "more": {
@@ -80,12 +83,15 @@
         "description": "Set up {protocol} using {transport}.",
         "data": {
           "name": "Gateway name", "host": "Host name or IP address", "port": "TCP port",
-          "serial_path": "Serial device path", "ble_address": "Bluetooth address",
+          "serial_path": "USB device or advanced path", "ble_address": "Bluetooth address",
           "mqtt_topic": "MQTT subscribe topic", "publish_topic": "MQTT downlink topic (optional)",
           "mqtt_node_id": "Gateway node number for MQTT sends (optional)", "api_url": "REST state URL",
           "api_key": "API key (optional)", "send_url": "REST send URL (optional)",
           "baudrate": "Serial baud rate", "debug": "SDK debug logging", "pin": "Bluetooth PIN (optional)",
           "verify_connection": "Test before saving"
+        },
+        "data_description": {
+          "serial_path": "Choose a detected local USB device, or type the exact Home Assistant-visible path for an advanced mapping."
         }
       },
       "edit_gateway": { "title": "Edit a gateway", "data": { "gateway": "Gateway" } },
@@ -93,12 +99,15 @@
         "title": "Update the gateway", "description": "Edit {protocol} using {transport}.",
         "data": {
           "name": "Gateway name", "host": "Host name or IP address", "port": "TCP port",
-          "serial_path": "Serial device path", "ble_address": "Bluetooth address",
+          "serial_path": "USB device or advanced path", "ble_address": "Bluetooth address",
           "mqtt_topic": "MQTT subscribe topic", "publish_topic": "MQTT downlink topic (optional)",
           "mqtt_node_id": "Gateway node number for MQTT sends (optional)", "api_url": "REST state URL",
           "api_key": "API key (optional)", "send_url": "REST send URL (optional)",
           "baudrate": "Serial baud rate", "debug": "SDK debug logging", "pin": "Bluetooth PIN (optional)",
           "verify_connection": "Test before saving"
+        },
+        "data_description": {
+          "serial_path": "Choose a detected local USB device, or retain or type the exact Home Assistant-visible path for an advanced mapping."
         }
       },
       "remove_gateway": {

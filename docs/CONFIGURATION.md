@@ -97,7 +97,7 @@ Expected:
 
 ## Meshtastic USB Serial
 
-Prefer stable `/dev/serial/by-id/` paths.
+The GUI lists local USB serial devices visible to Home Assistant. Prefer a stable `/dev/serial/by-id/` selection. If the desired mapping is not listed, type the exact path visible inside Home Assistant.
 
 ```yaml
 meshnet:

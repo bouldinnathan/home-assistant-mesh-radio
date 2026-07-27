@@ -1,5 +1,9 @@
 # Upgrade Guide
 
+## From 0.2.x
+
+0.3.0 adds the USB-device picker and keeps config entry version 1 and SQLite schema version 1, so existing gateway and history data do not need migration.
+
 ## From 0.1.x
 
 0.2.0 keeps config entry version 1 and SQLite schema version 1, so existing gateway and history data do not need migration. Back up `meshnet.sqlite3` before upgrading.

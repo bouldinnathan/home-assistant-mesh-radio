@@ -6,7 +6,7 @@ from typing import Final
 
 DOMAIN: Final = "meshnet"
 NAME: Final = "MeshNet"
-VERSION: Final = "0.2.0"
+VERSION: Final = "0.3.0"
 
 PLATFORMS: Final = ["sensor", "binary_sensor", "device_tracker"]
 

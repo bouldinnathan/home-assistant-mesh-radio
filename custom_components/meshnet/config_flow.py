@@ -6,7 +6,6 @@ import asyncio
 from contextlib import suppress
 from copy import deepcopy
 import json
-import os
 from typing import Any
 
 import voluptuous as vol
@@ -16,6 +15,10 @@ from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT
 from homeassistant.core import callback
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.selector import (
+    SelectOptionDict,
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
     TextSelector,
     TextSelectorConfig,
     TextSelectorType,
@@ -55,6 +58,7 @@ from .const import (
     TRANSPORT_SERIAL,
     TRANSPORT_TCP,
 )
+from .serial_devices import SerialDevice, discover_serial_devices
 
 
 CONF_ACTION = "action"
@@ -159,9 +163,21 @@ class MeshNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             else:
                 self._gateways.append(gateway)
                 return await self.async_step_more()
+        form_defaults = user_input or {}
+        serial_field, serial_default = await _async_serial_field(
+            self.hass,
+            transport=self._transport,
+            current=form_defaults.get(CONF_SERIAL_PATH),
+        )
         return self.async_show_form(
             step_id="gateway",
-            data_schema=_gateway_schema(self._protocol, self._transport),
+            data_schema=_gateway_schema(
+                self._protocol,
+                self._transport,
+                defaults=form_defaults,
+                serial_field=serial_field,
+                serial_default=serial_default,
+            ),
             errors=errors,
             description_placeholders={
                 "protocol": PROTOCOL_LABELS[self._protocol],
@@ -335,9 +351,21 @@ class MeshNetOptionsFlow(config_entries.OptionsFlow):
                 errors["base"] = "cannot_connect"
             else:
                 return self._save(**{CONF_GATEWAYS: gateways})
+        form_defaults = user_input or {}
+        serial_field, serial_default = await _async_serial_field(
+            self.hass,
+            transport=self._transport,
+            current=form_defaults.get(CONF_SERIAL_PATH),
+        )
         return self.async_show_form(
             step_id="add_details",
-            data_schema=_gateway_schema(self._protocol, self._transport),
+            data_schema=_gateway_schema(
+                self._protocol,
+                self._transport,
+                defaults=form_defaults,
+                serial_field=serial_field,
+                serial_default=serial_default,
+            ),
             errors=errors,
             description_placeholders={
                 "protocol": PROTOCOL_LABELS[self._protocol],
@@ -404,10 +432,20 @@ class MeshNetOptionsFlow(config_entries.OptionsFlow):
                 errors["base"] = "cannot_connect"
             else:
                 return self._save(**{CONF_GATEWAYS: updated})
+        form_defaults = user_input or defaults
+        serial_field, serial_default = await _async_serial_field(
+            self.hass,
+            transport=self._transport,
+            current=form_defaults.get(CONF_SERIAL_PATH),
+        )
         return self.async_show_form(
             step_id="edit_details",
             data_schema=_gateway_schema(
-                self._protocol, self._transport, defaults=defaults
+                self._protocol,
+                self._transport,
+                defaults=form_defaults,
+                serial_field=serial_field,
+                serial_default=serial_default,
             ),
             errors=errors,
             description_placeholders={
@@ -538,6 +576,8 @@ def _gateway_schema(
     transport: str,
     *,
     defaults: dict[str, Any] | None = None,
+    serial_field: Any | None = None,
+    serial_default: str | None = None,
 ) -> vol.Schema:
     defaults = defaults or {}
     fields: dict[Any, Any] = {
@@ -561,13 +601,13 @@ def _gateway_schema(
             vol.Coerce(int), vol.Range(min=1, max=65535)
         )
     elif transport in {TRANSPORT_SERIAL, TRANSPORT_NATIVE}:
-        serial_default = defaults.get(CONF_SERIAL_PATH) or _first_serial_path()
+        serial_default = defaults.get(CONF_SERIAL_PATH) or serial_default
         marker = (
             vol.Required(CONF_SERIAL_PATH, default=serial_default)
             if serial_default
             else vol.Required(CONF_SERIAL_PATH)
         )
-        fields[marker] = cv.string
+        fields[marker] = serial_field or TextSelector(TextSelectorConfig())
         if protocol == PROTOCOL_MESHCORE:
             fields[
                 vol.Required(
@@ -649,19 +689,50 @@ def _settings_schema(
     return vol.Schema(fields)
 
 
-def _first_serial_path() -> str | None:
-    """Return the first stable HA-visible serial path, if one exists."""
-    by_id = "/dev/serial/by-id"
-    try:
-        names = sorted(os.listdir(by_id))
-    except OSError:
-        names = []
-    if names:
-        return os.path.join(by_id, names[0])
-    for candidate in ("/dev/ttyACM0", "/dev/ttyUSB0"):
-        if os.path.exists(candidate):
-            return candidate
-    return None
+async def _async_serial_field(
+    hass: Any,
+    *,
+    transport: str,
+    current: str | None = None,
+) -> tuple[Any | None, str | None]:
+    """Build a non-blocking picker containing local USB serial paths."""
+    if transport not in {TRANSPORT_SERIAL, TRANSPORT_NATIVE}:
+        return None, None
+
+    devices = await hass.async_add_executor_job(discover_serial_devices)
+    return _serial_field(devices, current=current)
+
+
+def _serial_field(
+    devices: list[SerialDevice], *, current: str | None = None
+) -> tuple[Any, str | None]:
+    """Build a dropdown that always accepts an advanced manual path."""
+    options = [
+        SelectOptionDict(value=device.path, label=device.label) for device in devices
+    ]
+    detected_paths = {device.path for device in devices}
+    if current and current not in detected_paths:
+        options.insert(
+            0,
+            SelectOptionDict(
+                value=current,
+                label=f"Currently configured (not detected) — {current}",
+            ),
+        )
+
+    default = current or (devices[0].path if devices else None)
+    if not options:
+        return TextSelector(TextSelectorConfig()), default
+    return (
+        SelectSelector(
+            SelectSelectorConfig(
+                options=options,
+                mode=SelectSelectorMode.DROPDOWN,
+                custom_value=True,
+            )
+        ),
+        default,
+    )
 
 
 def _gateway_form_defaults(gateway: dict[str, Any]) -> dict[str, Any]:
