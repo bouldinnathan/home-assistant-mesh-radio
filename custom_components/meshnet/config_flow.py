@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
+import os
 from contextlib import suppress
 from copy import deepcopy
-import json
 from typing import Any
 
+import homeassistant.helpers.config_validation as cv
 import voluptuous as vol
-
 from homeassistant import config_entries
 from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT
 from homeassistant.core import callback
-import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.selector import (
     SelectOptionDict,
     SelectSelector,
@@ -24,6 +25,33 @@ from homeassistant.helpers.selector import (
     TextSelectorType,
 )
 
+from .bluetooth_devices import (
+    BluetoothDevice,
+    async_discover_meshtastic_devices,
+    bluetooth_select_options,
+    normalize_bluetooth_address,
+)
+from .bluetooth_pairing import (
+    AmbiguousBluetoothDeviceError,
+    BluetoothDeviceNotFoundError,
+    BluetoothPairingManager,
+    BluetoothUnavailableError,
+    InvalidBluetoothAddressError,
+    InvalidPinError,
+    NotMeshtasticDeviceError,
+    PairingAttempt,
+    PairingCancelledError,
+    PairingCleanupIncompleteError,
+    PairingError,
+    PairingOwnershipPendingError,
+    PairingRateLimitedError,
+    PairingRejectedError,
+    PairingResult,
+    PairingStateError,
+    PairingTimeoutError,
+    PinPromptTimeoutError,
+    ProvisionalBond,
+)
 from .config_helpers import (
     DEFAULT_MQTT_TOPICS,
     DEFAULT_TCP_PORTS,
@@ -37,6 +65,9 @@ from .const import (
     CONF_API_KEY,
     CONF_API_URL,
     CONF_BLE_ADDRESS,
+    CONF_BLUETOOTH_ADAPTER,
+    CONF_BLUETOOTH_ADAPTER_ADDRESS,
+    CONF_BLUETOOTH_BOND_MANAGED,
     CONF_GATEWAYS,
     CONF_HISTORY_DAYS,
     CONF_MQTT_TOPIC,
@@ -45,6 +76,7 @@ from .const import (
     CONF_SCAN_INTERVAL,
     CONF_SERIAL_PATH,
     CONF_TRANSPORT,
+    DATA_BLUETOOTH_PAIRING,
     DEFAULT_HISTORY_DAYS,
     DEFAULT_NODE_TIMEOUT,
     DEFAULT_SCAN_INTERVAL,
@@ -60,6 +92,7 @@ from .const import (
 )
 from .serial_devices import SerialDevice, discover_serial_devices
 
+_LOGGER = logging.getLogger(__name__)
 
 CONF_ACTION = "action"
 CONF_ADD_ANOTHER = "add_another"
@@ -73,6 +106,9 @@ CONF_MQTT_NODE_ID = "mqtt_node_id"
 CONF_CONFIRM = "confirm"
 CONF_GATEWAY = "gateway"
 CONF_GATEWAYS_JSON = "gateways_json"
+CONF_PAIRING_PIN = "pairing_pin"
+CONF_READY_TO_PAIR = "ready_to_pair"
+CONF_REMOVE_BLUETOOTH_BOND = "remove_bluetooth_bond"
 
 PROTOCOL_LABELS = {
     PROTOCOL_MESHTASTIC: "Meshtastic",
@@ -109,18 +145,387 @@ class MissingDependencyError(Exception):
     """Raised when an optional Home Assistant integration is unavailable."""
 
 
-class MeshNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class BluetoothOwnershipChangeError(ValueError):
+    """Raised when an edit would orphan or forge an owned Bluetooth bond."""
+
+
+class BluetoothGuidedSetupRequiredError(ValueError):
+    """Raised when an unpaired Bluetooth gateway bypasses the pairing wizard."""
+
+
+class _MeshtasticPairingFlowMixin:
+    """Shared, PIN-safe pairing steps for config and options flows."""
+
+    def _init_pairing_flow(self) -> None:
+        self._pairing_gateway: dict[str, Any] | None = None
+        self._pairing_return_step: str | None = None
+        self._pairing_error: str | None = None
+        self._pairing_attempt: PairingAttempt | None = None
+        self._pairing_begin_task: asyncio.Task[PairingAttempt] | None = None
+        self._pairing_submit_task: asyncio.Task[PairingResult] | None = None
+        self._pairing_result: PairingResult | None = None
+        self._provisional_bonds: set[tuple[str, str, str]] = set()
+
+    def _remember_provisional_bond(self, bond: ProvisionalBond | None) -> None:
+        """Retain a non-secret cleanup key until Home Assistant commits it."""
+        if bond is not None:
+            self._provisional_bonds.add(
+                (bond.adapter, bond.adapter_address, bond.address)
+            )
+
+    def _remember_provisional_bonds(
+        self, bonds: tuple[ProvisionalBond, ...]
+    ) -> None:
+        """Retain all cleanup keys from one ambiguous pairing transaction."""
+        for bond in bonds:
+            self._remember_provisional_bond(bond)
+
+    def _discard_provisional_bonds(
+        self, bonds: tuple[ProvisionalBond, ...]
+    ) -> None:
+        """Drop superseded aliases without touching the current BlueZ bond."""
+        for bond in bonds:
+            self._provisional_bonds.discard(
+                (bond.adapter, bond.adapter_address, bond.address)
+            )
+
+    def _remember_pairing_error(self, error: PairingError) -> None:
+        """Preserve rollback ownership before reducing an error to a UI key."""
+        if isinstance(error, PairingCleanupIncompleteError):
+            self._remember_provisional_bonds(error.bonds)
+        self._pairing_error = _pairing_error_key(error)
+
+    async def _async_prepare_gateway(
+        self,
+        gateway: dict[str, Any],
+        *,
+        return_step: str,
+    ):
+        """Start an explicit pairing confirmation for Meshtastic BLE."""
+        if not _is_meshtastic_bluetooth(gateway):
+            await async_validate_connection(self.hass, gateway)
+            return None
+        self._pairing_gateway = deepcopy(gateway)
+        self._pairing_return_step = return_step
+        self._pairing_error = None
+        return await self.async_step_pair_intro()
+
+    async def async_step_pair_intro(
+        self, user_input: dict[str, Any] | None = None
+    ):
+        """Require explicit readiness before creating a Bluetooth bond."""
+        if self._pairing_gateway is None:
+            return self.async_abort(reason="pairing_state_lost")
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            if not user_input.get(CONF_READY_TO_PAIR, False):
+                errors["base"] = "pairing_confirmation_required"
+            else:
+                if self._pairing_begin_task is None:
+                    manager = _async_pairing_manager(self.hass)
+                    self._pairing_begin_task = self.hass.async_create_task(
+                        manager.async_begin(
+                            self._pairing_gateway[CONF_BLE_ADDRESS]
+                        )
+                    )
+                return await self.async_step_pairing()
+        return self.async_show_form(
+            step_id="pair_intro",
+            data_schema=vol.Schema(
+                {vol.Required(CONF_READY_TO_PAIR, default=False): cv.boolean}
+            ),
+            errors=errors,
+        )
+
+    async def async_step_pairing(
+        self, user_input: dict[str, Any] | None = None
+    ):
+        """Show bounded progress while BlueZ begins one exact pairing."""
+        del user_input
+        task = self._pairing_begin_task
+        if task is None:
+            return self.async_abort(reason="pairing_state_lost")
+        if not task.done():
+            return self.async_show_progress(
+                step_id="pairing",
+                progress_action="pairing",
+                progress_task=task,
+            )
+        try:
+            attempt = task.result()
+        except PairingError as err:
+            self._remember_pairing_error(err)
+            return self.async_show_progress_done(
+                next_step_id=self._pairing_return_step or "user"
+            )
+        except asyncio.CancelledError:
+            self._pairing_error = "pairing_cancelled"
+            return self.async_show_progress_done(
+                next_step_id=self._pairing_return_step or "user"
+            )
+        self._pairing_attempt = attempt
+        provisional_bonds = getattr(attempt, "provisional_bonds", ())
+        if not provisional_bonds and (
+            provisional_bond := getattr(attempt, "provisional_bond", None)
+        ):
+            provisional_bonds = (provisional_bond,)
+        if provisional_bonds:
+            self._remember_provisional_bonds(provisional_bonds)
+            self._pairing_error = "pairing_cleanup_incomplete"
+            return self.async_show_progress_done(
+                next_step_id=self._pairing_return_step or "user"
+            )
+        if attempt.requires_pin:
+            return self.async_show_progress_done(next_step_id="pair_pin")
+        result = attempt.result
+        if result is None:
+            self._pairing_error = "pairing_failed"
+            return self.async_show_progress_done(
+                next_step_id=self._pairing_return_step or "user"
+            )
+        self._pairing_result = result
+        return self.async_show_progress_done(next_step_id="pair_finish")
+
+    async def async_step_pair_pin(
+        self, user_input: dict[str, Any] | None = None
+    ):
+        """Collect one six-digit PIN without retaining it in flow state."""
+        if self._pairing_submit_task is not None:
+            if user_input is not None:
+                user_input.clear()
+            return await self.async_step_pairing_submit()
+        attempt = self._pairing_attempt
+        if attempt is None or not attempt.requires_pin:
+            return self.async_abort(reason="pairing_state_lost")
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            pin = user_input.get(CONF_PAIRING_PIN)
+            if not isinstance(pin, str) or not pin.isascii() or not (
+                len(pin) == 6 and pin.isdecimal()
+            ):
+                errors[CONF_PAIRING_PIN] = "invalid_pin"
+            else:
+                self._pairing_submit_task = self.hass.async_create_task(
+                    attempt.async_submit_pin(pin)
+                )
+                # Do not retain the submitted secret in a form-default mapping.
+                user_input.clear()
+                pin = ""
+                return await self.async_step_pairing_submit()
+        return self.async_show_form(
+            step_id="pair_pin",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_PAIRING_PIN): TextSelector(
+                        TextSelectorConfig(type=TextSelectorType.PASSWORD)
+                    )
+                }
+            ),
+            errors=errors,
+        )
+
+    async def async_step_pairing_submit(
+        self, user_input: dict[str, Any] | None = None
+    ):
+        """Show progress while BlueZ verifies the submitted PIN and bond."""
+        del user_input
+        task = self._pairing_submit_task
+        if task is None:
+            return self.async_abort(reason="pairing_state_lost")
+        if not task.done():
+            return self.async_show_progress(
+                step_id="pairing_submit",
+                progress_action="verifying_pairing",
+                progress_task=task,
+            )
+        try:
+            self._pairing_result = task.result()
+        except PairingError as err:
+            self._remember_pairing_error(err)
+            return self.async_show_progress_done(
+                next_step_id=self._pairing_return_step or "user"
+            )
+        except asyncio.CancelledError:
+            self._pairing_error = "pairing_cancelled"
+            return self.async_show_progress_done(
+                next_step_id=self._pairing_return_step or "user"
+            )
+        return self.async_show_progress_done(next_step_id="pair_finish")
+
+    async def async_step_pair_finish(
+        self, user_input: dict[str, Any] | None = None
+    ):
+        """Persist only verified, non-secret pairing metadata."""
+        del user_input
+        gateway = self._pairing_gateway
+        result = self._pairing_result
+        if gateway is None or result is None:
+            return self.async_abort(reason="pairing_state_lost")
+        gateway[CONF_BLE_ADDRESS] = result.address
+        self._discard_provisional_bonds(
+            getattr(self._pairing_attempt, "retired_bonds", ())
+        )
+        options = dict(gateway.get("options") or {})
+        options[CONF_BLUETOOTH_ADAPTER] = result.adapter
+        options[CONF_BLUETOOTH_ADAPTER_ADDRESS] = result.adapter_address
+        if result.bond_created:
+            options[CONF_BLUETOOTH_BOND_MANAGED] = True
+        elif not options.get(CONF_BLUETOOTH_BOND_MANAGED):
+            options.pop(CONF_BLUETOOTH_BOND_MANAGED, None)
+        gateway["options"] = options
+        if result.bond_created:
+            self._remember_provisional_bond(
+                ProvisionalBond(
+                    address=result.address,
+                    adapter=result.adapter,
+                    adapter_address=result.adapter_address,
+                )
+            )
+        self._clear_pairing_tasks()
+        return await self._async_save_paired_gateway(gateway)
+
+    @callback
+    def async_remove(self) -> None:
+        """Cancel abandoned work and preserve ambiguous external bonds."""
+        if not (
+            self._provisional_bonds
+            or self._pairing_attempt is not None
+            or self._pairing_begin_task is not None
+            or self._pairing_submit_task is not None
+            or self._pairing_result is not None
+        ):
+            return
+        self.hass.async_create_task(self._async_cleanup_removed_pairing_flow())
+
+    async def _async_cleanup_removed_pairing_flow(self) -> None:
+        """Finish active work and release ambiguous process-local bond proof."""
+        begin_task = self._pairing_begin_task
+        submit_task = self._pairing_submit_task
+        attempt = self._pairing_attempt
+        result = self._pairing_result
+
+        for task in (begin_task, submit_task):
+            if task is not None and not task.done():
+                task.cancel()
+        for task in (begin_task, submit_task):
+            if task is not None:
+                with suppress(BaseException):
+                    await task
+                if task.done() and not task.cancelled():
+                    with suppress(BaseException):
+                        error = task.exception()
+                        if isinstance(error, PairingCleanupIncompleteError):
+                            self._remember_provisional_bonds(error.bonds)
+
+        if attempt is None and begin_task is not None and begin_task.done():
+            with suppress(BaseException):
+                attempt = begin_task.result()
+        if result is None and submit_task is not None and submit_task.done():
+            with suppress(BaseException):
+                result = submit_task.result()
+        if attempt is not None:
+            await attempt.async_cancel()
+            attempt_bonds = getattr(attempt, "provisional_bonds", ())
+            if not attempt_bonds and (
+                attempt_bond := getattr(attempt, "provisional_bond", None)
+            ):
+                attempt_bonds = (attempt_bond,)
+            self._remember_provisional_bonds(attempt_bonds)
+            self._discard_provisional_bonds(
+                getattr(attempt, "retired_bonds", ())
+            )
+            if result is None:
+                with suppress(BaseException):
+                    result = attempt.result
+        if result is not None and result.bond_created:
+            self._remember_provisional_bond(
+                ProvisionalBond(
+                    address=result.address,
+                    adapter=result.adapter,
+                    adapter_address=result.adapter_address,
+                )
+            )
+
+        # A CREATE_ENTRY result is only a request.  Home Assistant applies the
+        # config entry/options afterward, then calls async_remove().  Inspect
+        # that committed in-memory state here instead of clearing ownership at
+        # form-return time, which could orphan a bond if finalization aborted.
+        manager = _async_pairing_manager(self.hass)
+        committed_bonds = self._provisional_bonds.intersection(
+            _persisted_owned_bond_keys(self.hass)
+        )
+        for adapter, adapter_address, address in committed_bonds:
+            # The config entry is now the durable authority.  Do not leave an
+            # ephemeral generation-less proof that could later claim a bond
+            # another client removed and recreated at the same address.
+            manager.release_created(
+                address,
+                adapter=adapter,
+                adapter_address=adapter_address,
+            )
+        self._provisional_bonds.difference_update(committed_bonds)
+
+        for adapter, adapter_address, address in tuple(self._provisional_bonds):
+            # BlueZ has no bond-generation token.  Once the transactional
+            # rollback window has ended, automatically calling RemoveDevice
+            # could delete a bond another client recreated at the same path.
+            # Preserve external state and merely forget our ephemeral proof.
+            manager.release_created(
+                address,
+                adapter=adapter,
+                adapter_address=adapter_address,
+            )
+            self._provisional_bonds.discard(
+                (adapter, adapter_address, address)
+            )
+        self._clear_pairing_tasks()
+
+    def _consume_pairing_error(
+        self, step_id: str
+    ) -> tuple[str | None, dict[str, Any]]:
+        """Return one pending safe error and the non-secret gateway defaults."""
+        if self._pairing_return_step != step_id or self._pairing_error is None:
+            return None, {}
+        error = self._pairing_error
+        defaults = deepcopy(self._pairing_gateway or {})
+        self._clear_pairing_tasks()
+        return error, defaults
+
+    def _clear_pairing_tasks(self) -> None:
+        """Drop flow references after backend cleanup has completed."""
+        self._pairing_gateway = None
+        self._pairing_return_step = None
+        self._pairing_error = None
+        self._pairing_attempt = None
+        self._pairing_begin_task = None
+        self._pairing_submit_task = None
+        self._pairing_result = None
+
+    async def _async_save_paired_gateway(self, gateway: dict[str, Any]):
+        raise NotImplementedError
+
+
+class MeshNetConfigFlow(
+    _MeshtasticPairingFlowMixin,
+    config_entries.ConfigFlow,
+    domain=DOMAIN,
+):
     """Handle a guided config flow for MeshNet."""
 
     VERSION = 1
+    MINOR_VERSION = 2
 
     def __init__(self) -> None:
         self._gateways: list[dict[str, Any]] = []
         self._protocol = PROTOCOL_MESHTASTIC
         self._transport = TRANSPORT_TCP
+        self._discovered_ble_address: str | None = None
+        self._init_pairing_flow()
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None):
         """Choose the radio platform for the next gateway."""
+        await self.async_set_unique_id(DOMAIN)
+        self._abort_if_unique_id_configured()
         if user_input is not None:
             self._protocol = user_input[CONF_PROTOCOL]
             return await self.async_step_connection()
@@ -128,6 +533,19 @@ class MeshNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="user",
             data_schema=_protocol_schema(self._protocol),
         )
+
+    async def async_step_bluetooth(self, discovery_info: Any):
+        """Pre-fill the guided flow from a Meshtastic advertisement."""
+        try:
+            address = normalize_bluetooth_address(discovery_info.address)
+        except (AttributeError, ValueError):
+            return self.async_abort(reason="invalid_discovery")
+        await self.async_set_unique_id(DOMAIN)
+        self._abort_if_unique_id_configured()
+        self._protocol = PROTOCOL_MESHTASTIC
+        self._transport = TRANSPORT_BLUETOOTH
+        self._discovered_ble_address = address
+        return await self.async_step_gateway()
 
     async def async_step_connection(self, user_input: dict[str, Any] | None = None):
         """Choose one connection method supported by the platform."""
@@ -146,10 +564,17 @@ class MeshNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_gateway(self, user_input: dict[str, Any] | None = None):
         """Collect and validate only the fields used by this transport."""
         errors: dict[str, str] = {}
+        pairing_error, pairing_defaults = self._consume_pairing_error("gateway")
+        if pairing_error:
+            errors["base"] = pairing_error
         if user_input is not None:
             try:
                 gateway = gateway_from_form(self._protocol, self._transport, user_input)
                 _validate_unique_gateways([*self._gateways, gateway])
+                if _is_meshtastic_bluetooth(gateway):
+                    return await self._async_prepare_gateway(
+                        gateway, return_step="gateway"
+                    )
                 if user_input.get(CONF_VERIFY_CONNECTION, True):
                     await async_validate_connection(self.hass, gateway)
             except ValueError:
@@ -163,11 +588,19 @@ class MeshNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             else:
                 self._gateways.append(gateway)
                 return await self.async_step_more()
-        form_defaults = user_input or {}
+        form_defaults = user_input or pairing_defaults
+        if not form_defaults and self._discovered_ble_address:
+            form_defaults = {CONF_BLE_ADDRESS: self._discovered_ble_address}
         serial_field, serial_default = await _async_serial_field(
             self.hass,
             transport=self._transport,
             current=form_defaults.get(CONF_SERIAL_PATH),
+        )
+        bluetooth_field, bluetooth_default = await _async_bluetooth_field(
+            self.hass,
+            protocol=self._protocol,
+            transport=self._transport,
+            current=form_defaults.get(CONF_BLE_ADDRESS),
         )
         return self.async_show_form(
             step_id="gateway",
@@ -177,6 +610,8 @@ class MeshNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 defaults=form_defaults,
                 serial_field=serial_field,
                 serial_default=serial_default,
+                bluetooth_field=bluetooth_field,
+                bluetooth_default=bluetooth_default,
             ),
             errors=errors,
             description_placeholders={
@@ -184,6 +619,21 @@ class MeshNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 "transport": TRANSPORT_LABELS[self._transport],
             },
         )
+
+    async def _async_save_paired_gateway(self, gateway: dict[str, Any]):
+        """Persist a verified bond immediately so it cannot become orphaned."""
+        _validate_unique_gateways([*self._gateways, gateway])
+        self._gateways.append(gateway)
+        self._discovered_ble_address = None
+        result = self.async_create_entry(
+            title="MeshNet",
+            data={
+                CONF_GATEWAYS: deepcopy(self._gateways),
+                CONF_NODE_TIMEOUT: DEFAULT_NODE_TIMEOUT,
+                CONF_HISTORY_DAYS: DEFAULT_HISTORY_DAYS,
+            },
+        )
+        return result
 
     async def async_step_more(self, user_input: dict[str, Any] | None = None):
         """Offer another gateway before creating the single hub entry."""
@@ -236,8 +686,15 @@ class MeshNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if not isinstance(gateways, list):
             return self.async_abort(reason="invalid_import")
         try:
-            validated = [validate_gateway_dict(item) for item in gateways]
+            validated = [
+                _strip_untrusted_bluetooth_ownership(validate_gateway_dict(item))
+                for item in gateways
+            ]
             _validate_unique_gateways(validated)
+            if any(_is_meshtastic_bluetooth(item) for item in validated):
+                raise BluetoothGuidedSetupRequiredError
+        except BluetoothGuidedSetupRequiredError:
+            return self.async_abort(reason="bluetooth_requires_gui")
         except ValueError:
             return self.async_abort(reason="invalid_import")
         await self.async_set_unique_id(DOMAIN)
@@ -259,18 +716,20 @@ class MeshNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     @callback
     def async_get_options_flow(
         config_entry: config_entries.ConfigEntry,
-    ) -> "MeshNetOptionsFlow":
+    ) -> MeshNetOptionsFlow:
         """Return the modern options flow (HA 2024.11 and newer)."""
         return MeshNetOptionsFlow()
 
 
-class MeshNetOptionsFlow(config_entries.OptionsFlow):
+class MeshNetOptionsFlow(_MeshtasticPairingFlowMixin, config_entries.OptionsFlow):
     """Form-driven add, edit, remove, and advanced options flow."""
 
     def __init__(self) -> None:
         self._protocol = PROTOCOL_MESHTASTIC
         self._transport = TRANSPORT_TCP
         self._selected_gateway_id: str | None = None
+        self._pairing_save_action: str | None = None
+        self._init_pairing_flow()
 
     def _gateways(self) -> list[dict[str, Any]]:
         gateways = self.config_entry.options.get(CONF_GATEWAYS)
@@ -334,11 +793,21 @@ class MeshNetOptionsFlow(config_entries.OptionsFlow):
     ):
         """Validate and save a new gateway."""
         errors: dict[str, str] = {}
+        pairing_error, pairing_defaults = self._consume_pairing_error(
+            "add_details"
+        )
+        if pairing_error:
+            errors["base"] = pairing_error
         if user_input is not None:
             try:
                 gateway = gateway_from_form(self._protocol, self._transport, user_input)
                 gateways = [*self._gateways(), gateway]
                 _validate_unique_gateways(gateways)
+                if _is_meshtastic_bluetooth(gateway):
+                    self._pairing_save_action = "add"
+                    return await self._async_prepare_gateway(
+                        gateway, return_step="add_details"
+                    )
                 if user_input.get(CONF_VERIFY_CONNECTION, True):
                     await async_validate_connection(self.hass, gateway)
             except ValueError:
@@ -351,11 +820,17 @@ class MeshNetOptionsFlow(config_entries.OptionsFlow):
                 errors["base"] = "cannot_connect"
             else:
                 return self._save(**{CONF_GATEWAYS: gateways})
-        form_defaults = user_input or {}
+        form_defaults = user_input or pairing_defaults
         serial_field, serial_default = await _async_serial_field(
             self.hass,
             transport=self._transport,
             current=form_defaults.get(CONF_SERIAL_PATH),
+        )
+        bluetooth_field, bluetooth_default = await _async_bluetooth_field(
+            self.hass,
+            protocol=self._protocol,
+            transport=self._transport,
+            current=form_defaults.get(CONF_BLE_ADDRESS),
         )
         return self.async_show_form(
             step_id="add_details",
@@ -365,6 +840,8 @@ class MeshNetOptionsFlow(config_entries.OptionsFlow):
                 defaults=form_defaults,
                 serial_field=serial_field,
                 serial_default=serial_default,
+                bluetooth_field=bluetooth_field,
+                bluetooth_default=bluetooth_default,
             ),
             errors=errors,
             description_placeholders={
@@ -405,6 +882,11 @@ class MeshNetOptionsFlow(config_entries.OptionsFlow):
         selected = _find_gateway(gateways, self._selected_gateway_id)
         defaults = _gateway_form_defaults(selected)
         errors: dict[str, str] = {}
+        pairing_error, pairing_defaults = self._consume_pairing_error(
+            "edit_details"
+        )
+        if pairing_error:
+            errors["base"] = pairing_error
         if user_input is not None:
             try:
                 replacement = gateway_from_form(
@@ -420,8 +902,27 @@ class MeshNetOptionsFlow(config_entries.OptionsFlow):
                     for gateway in gateways
                 ]
                 _validate_unique_gateways(updated)
+                if _is_meshtastic_bluetooth(replacement):
+                    if (
+                        _has_meshnet_owned_bond(selected)
+                        and selected.get(CONF_BLE_ADDRESS)
+                        != replacement.get(CONF_BLE_ADDRESS)
+                    ):
+                        raise BluetoothOwnershipChangeError
+                    _preserve_bluetooth_ownership(selected, replacement)
+                    if _has_meshnet_owned_bond(selected):
+                        # Name/options edits keep the exact already-verified
+                        # adapter-scoped historical record. Moving that marker
+                        # requires guided removal followed by a fresh add.
+                        return self._save(**{CONF_GATEWAYS: updated})
+                    self._pairing_save_action = "edit"
+                    return await self._async_prepare_gateway(
+                        replacement, return_step="edit_details"
+                    )
                 if user_input.get(CONF_VERIFY_CONNECTION, True):
                     await async_validate_connection(self.hass, replacement)
+            except BluetoothOwnershipChangeError:
+                errors["base"] = "owned_bond_requires_guided_change"
             except ValueError:
                 errors["base"] = "invalid_gateway"
             except InvalidAuthError:
@@ -432,11 +933,17 @@ class MeshNetOptionsFlow(config_entries.OptionsFlow):
                 errors["base"] = "cannot_connect"
             else:
                 return self._save(**{CONF_GATEWAYS: updated})
-        form_defaults = user_input or defaults
+        form_defaults = user_input or pairing_defaults or defaults
         serial_field, serial_default = await _async_serial_field(
             self.hass,
             transport=self._transport,
             current=form_defaults.get(CONF_SERIAL_PATH),
+        )
+        bluetooth_field, bluetooth_default = await _async_bluetooth_field(
+            self.hass,
+            protocol=self._protocol,
+            transport=self._transport,
+            current=form_defaults.get(CONF_BLE_ADDRESS),
         )
         return self.async_show_form(
             step_id="edit_details",
@@ -446,6 +953,8 @@ class MeshNetOptionsFlow(config_entries.OptionsFlow):
                 defaults=form_defaults,
                 serial_field=serial_field,
                 serial_default=serial_default,
+                bluetooth_field=bluetooth_field,
+                bluetooth_default=bluetooth_default,
             ),
             errors=errors,
             description_placeholders={
@@ -453,6 +962,24 @@ class MeshNetOptionsFlow(config_entries.OptionsFlow):
                 "transport": TRANSPORT_LABELS[self._transport],
             },
         )
+
+    async def _async_save_paired_gateway(self, gateway: dict[str, Any]):
+        """Save a verified Bluetooth gateway through the active options action."""
+        gateways = self._gateways()
+        if self._pairing_save_action == "add":
+            updated = [*gateways, gateway]
+        elif self._pairing_save_action == "edit":
+            updated = [
+                gateway
+                if item["gateway_id"] == gateway["gateway_id"]
+                else item
+                for item in gateways
+            ]
+        else:
+            return self.async_abort(reason="pairing_state_lost")
+        self._pairing_save_action = None
+        _validate_unique_gateways(updated)
+        return self._save(**{CONF_GATEWAYS: updated})
 
     async def async_step_remove_gateway(
         self, user_input: dict[str, Any] | None = None
@@ -469,18 +996,46 @@ class MeshNetOptionsFlow(config_entries.OptionsFlow):
             if not user_input[CONF_CONFIRM]:
                 errors["base"] = "confirmation_required"
             else:
-                remaining = [
-                    gateway
-                    for gateway in gateways
-                    if gateway["gateway_id"] != user_input[CONF_GATEWAY]
-                ]
-                return self._save(**{CONF_GATEWAYS: remaining})
+                selected = _find_gateway(gateways, user_input[CONF_GATEWAY])
+                owned_bond_key = _owned_bond_key(selected)
+                if owned_bond_key and user_input.get(
+                    CONF_REMOVE_BLUETOOTH_BOND, False
+                ):
+                    pairing_manager = _async_pairing_manager(self.hass)
+                    adapter, adapter_address, address = owned_bond_key
+                    try:
+                        await pairing_manager.async_forget_current_bond(
+                            address,
+                            adapter=adapter,
+                            adapter_address=adapter_address,
+                            user_confirmed=True,
+                        )
+                    except PairingError:
+                        errors["base"] = "bluetooth_cleanup_failed"
+                elif owned_bond_key:
+                    pairing_manager = _async_pairing_manager(self.hass)
+                    adapter, adapter_address, address = owned_bond_key
+                    pairing_manager.release_created(
+                        address,
+                        adapter=adapter,
+                        adapter_address=adapter_address,
+                    )
+                if not errors:
+                    remaining = [
+                        gateway
+                        for gateway in gateways
+                        if gateway["gateway_id"] != user_input[CONF_GATEWAY]
+                    ]
+                    return self._save(**{CONF_GATEWAYS: remaining})
         return self.async_show_form(
             step_id="remove_gateway",
             data_schema=vol.Schema(
                 {
                     vol.Required(CONF_GATEWAY): vol.In(choices),
                     vol.Required(CONF_CONFIRM, default=False): cv.boolean,
+                    vol.Required(
+                        CONF_REMOVE_BLUETOOTH_BOND, default=False
+                    ): cv.boolean,
                 }
             ),
             errors=errors,
@@ -526,6 +1081,16 @@ class MeshNetOptionsFlow(config_entries.OptionsFlow):
                     raise ValueError("gateways_json must be a list")
                 gateways = [validate_gateway_dict(item) for item in parsed]
                 _validate_unique_gateways(gateways)
+                _require_guided_setup_for_new_bluetooth(
+                    self._gateways(), gateways
+                )
+                gateways = _reconcile_advanced_bluetooth_ownership(
+                    self._gateways(), gateways
+                )
+            except BluetoothGuidedSetupRequiredError:
+                errors[CONF_GATEWAYS_JSON] = "bluetooth_requires_gui"
+            except BluetoothOwnershipChangeError:
+                errors[CONF_GATEWAYS_JSON] = "owned_bond_requires_guided_change"
             except (TypeError, ValueError, json.JSONDecodeError):
                 errors[CONF_GATEWAYS_JSON] = "invalid_gateways"
             else:
@@ -544,6 +1109,195 @@ class MeshNetOptionsFlow(config_entries.OptionsFlow):
             ),
             errors=errors,
         )
+
+
+def _async_pairing_manager(hass: Any) -> BluetoothPairingManager:
+    """Return one HA-instance manager so pairing is globally serialized."""
+    manager = hass.data.get(DATA_BLUETOOTH_PAIRING)
+    if isinstance(manager, BluetoothPairingManager):
+        return manager
+    manager = BluetoothPairingManager(prompt_timeout=50.0)
+    hass.data[DATA_BLUETOOTH_PAIRING] = manager
+    return manager
+
+
+def _is_meshtastic_bluetooth(gateway: dict[str, Any]) -> bool:
+    return (
+        gateway.get(CONF_PROTOCOL) == PROTOCOL_MESHTASTIC
+        and gateway.get(CONF_TRANSPORT) == TRANSPORT_BLUETOOTH
+    )
+
+
+def _has_meshnet_owned_bond(gateway: dict[str, Any]) -> bool:
+    return _owned_bond_key(gateway) is not None
+
+
+def _owned_bond_key(
+    gateway: dict[str, Any],
+) -> tuple[str, str, str] | None:
+    """Return the complete adapter-scoped ownership identity, if valid."""
+    if not _is_meshtastic_bluetooth(gateway):
+        return None
+    options = gateway.get("options") or {}
+    if options.get(CONF_BLUETOOTH_BOND_MANAGED) is not True:
+        return None
+    adapter = options.get(CONF_BLUETOOTH_ADAPTER)
+    if not (
+        isinstance(adapter, str)
+        and adapter.startswith("hci")
+        and adapter[3:].isdigit()
+    ):
+        return None
+    try:
+        adapter_address = normalize_bluetooth_address(
+            options.get(CONF_BLUETOOTH_ADAPTER_ADDRESS)
+        )
+        device_address = normalize_bluetooth_address(gateway.get(CONF_BLE_ADDRESS))
+    except ValueError:
+        return None
+    return adapter, adapter_address, device_address
+
+
+def _persisted_owned_bond_keys(hass: Any) -> set[tuple[str, str, str]]:
+    """Return originally paired bonds represented by committed entry state."""
+    config_entries_manager = getattr(hass, "config_entries", None)
+    if config_entries_manager is None:
+        return set()
+    entries = config_entries_manager.async_entries(DOMAIN)
+    bond_keys: set[tuple[str, str, str]] = set()
+    for entry in entries:
+        gateways = entry.options.get(CONF_GATEWAYS)
+        if gateways is None:
+            gateways = entry.data.get(CONF_GATEWAYS, [])
+        for gateway in gateways:
+            if not isinstance(gateway, dict):
+                continue
+            if bond_key := _owned_bond_key(gateway):
+                bond_keys.add(bond_key)
+    return bond_keys
+
+
+def _preserve_bluetooth_ownership(
+    previous: dict[str, Any], replacement: dict[str, Any]
+) -> None:
+    """Keep ownership only while editing the same canonical radio address."""
+    if previous.get(CONF_BLE_ADDRESS) != replacement.get(CONF_BLE_ADDRESS):
+        return
+    bond_key = _owned_bond_key(previous)
+    if bond_key is None:
+        return
+    adapter, adapter_address, _device_address = bond_key
+    replacement_options = dict(replacement.get("options") or {})
+    replacement_options[CONF_BLUETOOTH_BOND_MANAGED] = True
+    replacement_options[CONF_BLUETOOTH_ADAPTER] = adapter
+    replacement_options[CONF_BLUETOOTH_ADAPTER_ADDRESS] = adapter_address
+    replacement["options"] = replacement_options
+
+
+def _strip_untrusted_bluetooth_ownership(
+    gateway: dict[str, Any],
+) -> dict[str, Any]:
+    """Remove a bond-ownership claim supplied by YAML or another untrusted form."""
+    cleaned = deepcopy(gateway)
+    options = dict(cleaned.get("options") or {})
+    options.pop(CONF_BLUETOOTH_BOND_MANAGED, None)
+    options.pop(CONF_BLUETOOTH_ADAPTER, None)
+    options.pop(CONF_BLUETOOTH_ADAPTER_ADDRESS, None)
+    if options:
+        cleaned["options"] = options
+    else:
+        cleaned.pop("options", None)
+    return cleaned
+
+
+def _require_guided_setup_for_new_bluetooth(
+    current: list[dict[str, Any]], proposed: list[dict[str, Any]]
+) -> None:
+    """Reject new Meshtastic BLE endpoints that bypass protected pairing."""
+    existing = {
+        (gateway.get("gateway_id"), gateway.get(CONF_BLE_ADDRESS))
+        for gateway in current
+        if _is_meshtastic_bluetooth(gateway)
+    }
+    if any(
+        _is_meshtastic_bluetooth(gateway)
+        and (gateway.get("gateway_id"), gateway.get(CONF_BLE_ADDRESS))
+        not in existing
+        for gateway in proposed
+    ):
+        raise BluetoothGuidedSetupRequiredError
+
+
+def _reconcile_advanced_bluetooth_ownership(
+    current: list[dict[str, Any]], proposed: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Preserve real ownership while blocking forged or orphaned bond metadata."""
+    owned = {
+        gateway["gateway_id"]: gateway
+        for gateway in current
+        if _has_meshnet_owned_bond(gateway)
+    }
+    matched: set[str] = set()
+    reconciled: list[dict[str, Any]] = []
+    for gateway in proposed:
+        cleaned = deepcopy(gateway)
+        options = dict(cleaned.get("options") or {})
+        claimed_owned = bool(options.pop(CONF_BLUETOOTH_BOND_MANAGED, False))
+        options.pop(CONF_BLUETOOTH_ADAPTER, None)
+        options.pop(CONF_BLUETOOTH_ADAPTER_ADDRESS, None)
+        previous = owned.get(cleaned.get("gateway_id"))
+        same_owned_bond = bool(
+            previous
+            and _is_meshtastic_bluetooth(cleaned)
+            and cleaned.get(CONF_BLE_ADDRESS) == previous.get(CONF_BLE_ADDRESS)
+        )
+        if claimed_owned and not same_owned_bond:
+            raise BluetoothOwnershipChangeError
+        if same_owned_bond:
+            matched.add(cleaned["gateway_id"])
+            options[CONF_BLUETOOTH_BOND_MANAGED] = True
+            previous_options = previous.get("options") or {}
+            if adapter := previous_options.get(CONF_BLUETOOTH_ADAPTER):
+                options[CONF_BLUETOOTH_ADAPTER] = adapter
+            if adapter_address := previous_options.get(
+                CONF_BLUETOOTH_ADAPTER_ADDRESS
+            ):
+                options[CONF_BLUETOOTH_ADAPTER_ADDRESS] = adapter_address
+        if options:
+            cleaned["options"] = options
+        else:
+            cleaned.pop("options", None)
+        reconciled.append(cleaned)
+    if matched != set(owned):
+        raise BluetoothOwnershipChangeError
+    return reconciled
+
+
+def _pairing_error_key(error: PairingError) -> str:
+    """Map internal failures to stable translations without leaking details."""
+    if isinstance(error, PairingCleanupIncompleteError):
+        return "pairing_cleanup_incomplete"
+    if isinstance(error, PairingOwnershipPendingError):
+        return "pairing_ownership_pending"
+    if isinstance(error, PairingRateLimitedError):
+        return "pairing_rate_limited"
+    if isinstance(error, (PairingTimeoutError, PinPromptTimeoutError)):
+        return "pairing_timeout"
+    if isinstance(error, (BluetoothDeviceNotFoundError, AmbiguousBluetoothDeviceError)):
+        return "local_adapter_required"
+    if isinstance(error, InvalidBluetoothAddressError):
+        return "invalid_gateway"
+    if isinstance(error, InvalidPinError):
+        return "invalid_pin"
+    if isinstance(error, NotMeshtasticDeviceError):
+        return "not_meshtastic_device"
+    if isinstance(error, BluetoothUnavailableError):
+        return "bluez_unavailable"
+    if isinstance(error, PairingCancelledError):
+        return "pairing_cancelled"
+    if isinstance(error, (PairingRejectedError, PairingStateError)):
+        return "pairing_rejected"
+    return "pairing_failed"
 
 
 def _protocol_schema(default: str) -> vol.Schema:
@@ -578,6 +1332,8 @@ def _gateway_schema(
     defaults: dict[str, Any] | None = None,
     serial_field: Any | None = None,
     serial_default: str | None = None,
+    bluetooth_field: Any | None = None,
+    bluetooth_default: str | None = None,
 ) -> vol.Schema:
     defaults = defaults or {}
     fields: dict[Any, Any] = {
@@ -618,11 +1374,15 @@ def _gateway_schema(
                 vol.Required(CONF_DEBUG, default=defaults.get(CONF_DEBUG, False))
             ] = cv.boolean
     elif transport == TRANSPORT_BLUETOOTH:
+        bluetooth_default = defaults.get(CONF_BLE_ADDRESS) or bluetooth_default
+        bluetooth_marker = (
+            vol.Required(CONF_BLE_ADDRESS, default=bluetooth_default)
+            if bluetooth_default
+            else vol.Required(CONF_BLE_ADDRESS)
+        )
         fields[
-            vol.Required(
-                CONF_BLE_ADDRESS, default=defaults.get(CONF_BLE_ADDRESS, "")
-            )
-        ] = cv.string
+            bluetooth_marker
+        ] = bluetooth_field or TextSelector(TextSelectorConfig())
         if protocol == PROTOCOL_MESHCORE:
             fields[vol.Optional(CONF_PIN, default=defaults.get(CONF_PIN, ""))] = cv.string
     elif transport == TRANSPORT_MQTT:
@@ -658,12 +1418,16 @@ def _gateway_schema(
             vol.Optional(CONF_SEND_URL, default=defaults.get(CONF_SEND_URL, ""))
         ] = cv.string
 
-    fields[
-        vol.Required(
-            CONF_VERIFY_CONNECTION,
-            default=defaults.get(CONF_VERIFY_CONNECTION, True),
-        )
-    ] = cv.boolean
+    if not (
+        protocol == PROTOCOL_MESHTASTIC
+        and transport == TRANSPORT_BLUETOOTH
+    ):
+        fields[
+            vol.Required(
+                CONF_VERIFY_CONNECTION,
+                default=defaults.get(CONF_VERIFY_CONNECTION, True),
+            )
+        ] = cv.boolean
     return vol.Schema(fields)
 
 
@@ -701,6 +1465,44 @@ async def _async_serial_field(
 
     devices = await hass.async_add_executor_job(discover_serial_devices)
     return _serial_field(devices, current=current)
+
+
+async def _async_bluetooth_field(
+    hass: Any,
+    *,
+    protocol: str,
+    transport: str,
+    current: str | None = None,
+) -> tuple[Any | None, str | None]:
+    """Build a picker from cached Meshtastic advertisements.
+
+    Discovery can include Home Assistant Bluetooth proxies. The BlueZ pairing
+    transaction performs a second, authoritative local-adapter check before it
+    requests a PIN or changes any bond state.
+    """
+    if protocol != PROTOCOL_MESHTASTIC or transport != TRANSPORT_BLUETOOTH:
+        return None, None
+    devices = await async_discover_meshtastic_devices(hass)
+    return _bluetooth_field(devices, current=current)
+
+
+def _bluetooth_field(
+    devices: list[BluetoothDevice], *, current: str | None = None
+) -> tuple[Any, str | None]:
+    """Return a Meshtastic dropdown that still accepts one exact manual MAC."""
+    options, default = bluetooth_select_options(devices, current=current)
+    if not options:
+        return TextSelector(TextSelectorConfig()), default
+    return (
+        SelectSelector(
+            SelectSelectorConfig(
+                options=[SelectOptionDict(**option) for option in options],
+                mode=SelectSelectorMode.DROPDOWN,
+                custom_value=True,
+            )
+        ),
+        default,
+    )
 
 
 def _serial_field(
@@ -755,6 +1557,13 @@ def _validate_unique_gateways(gateways: list[dict[str, Any]]) -> None:
     ids = [gateway["gateway_id"] for gateway in gateways]
     if len(ids) != len(set(ids)):
         raise ValueError("gateway IDs must be unique")
+    bluetooth_addresses = [
+        gateway.get(CONF_BLE_ADDRESS)
+        for gateway in gateways
+        if gateway.get(CONF_TRANSPORT) == TRANSPORT_BLUETOOTH
+    ]
+    if len(bluetooth_addresses) != len(set(bluetooth_addresses)):
+        raise ValueError("Bluetooth addresses must be unique")
 
 
 async def async_validate_connection(hass: Any, gateway: dict[str, Any]) -> None:
@@ -803,7 +1612,6 @@ async def _async_probe_tcp(host: str, port: int) -> None:
 
 async def _async_probe_rest(hass: Any, gateway: dict[str, Any]) -> None:
     import aiohttp
-
     from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
     headers = {}

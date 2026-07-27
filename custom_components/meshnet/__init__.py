@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime
-import logging
 from pathlib import Path
 from typing import Any
 
@@ -15,13 +15,14 @@ from .const import (
     ATTR_PRIORITY,
     ATTR_TARGET_NODE,
     ATTR_WHEN,
+    CONF_BLUETOOTH_ADAPTER,
+    CONF_BLUETOOTH_ADAPTER_ADDRESS,
+    CONF_BLUETOOTH_BOND_MANAGED,
+    CONF_GATEWAYS,
     DOMAIN,
     MESSAGE_TYPE_BROADCAST,
     PLATFORMS,
 )
-
-
-_LOGGER = logging.getLogger(__name__)
 
 SERVICE_SEND_MESSAGE = "send_message"
 SERVICE_BROADCAST_MESSAGE = "broadcast_message"
@@ -71,15 +72,26 @@ async def async_unload_entry(hass, entry) -> bool:
     return unload_ok
 
 
+async def async_remove_entry(hass, entry) -> None:
+    """Preserve external Bluetooth state when a config entry is deleted.
+
+    BlueZ exposes no bond-generation identifier.  An address stored when
+    MeshNet paired a radio may later name a bond another client recreated, so
+    unattended entry removal must never call ``RemoveDevice``.  Users who
+    intentionally want address-scoped BlueZ cleanup can request it in the
+    confirmed Configure -> Remove gateway flow before deleting the entry.
+    """
+    del hass, entry
+
+
 async def _async_update_listener(hass, entry) -> None:
     """Reload on options changes."""
     await hass.config_entries.async_reload(entry.entry_id)
 
 
 def _async_register_services(hass) -> None:
-    import voluptuous as vol
-
     import homeassistant.helpers.config_validation as cv
+    import voluptuous as vol
 
     from .coordinator import service_fields
 
@@ -191,7 +203,43 @@ async def _async_register_panel(hass) -> None:
 
 
 async def async_migrate_entry(hass, entry) -> bool:
-    """Migrate old config entries."""
-    if entry.version == 1:
+    """Remove deletion authority from entries created before version 0.4."""
+    if entry.version != 1:
+        return False
+    if entry.minor_version >= 2:
         return True
+
+    data = _strip_legacy_bluetooth_ownership(entry.data)
+    options = _strip_legacy_bluetooth_ownership(entry.options)
+    hass.config_entries.async_update_entry(
+        entry,
+        data=data,
+        options=options,
+        minor_version=2,
+    )
     return True
+
+
+def _strip_legacy_bluetooth_ownership(values: Any) -> dict[str, Any]:
+    """Strip v0.4-only trust metadata from an older entry mapping."""
+    migrated = deepcopy(dict(values))
+    gateways = migrated.get(CONF_GATEWAYS)
+    if not isinstance(gateways, list):
+        return migrated
+    cleaned_gateways: list[Any] = []
+    for gateway in gateways:
+        if not isinstance(gateway, dict):
+            cleaned_gateways.append(gateway)
+            continue
+        cleaned = deepcopy(gateway)
+        gateway_options = dict(cleaned.get("options") or {})
+        gateway_options.pop(CONF_BLUETOOTH_BOND_MANAGED, None)
+        gateway_options.pop(CONF_BLUETOOTH_ADAPTER, None)
+        gateway_options.pop(CONF_BLUETOOTH_ADAPTER_ADDRESS, None)
+        if gateway_options:
+            cleaned["options"] = gateway_options
+        else:
+            cleaned.pop("options", None)
+        cleaned_gateways.append(cleaned)
+    migrated[CONF_GATEWAYS] = cleaned_gateways
+    return migrated

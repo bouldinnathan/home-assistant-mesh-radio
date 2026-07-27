@@ -25,7 +25,6 @@ from ..compat import percentage_unit
 from ..entity import MeshNetCoordinatorEntity, MeshNetGatewayEntity, MeshNetNodeEntity
 from ..models import GatewayStatus, MeshSnapshot, NodeState
 
-
 PERCENTAGE_UNIT = percentage_unit(ha_const)
 
 

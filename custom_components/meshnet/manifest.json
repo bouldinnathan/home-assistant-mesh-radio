@@ -2,14 +2,22 @@
   "domain": "meshnet",
   "name": "MeshNet",
   "after_dependencies": [
-    "mqtt",
-    "bluetooth_adapters"
+    "mqtt"
+  ],
+  "bluetooth": [
+    {
+      "connectable": true,
+      "service_uuid": "6ba1b218-15a8-461f-9fa8-5dcae273eafd"
+    }
   ],
   "codeowners": [
     "@bouldinnathan"
   ],
   "config_flow": true,
   "documentation": "https://github.com/bouldinnathan/home-assistant-mesh-radio",
+  "dependencies": [
+    "bluetooth_adapters"
+  ],
   "integration_type": "hub",
   "iot_class": "local_push",
   "loggers": [
@@ -22,6 +30,6 @@
     "meshcore==2.3.7"
   ],
   "single_config_entry": true,
-  "version": "0.3.0",
+  "version": "0.4.0",
   "issue_tracker": "https://github.com/bouldinnathan/home-assistant-mesh-radio/issues"
 }

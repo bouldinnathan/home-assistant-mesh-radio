@@ -139,6 +139,55 @@ Avoid sending:
 - Sensitive medical or financial data
 - Precise home location unless intentionally shared
 
+## Bluetooth Pairing Security (version 0.4)
+
+Meshtastic pairing is limited to a local BlueZ adapter and the exact canonical
+MAC address selected in the Home Assistant form. Bluetooth proxies are not
+accepted for this direct connection. MeshNet registers a temporary,
+application-scoped BlueZ agent; it does not request the system-default agent
+role and rejects pairing callbacks for any other device.
+
+The verified adapter must also be the only powered local Bluetooth adapter.
+Meshtastic 2.7.11 cannot select a controller, so this check prevents the SDK
+from silently using a different powered adapter. Ownership is bound to the
+controller's stable Adapter1 address as well as the radio address; an `hciN`
+rename cannot redirect deletion. New Meshtastic Bluetooth gateways cannot
+bypass pairing through YAML or Advanced JSON.
+
+The six-digit PIN field is password-masked. The value exists only for the
+active pairing request and is not written to config entries, options,
+diagnostics, or logs. The PIN prompt expires after about 50 seconds, the entire
+pairing transaction has a 75-second limit, and the temporary agent is removed
+after success, failure, cancellation, or timeout.
+
+Screened radios should use Meshtastic `RANDOM_PIN`. A screenless device may need
+a fixed PIN; its factory value may be `123456`, but that shared default should
+be changed before regular use. Close the Meshtastic phone app before pairing so
+it cannot compete for the radio's single Bluetooth client connection.
+
+MeshNet records that it originally paired an adapter-scoped radio, but it does
+not treat that marker as proof about the current bond generation. BlueZ exposes
+no generation identifier: another client can remove and recreate a bond at the
+same address and Device1 path. Pre-0.4 entries are migrated by stripping any
+untrusted originally-paired marker.
+
+Pairing submissions are serialized, rate-limited, and idempotent. If Pair
+succeeds but verification fails, MeshNet attempts bounded rollback immediately
+inside the active D-Bus transaction. If rollback cannot be verified, the exact
+Device1/controller evidence remains in memory only to block overlapping MeshNet
+pairing flows. Ending the flow releases that evidence without a delayed
+`RemoveDevice` call, because delayed deletion could target a bond recreated by
+another client.
+
+Config-entry deletion and HACS uninstall never remove BlueZ bonds. Abandoning a
+flow after its pairing transaction has ended never starts delayed deletion.
+Canceling while a pairing transaction is still active may immediately roll back
+that transaction's uncommitted bond, with the same Device1 and stable-controller
+identity guards. The guided Remove-gateway form offers an explicitly confirmed,
+address-scoped current-bond deletion; it is off by default and warns that other
+apps may be disconnected. This consent is not presented as proof that the
+current bond is the historical one MeshNet created.
+
 ## Diagnostics
 
 Diagnostics contain aggregate health and count information only. They exclude
@@ -182,6 +231,13 @@ chmod 600 /config/secrets.yaml
 
 ## Uninstall Safety
 
+Deleting the MeshNet integration entry and uninstalling through HACS preserve
+all external BlueZ bonds. If address-scoped cleanup is desired, first use
+**Configure → Remove gateway**, enable **Remove this radio's current Bluetooth
+bond (may disconnect other apps)**, and confirm. The checkbox is off by default,
+and a failed cleanup keeps the gateway. Otherwise, remove the gateway/entry and
+HACS package without changing Bluetooth state.
+
 `uninstall.sh` removes only an existing component whose path is exactly the
 recorded `<config_dir>/custom_components/meshnet` and whose manifest declares
 the `meshnet` domain. It rejects symlinked and mismatched targets. It does not
@@ -195,12 +251,17 @@ remove:
 
 This is intentional to prevent data loss. Remove those manually only after backing up.
 
+HACS custom integrations execute inside the Home Assistant Core process. These
+pairing restrictions reduce privilege and scope, but they do not provide crash
+or process isolation. True isolation requires a separate Home Assistant App or
+sidecar that communicates with Home Assistant over a bounded interface such as
+MQTT.
+
 ## Reporting Security Issues
 
-This source snapshot does not declare a public issue tracker. If you publish this repository, add a real security contact and update:
-
-```text
-custom_components/meshnet/manifest.json
-README.md
-docs/SECURITY.md
-```
+Report ordinary bugs through the repository's
+[issue tracker](https://github.com/bouldinnathan/home-assistant-mesh-radio/issues).
+Do not post credentials, Bluetooth PINs, private addresses, diagnostics, or
+other sensitive data in a public issue. For a vulnerability that needs a private
+report, use GitHub's private vulnerability-reporting option on the repository's
+**Security** tab when it is available.

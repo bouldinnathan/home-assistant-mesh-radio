@@ -6,7 +6,8 @@ from typing import Final
 
 DOMAIN: Final = "meshnet"
 NAME: Final = "MeshNet"
-VERSION: Final = "0.3.0"
+VERSION: Final = "0.4.0"
+DATA_BLUETOOTH_PAIRING: Final = f"{DOMAIN}_bluetooth_pairing"
 
 PLATFORMS: Final = ["sensor", "binary_sensor", "device_tracker"]
 
@@ -17,6 +18,9 @@ CONF_PROTOCOL: Final = "protocol"
 CONF_TRANSPORT: Final = "transport"
 CONF_SERIAL_PATH: Final = "serial_path"
 CONF_BLE_ADDRESS: Final = "ble_address"
+CONF_BLUETOOTH_ADAPTER: Final = "bluetooth_adapter"
+CONF_BLUETOOTH_ADAPTER_ADDRESS: Final = "bluetooth_adapter_address"
+CONF_BLUETOOTH_BOND_MANAGED: Final = "bluetooth_bond_managed"
 CONF_MQTT_TOPIC: Final = "mqtt_topic"
 CONF_API_URL: Final = "api_url"
 CONF_API_KEY: Final = "api_key"

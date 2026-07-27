@@ -1,6 +1,9 @@
 # Configuration
 
-MeshNet can be configured from the guided Home Assistant UI or imported from YAML. The UI path is recommended: it filters connection methods by protocol, displays only relevant fields, tests connectivity, and can add multiple gateways in one run.
+MeshNet can be configured from the guided Home Assistant UI or imported from
+YAML. The UI path is recommended: it filters connection methods by protocol,
+displays only relevant fields, and tests connectivity. Meshtastic Bluetooth is
+GUI-only because its local bond must be verified and tracked safely.
 
 ## Configuration Methods
 
@@ -28,6 +31,12 @@ meshnet:
 
 After Home Assistant imports YAML into a config entry, use **Configure** to add, edit, or remove gateways with forms. The Advanced JSON editor remains available only as an escape hatch for custom bridge fields.
 
+YAML and Advanced JSON cannot add or replace a Meshtastic Bluetooth gateway.
+Use the guided Add form for a new endpoint. Edit can rename a paired gateway,
+but changing its radio address requires **Remove gateway**, then Add. This
+prevents an unverified or forged originally-paired marker from authorizing
+current-bond cleanup for a different address.
+
 ## Global Options
 
 | Option | Default | Meaning |
@@ -53,7 +62,7 @@ Transport-specific required fields:
 | --- | --- | --- |
 | `tcp` | `host` | `port` |
 | `serial` | `serial_path` | `options.baudrate`, `options.debug` |
-| `bluetooth` | `ble_address` | `options.pin` |
+| `bluetooth` | `ble_address` | `options.pin` (MeshCore only) |
 | `mqtt` | Home Assistant MQTT integration, `mqtt_topic` | `options.publish_topic`, `options.mqtt_node_id` |
 | `rest` | `api_url` | `api_key`, `options.send_url` |
 
@@ -65,6 +74,66 @@ Supported combinations:
 | `meshcore` | `tcp`, `serial`, `bluetooth`, `mqtt`, `rest` |
 
 Invalid combinations are rejected by the config flow.
+
+## Meshtastic Bluetooth pairing (version 0.4)
+
+> [!NOTE]
+> This section describes the version 0.4 behavior. Install a version 0.4 build
+> before expecting these controls in Home Assistant.
+
+Meshtastic Bluetooth setup uses a local Linux BlueZ adapter. Home Assistant
+Bluetooth proxies are not supported for pairing or for the subsequent direct
+Meshtastic SDK connection.
+
+Meshtastic 2.7.11 cannot be told which Linux Bluetooth controller to use.
+MeshNet therefore fails closed unless the verified adapter is the only powered
+local adapter. Other installed adapters may remain present while powered off.
+The stored pairing record includes the controller's stable Bluetooth address,
+so an `hciN` rename after reboot does not authorize a different controller.
+
+Before starting:
+
+1. Enable Bluetooth on the Meshtastic radio and disable Wi-Fi if its firmware
+   does not permit both at the same time.
+2. Close the Meshtastic phone app and disconnect other Bluetooth clients. A
+   radio normally serves only one Bluetooth client at a time.
+3. Place the radio near a local Bluetooth adapter attached to the Home
+   Assistant host.
+
+In the MeshNet form:
+
+1. Choose a discovered Meshtastic radio from the dropdown. The advanced option
+   accepts only a canonical Bluetooth MAC address such as
+   `AA:BB:CC:DD:EE:FF`.
+2. Select **Start pairing**.
+3. For a screened radio configured with `RANDOM_PIN`, enter the six-digit code
+   that appears on the radio. For a screenless radio, enter its configured fixed
+   PIN. A factory fixed PIN may be `123456`; change that default in Meshtastic
+   before using Bluetooth for regular operation.
+4. Submit within about 50 seconds. Start again if the request expires.
+
+The PIN entry is password-masked. MeshNet passes it only to the temporary
+pairing operation and never saves it in the Home Assistant config entry,
+diagnostics, or logs. Do not place a Meshtastic Bluetooth PIN in YAML or in
+`options.pin`; that option is for MeshCore SDK connections only.
+
+MeshNet registers a temporary, application-scoped BlueZ agent for the exact
+selected device. It does not become the system default agent. On Home Assistant
+OS, normal pairing therefore does not require a root shell or `bluetoothctl`.
+
+The first verified Bluetooth gateway is saved immediately with safe global
+defaults, rather than leaving a provisional bond at the Add-another/settings
+screens. Use **Configure** afterward to add gateways or change global options.
+
+Deleting a gateway, config entry, or HACS package preserves external BlueZ
+state. BlueZ has no bond-generation identifier, so MeshNet cannot prove that a
+same-address bond was not recreated by another app after initial setup.
+
+For deliberate cleanup, choose **Configure → Remove gateway**, enable **Remove
+this radio's current Bluetooth bond (may disconnect other apps)**, and confirm.
+The option is off by default. It removes the current address-scoped bond, not a
+cryptographically identifiable historical generation. If BlueZ is unavailable,
+the gateway is kept so the explicitly requested operation can be retried.
 
 ## Meshtastic TCP
 

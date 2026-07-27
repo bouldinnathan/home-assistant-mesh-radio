@@ -10,8 +10,8 @@ from custom_components.meshnet.const import PROTOCOL_MESHTASTIC, TRANSPORT_TCP
 from custom_components.meshnet.models import (
     GatewayConfig,
     GatewayStatus,
-    MessageRecord,
     MeshSnapshot,
+    MessageRecord,
 )
 
 
@@ -222,5 +222,178 @@ def test_diagnostics_exclude_gateway_identity_errors_and_mesh_content(monkeypatc
             "token=private",
         ):
             assert private_value not in serialized
+
+    asyncio.run(run())
+
+
+def test_reconnect_loop_retries_with_increasing_backoff(monkeypatch) -> None:
+    """A failed reconnect remains single-flight and retries until connected."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+        coordinator = object.__new__(coordinator_class)
+        coordinator._shutting_down = False
+        coordinator._reconnect_suspended = False
+
+        delays = []
+        original_sleep = asyncio.sleep
+
+        async def fast_sleep(delay: float) -> None:
+            delays.append(delay)
+            await original_sleep(0)
+
+        monkeypatch.setattr(asyncio, "sleep", fast_sleep)
+        coordinator._reconnect_delay = lambda attempt: float(30 * (2**attempt))
+
+        class Gateway:
+            def __init__(self) -> None:
+                self.status = SimpleNamespace(connected=False)
+                self.start_pending = False
+                self.start_calls = 0
+                self.stop_calls = 0
+                self.errors = []
+
+            async def async_stop(self) -> None:
+                self.stop_calls += 1
+
+            async def async_start(self) -> None:
+                self.start_calls += 1
+                if self.start_calls < 3:
+                    raise RuntimeError(f"failure {self.start_calls}")
+                self.status.connected = True
+
+            async def _emit_error(self, error: str) -> None:
+                self.errors.append(error)
+
+        gateway = Gateway()
+        coordinator.gateways = {"gateway-1": gateway}
+
+        await coordinator._delayed_reconnect("gateway-1")
+
+        assert delays == [30.0, 60.0, 120.0]
+        assert gateway.stop_calls == 3
+        assert gateway.start_calls == 3
+        assert gateway.errors == [
+            "Reconnect failed: failure 1",
+            "Reconnect failed: failure 2",
+        ]
+
+    asyncio.run(run())
+
+
+def test_reconnect_joins_pending_start_before_retry(monkeypatch) -> None:
+    """Reconnect must not stop or duplicate an in-flight BLE constructor."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+        coordinator = object.__new__(coordinator_class)
+        coordinator._shutting_down = False
+        coordinator._reconnect_suspended = False
+        coordinator._reconnect_delay = lambda _attempt: 0.0
+
+        order = []
+        pending_joined = asyncio.Event()
+        release_pending = asyncio.Event()
+        original_sleep = asyncio.sleep
+
+        async def fast_sleep(_delay: float) -> None:
+            order.append("sleep")
+            await original_sleep(0)
+
+        monkeypatch.setattr(asyncio, "sleep", fast_sleep)
+
+        class Gateway:
+            def __init__(self) -> None:
+                self.status = SimpleNamespace(connected=False)
+                self.start_pending = True
+
+            async def async_start(self) -> None:
+                if self.start_pending:
+                    order.append("join")
+                    pending_joined.set()
+                    await release_pending.wait()
+                    self.start_pending = False
+                    raise RuntimeError("original start failed")
+                order.append("retry")
+                self.status.connected = True
+
+            async def async_stop(self) -> None:
+                order.append("stop")
+
+            async def _emit_error(self, _error: str) -> None:
+                return None
+
+        coordinator.gateways = {"gateway-1": Gateway()}
+        reconnect_task = asyncio.create_task(coordinator._delayed_reconnect("gateway-1"))
+
+        await pending_joined.wait()
+        assert order == ["join"]
+        release_pending.set()
+        await reconnect_task
+
+        assert order == ["join", "sleep", "stop", "retry"]
+
+    asyncio.run(run())
+
+
+def test_reconnect_backoff_is_exponential_jittered_and_capped(monkeypatch) -> None:
+    coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+
+    first = coordinator_class._reconnect_delay(0)
+    second = coordinator_class._reconnect_delay(1)
+    capped = coordinator_class._reconnect_delay(100)
+
+    assert 24.0 <= first <= 36.0
+    assert 48.0 <= second <= 72.0
+    assert second > first
+    assert 240.0 <= capped <= 300.0
+
+
+def test_shutdown_cancels_reconnect_before_transport_restart(monkeypatch) -> None:
+    """A reconnect sleeping during unload cannot restart its gateway."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+        coordinator = object.__new__(coordinator_class)
+        coordinator._shutting_down = False
+        coordinator._reconnect_suspended = False
+        coordinator._reconnect_delay = lambda _attempt: 30.0
+
+        sleep_started = asyncio.Event()
+
+        async def blocking_sleep(_delay: float) -> None:
+            sleep_started.set()
+            await asyncio.Future()
+
+        monkeypatch.setattr(asyncio, "sleep", blocking_sleep)
+
+        class Gateway:
+            def __init__(self) -> None:
+                self.status = SimpleNamespace(connected=False)
+                self.start_pending = False
+                self.calls = []
+
+            async def async_stop(self) -> None:
+                self.calls.append("stop")
+
+            async def async_start(self) -> None:
+                self.calls.append("start")
+
+            async def _emit_error(self, _error: str) -> None:
+                return None
+
+        gateway = Gateway()
+        coordinator.gateways = {"gateway-1": gateway}
+        reconnect_task = asyncio.create_task(coordinator._delayed_reconnect("gateway-1"))
+        coordinator._reconnect_tasks = {"gateway-1": reconnect_task}
+
+        await sleep_started.wait()
+        coordinator._shutting_down = True
+        coordinator._reconnect_suspended = True
+        await coordinator._cancel_reconnect_tasks()
+
+        assert reconnect_task.cancelled()
+        assert coordinator._reconnect_tasks == {}
+        assert gateway.calls == []
 
     asyncio.run(run())

@@ -50,6 +50,20 @@
           "verify_connection": "Recommended. Turn this off only when intentionally configuring an offline gateway."
         }
       },
+      "pair_intro": {
+        "title": "Pair the Meshtastic radio",
+        "description": "Close the Meshtastic phone app, wake the radio, and keep its screen visible. Continuing starts one time-limited pairing request for the selected local radio.",
+        "data": {
+          "ready_to_pair": "I am ready to start pairing"
+        }
+      },
+      "pair_pin": {
+        "title": "Enter the radio's Bluetooth PIN",
+        "description": "Enter the six-digit code now shown by a RANDOM_PIN radio, or the configured fixed code for a screenless radio. The code expires shortly and is never saved by MeshNet.",
+        "data": {
+          "pairing_pin": "Six-digit Bluetooth PIN"
+        }
+      },
       "more": {
         "title": "Gateway added",
         "description": "Configured gateways:\n\n{gateways}",
@@ -68,13 +82,32 @@
     },
     "abort": {
       "already_configured": "MeshNet is already configured. Open its Configure dialog to manage gateways.",
-      "invalid_import": "The imported MeshNet configuration is invalid. Check gateway IDs and transport fields."
+      "invalid_import": "The imported MeshNet configuration is invalid. Check gateway IDs and transport fields.",
+      "invalid_discovery": "The Bluetooth discovery did not contain a safe device address.",
+      "bluetooth_requires_gui": "Meshtastic Bluetooth must be added through the MeshNet setup wizard so the local bond can be verified safely.",
+      "pairing_state_lost": "The time-limited Bluetooth pairing request ended. Start pairing again."
+    },
+    "progress": {
+      "pairing": "Starting a protected pairing request for the selected local radio…",
+      "verifying_pairing": "Verifying the Bluetooth bond and Meshtastic service…"
     },
     "error": {
       "cannot_connect": "Home Assistant could not reach this gateway. Check its address, port, device mapping, and permissions, or turn off the connection test to save an offline gateway.",
       "invalid_auth": "The gateway rejected the API key.",
       "missing_dependency": "This method needs another Home Assistant integration. Configure MQTT first, then try again.",
-      "invalid_gateway": "The gateway settings are incomplete, duplicated, or invalid for this radio and connection method."
+      "invalid_gateway": "The gateway settings are incomplete, duplicated, or invalid for this radio and connection method.",
+      "bluez_unavailable": "Home Assistant could not open the local BlueZ pairing service. Bluetooth proxies and remote adapters cannot perform this pairing.",
+      "invalid_pin": "Enter exactly six ASCII digits.",
+      "local_adapter_required": "The selected radio was not found on a local BlueZ adapter. Bluetooth proxy-only devices cannot be paired here.",
+      "not_meshtastic_device": "The selected Bluetooth device did not expose the Meshtastic service.",
+      "pairing_cancelled": "The pairing request was cancelled. Wake the radio and start again.",
+      "pairing_cleanup_incomplete": "BlueZ may have kept the bond after verification failed. Cancel this setup and restart Bluetooth before retrying; MeshNet will not automatically delete an ambiguous bond.",
+      "pairing_ownership_pending": "Another MeshNet pairing flow still controls this radio. Finish or cancel that flow before retrying; restart Home Assistant if that flow is no longer open.",
+      "pairing_confirmation_required": "Confirm that the radio is ready before pairing.",
+      "pairing_failed": "Bluetooth pairing failed safely without saving the gateway.",
+      "pairing_rate_limited": "Too many pairing requests were started for this radio. Wait about 10 minutes before trying again.",
+      "pairing_rejected": "The radio or BlueZ rejected the pairing request. Check the PIN, close other clients, and try again.",
+      "pairing_timeout": "The pairing request expired. Start again promptly; if asked for a PIN, enter the displayed code within about 50 seconds."
     }
   },
   "options": {
@@ -155,10 +188,25 @@
       },
       "remove_gateway": {
         "title": "Remove a gateway",
-        "description": "This removes the connection from MeshNet. It does not change or erase the radio.",
+        "description": "This removes the connection from MeshNet. Bluetooth cleanup is optional and off by default; removing the radio's current BlueZ bond may disconnect other apps that use it.",
         "data": {
           "gateway": "Gateway",
-          "confirm": "I understand and want to remove this gateway"
+          "confirm": "I understand and want to remove this gateway",
+          "remove_bluetooth_bond": "Remove this radio's current Bluetooth bond (may disconnect other apps)"
+        }
+      },
+      "pair_intro": {
+        "title": "Pair the Meshtastic radio",
+        "description": "Close the Meshtastic phone app, wake the radio, and keep its screen visible. Continuing starts one time-limited pairing request for the selected local radio.",
+        "data": {
+          "ready_to_pair": "I am ready to start pairing"
+        }
+      },
+      "pair_pin": {
+        "title": "Enter the radio's Bluetooth PIN",
+        "description": "Enter the six-digit code now shown by a RANDOM_PIN radio, or the configured fixed code for a screenless radio. The code expires shortly and is never saved by MeshNet.",
+        "data": {
+          "pairing_pin": "Six-digit Bluetooth PIN"
         }
       },
       "general": {
@@ -178,7 +226,12 @@
       }
     },
     "abort": {
-      "no_gateways": "There are no gateways to edit or remove. Choose Add a gateway instead."
+      "no_gateways": "There are no gateways to edit or remove. Choose Add a gateway instead.",
+      "pairing_state_lost": "The time-limited Bluetooth pairing request ended. Start pairing again."
+    },
+    "progress": {
+      "pairing": "Starting a protected pairing request for the selected local radio…",
+      "verifying_pairing": "Verifying the Bluetooth bond and Meshtastic service…"
     },
     "error": {
       "cannot_connect": "Home Assistant could not reach this gateway. Check the endpoint or turn off the connection test to save it offline.",
@@ -186,7 +239,22 @@
       "missing_dependency": "Configure the Home Assistant MQTT integration first.",
       "invalid_gateway": "The gateway settings are incomplete, duplicated, or invalid.",
       "invalid_gateways": "Gateway JSON must be a list of valid gateway objects with unique gateway IDs.",
-      "confirmation_required": "Check the confirmation box before removing the gateway."
+      "confirmation_required": "Check the confirmation box before removing the gateway.",
+      "bluetooth_cleanup_failed": "MeshNet could not verify removal of the current Bluetooth bond. The gateway was kept and no unattended cleanup will be attempted.",
+      "bluetooth_requires_gui": "Add or replace a Meshtastic Bluetooth gateway with the guided Add/Edit form so its local bond is verified safely.",
+      "owned_bond_requires_guided_change": "This change would move a MeshNet pairing record to a different radio. Remove the gateway, then add the replacement radio through guided setup.",
+      "bluez_unavailable": "Home Assistant could not open the local BlueZ pairing service. Bluetooth proxies and remote adapters cannot perform this pairing.",
+      "invalid_pin": "Enter exactly six ASCII digits.",
+      "local_adapter_required": "The selected radio was not found on a local BlueZ adapter. Bluetooth proxy-only devices cannot be paired here.",
+      "not_meshtastic_device": "The selected Bluetooth device did not expose the Meshtastic service.",
+      "pairing_cancelled": "The pairing request was cancelled. Wake the radio and start again.",
+      "pairing_cleanup_incomplete": "BlueZ may have kept the bond after verification failed. Cancel this setup and restart Bluetooth before retrying; MeshNet will not automatically delete an ambiguous bond.",
+      "pairing_ownership_pending": "Another MeshNet pairing flow still controls this radio. Finish or cancel that flow before retrying; restart Home Assistant if that flow is no longer open.",
+      "pairing_confirmation_required": "Confirm that the radio is ready before pairing.",
+      "pairing_failed": "Bluetooth pairing failed safely without saving the gateway.",
+      "pairing_rate_limited": "Too many pairing requests were started for this radio. Wait about 10 minutes before trying again.",
+      "pairing_rejected": "The radio or BlueZ rejected the pairing request. Check the PIN, close other clients, and try again.",
+      "pairing_timeout": "The pairing request expired. Start again promptly; if asked for a PIN, enter the displayed code within about 50 seconds."
     }
   },
   "issues": {

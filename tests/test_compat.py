@@ -22,7 +22,7 @@ def test_percentage_unit_uses_ratio_enum_when_available() -> None:
 
 
 def test_percentage_unit_falls_back_for_older_home_assistant() -> None:
-    """The declared Home Assistant 2025.1 floor still exposes PERCENTAGE."""
+    """The declared Home Assistant 2025.1.4 floor still exposes PERCENTAGE."""
     result = percentage_unit(SimpleNamespace(PERCENTAGE="%"))
 
     assert result == "%"

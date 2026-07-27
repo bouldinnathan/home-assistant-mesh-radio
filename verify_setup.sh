@@ -216,7 +216,7 @@ check_ha_version() {
   [[ -n "${CONFIG_DIR}" ]] || return 0
   local version_file="${CONFIG_DIR}/.HA_VERSION"
   if [[ ! -f "${version_file}" ]]; then
-    warn "Home Assistant version file not found; confirm Home Assistant 2025.1 or newer"
+    warn "Home Assistant version file not found; confirm Home Assistant 2025.1.4 or newer"
     return 0
   fi
   local detected oldest
@@ -226,9 +226,9 @@ check_ha_version() {
     return 0
   fi
   if command_exists sort; then
-    oldest="$(printf '%s\n%s\n' "2025.1.0" "${detected}" | sort -V | head -1)"
-    if [[ "${oldest}" != "2025.1.0" ]]; then
-      fail_required "Home Assistant ${detected} is older than the supported minimum 2025.1"
+    oldest="$(printf '%s\n%s\n' "2025.1.4" "${detected}" | sort -V | head -1)"
+    if [[ "${oldest}" != "2025.1.4" ]]; then
+      fail_required "Home Assistant ${detected} is older than the supported minimum 2025.1.4"
       return 0
     fi
   fi

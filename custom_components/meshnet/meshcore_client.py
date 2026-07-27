@@ -29,7 +29,6 @@ from .models import (
     utcnow,
 )
 
-
 _LOGGER = logging.getLogger(__name__)
 
 

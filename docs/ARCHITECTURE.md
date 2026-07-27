@@ -43,6 +43,71 @@ Responsibilities:
 
 Supported transports are validated before runtime setup.
 
+## Meshtastic Bluetooth Pairing Boundary (version 0.4)
+
+Bluetooth discovery and pairing are separate trust decisions:
+
+```text
+Home Assistant discovery cache
+        |
+        v
+Meshtastic UUID filter -> dropdown / canonical manual MAC
+        |
+        v
+Local BlueZ device verification
+        |
+        v
+Temporary app-scoped Agent1 -> exact Device1.Pair
+        |
+        v
+Re-read bonded state -> begin Meshtastic SDK connection
+```
+
+`custom_components/meshnet/bluetooth_devices.py` filters cached advertisements
+for the Meshtastic service UUID, canonicalizes MAC addresses, and constructs the
+selection list. A cached advertisement is not proof that a device belongs to a
+local adapter because Home Assistant Bluetooth proxies also populate discovery.
+The pairing backend therefore requires the exact device on a local BlueZ
+adapter before changing bond state. Proxies are rejected.
+
+Meshtastic 2.7.11 does not expose controller selection. Pairing and runtime
+therefore require the verified physical controller to be the sole powered local
+adapter. MeshNet stores both its current `hciN` name and stable Adapter1 address,
+then checks the stable identity before constructing the SDK interface.
+
+For each request, MeshNet opens a bounded pairing session, registers a temporary
+application-scoped BlueZ agent, and invokes pairing for only the selected device
+on that connection. It never requests the system-default agent role. Agent
+callbacks for any other BlueZ device fail closed. The PIN handoff and pairing
+prompt expire after about 50 seconds, the whole transaction has a 75-second
+limit, and cancellation/error paths unregister the agent and release the
+connection.
+
+Pairing and PIN submissions reuse an existing task so a duplicate browser
+request cannot start another transaction. If verification fails after Pair,
+rollback runs immediately on the active D-Bus connection and is bounded. BlueZ
+failure or process shutdown can still leave external daemon state.
+
+When Pair succeeds but rollback cannot be verified, MeshNet retains the exact
+Device1 path, stable controller identity, and BlueZ owner only long enough to
+block overlapping MeshNet flows. Flow removal releases that process-local proof
+without delayed deletion. BlueZ has no bond-generation identifier, so an old
+address/path cannot safely authorize `RemoveDevice` after another client may
+have recreated the bond.
+
+The PIN is transient: it is password-masked in the form and is not included in
+gateway options, persistence, diagnostics, or logging. After pairing, MeshNet
+re-reads BlueZ state before starting the provider client.
+
+MeshNet records the radio address, current `hciN` name, and stable controller
+address when it pairs a radio, but the record proves only historical setup.
+Entry deletion and HACS removal do not change BlueZ, and ending an already-idle
+flow cannot start delayed deletion. Canceling an active pairing transaction may
+immediately roll back its uncommitted bond using the exact Device1 and stable
+controller guards. The Configure removal form can perform a warned, explicitly
+confirmed deletion of the current same-address bond; the option defaults off
+because other clients may share or have recreated it.
+
 ## Normalized Models
 
 File:
@@ -195,3 +260,14 @@ Purpose:
 - Keep setup scripts safe and idempotent.
 - Do not silently edit Home Assistant YAML.
 - Require admin access for UI/API paths that can transmit messages.
+- Restrict Bluetooth pairing to a verified local BlueZ device and a temporary,
+  non-default agent.
+- Never persist or log a Bluetooth pairing PIN.
+
+## Isolation Boundary
+
+HACS custom integrations run inside the Home Assistant Core process. Strict
+pairing validation and bounded cleanup reduce the Bluetooth attack surface, but
+they do not isolate a crash or dependency failure from Home Assistant. True
+process isolation requires a separate Home Assistant App or sidecar with a
+small inter-process contract, such as MQTT.

@@ -11,13 +11,14 @@ jobs:
   unit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: python -m pip install --upgrade pip
-      - run: python -m pip install pytest
+      - run: python -m pip install pytest ruff
       - run: python -m compileall -q custom_components tests
+      - run: python -m ruff check .
       - run: bash -n setup.sh install.sh verify_setup.sh uninstall.sh
       - run: pytest
 
@@ -35,8 +36,8 @@ jobs:
             python: "3.14"
     name: Home Assistant ${{ matrix.label }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "${{ matrix.python }}"
           cache: pip
@@ -49,13 +50,18 @@ jobs:
       - name: Import integration against Home Assistant
         run: |
           python - <<'PY'
+          import dbus_fast
           import homeassistant.const
           import custom_components.meshnet.config_flow
           import custom_components.meshnet.coordinator
           import custom_components.meshnet.entities.binary_sensors
           import custom_components.meshnet.entities.device_tracker
           import custom_components.meshnet.entities.sensors
-          print("MeshNet Home Assistant imports passed")
+          print("MeshNet Home Assistant and dbus-fast imports passed")
           PY
       - run: python -m pip install pytest
-      - run: pytest -q tests/test_config_flow_ha.py
+      - run: >-
+          pytest -q
+          tests/test_config_flow_ha.py
+          tests/test_bluetooth_pairing.py
+      - run: python -m pip check

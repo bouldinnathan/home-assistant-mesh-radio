@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from custom_components.meshnet.models import MessageRecord, MeshPacket, NodeState
+from custom_components.meshnet.models import MeshPacket, MessageRecord, NodeState
 from custom_components.meshnet.store import MeshStore
 
 

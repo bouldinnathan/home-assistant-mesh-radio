@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
-import logging
 from typing import Any
 
 from .models import GatewayConfig, GatewayStatus, MeshPacket, NodeState, utcnow
@@ -65,6 +65,7 @@ class MeshGateway(ABC):
 
     async def async_refresh(self) -> None:
         """Refresh gateway state if supported."""
+        return None
 
     async def _emit_packet(self, packet: MeshPacket) -> None:
         self.status.packets_received += 1

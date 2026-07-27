@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import random
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
-import logging
 from pathlib import Path
 from typing import Any
 
@@ -46,9 +47,9 @@ from .meshtastic_client import MeshtasticClient
 from .models import (
     GatewayConfig,
     GatewayStatus,
-    MessageRecord,
     MeshPacket,
     MeshSnapshot,
+    MessageRecord,
     NodeState,
     stable_json,
     timestamp_to_json,
@@ -57,8 +58,11 @@ from .models import (
 from .rate_limiter import TokenBucket
 from .store import MeshStore
 
-
 _LOGGER = logging.getLogger(__name__)
+
+_RECONNECT_INITIAL_DELAY = 30.0
+_RECONNECT_MAX_DELAY = 300.0
+_RECONNECT_JITTER_RATIO = 0.2
 
 
 class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
@@ -78,6 +82,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         self._outbox_flush_owner: asyncio.Task[Any] | None = None
         self._reconnect_tasks: dict[str, asyncio.Task[Any]] = {}
         self._shutting_down = False
+        self._reconnect_suspended = False
         super().__init__(
             hass,
             _LOGGER,
@@ -111,11 +116,8 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
     async def async_shutdown(self) -> None:
         """Stop gateways and close durable storage."""
         self._shutting_down = True
-        for task in list(self._reconnect_tasks.values()):
-            task.cancel()
-        if self._reconnect_tasks:
-            await asyncio.gather(*self._reconnect_tasks.values(), return_exceptions=True)
-        self._reconnect_tasks.clear()
+        self._reconnect_suspended = True
+        await self._cancel_reconnect_tasks()
         for gateway in list(self.gateways.values()):
             try:
                 await gateway.async_stop()
@@ -125,10 +127,15 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
 
     async def async_reload_gateways(self) -> None:
         """Reload gateway configuration from the current config entry."""
-        for gateway in list(self.gateways.values()):
-            await gateway.async_stop()
-        self._gateway_configs = self._load_gateway_configs(self.entry)
-        await self._rebuild_gateways()
+        self._reconnect_suspended = True
+        try:
+            await self._cancel_reconnect_tasks()
+            for gateway in list(self.gateways.values()):
+                await gateway.async_stop()
+            self._gateway_configs = self._load_gateway_configs(self.entry)
+            await self._rebuild_gateways()
+        finally:
+            self._reconnect_suspended = False
         await self._start_gateways()
 
     async def async_send_message(
@@ -285,10 +292,10 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         self.snapshot.gateways[status.gateway_id] = status
         if status.connected:
             reconnect_task = self._reconnect_tasks.pop(status.gateway_id, None)
-            if reconnect_task:
+            if reconnect_task and reconnect_task is not asyncio.current_task():
                 reconnect_task.cancel()
             await self._flush_outbox(gateway_id=status.gateway_id)
-        elif not self._shutting_down:
+        elif not self._shutting_down and not self._reconnect_suspended:
             self._schedule_reconnect(status.gateway_id)
         self.async_set_updated_data(self.snapshot)
 
@@ -387,24 +394,79 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                 self._outbox_flush_owner = None
 
     def _schedule_reconnect(self, gateway_id: str) -> None:
-        if gateway_id in self._reconnect_tasks:
+        if self._shutting_down or self._reconnect_suspended or gateway_id in self._reconnect_tasks:
             return
         task = self.hass.async_create_task(self._delayed_reconnect(gateway_id))
         self._reconnect_tasks[gateway_id] = task
-        task.add_done_callback(lambda _: self._reconnect_tasks.pop(gateway_id, None))
+
+        def clear_reconnect(done_task: asyncio.Task[Any]) -> None:
+            if self._reconnect_tasks.get(gateway_id) is done_task:
+                self._reconnect_tasks.pop(gateway_id, None)
+
+        task.add_done_callback(clear_reconnect)
 
     async def _delayed_reconnect(self, gateway_id: str) -> None:
-        await asyncio.sleep(30)
-        if self._shutting_down:
-            return
-        gateway = self.gateways.get(gateway_id)
-        if gateway is None or gateway.status.connected:
-            return
-        try:
-            await gateway.async_stop()
-            await gateway.async_start()
-        except Exception as err:
-            await gateway._emit_error(f"Reconnect failed: {err}")
+        attempt = 0
+        while not self._shutting_down and not self._reconnect_suspended:
+            gateway = self.gateways.get(gateway_id)
+            if gateway is None or gateway.status.connected:
+                return
+
+            # A Meshtastic BLE constructor is synchronous underneath its async
+            # executor wrapper. Join that single-flight start instead of stopping
+            # it or queueing another constructor in Home Assistant's executor.
+            if getattr(gateway, "start_pending", False):
+                try:
+                    await gateway.async_start()
+                except Exception:
+                    pass
+                continue
+
+            await asyncio.sleep(self._reconnect_delay(attempt))
+            if self._shutting_down or self._reconnect_suspended:
+                return
+
+            gateway = self.gateways.get(gateway_id)
+            if gateway is None or gateway.status.connected:
+                return
+            if getattr(gateway, "start_pending", False):
+                continue
+
+            try:
+                await gateway.async_stop()
+                if self._shutting_down or self._reconnect_suspended:
+                    return
+                await gateway.async_start()
+            except Exception as err:
+                if self._shutting_down or self._reconnect_suspended:
+                    return
+                await gateway._emit_error(f"Reconnect failed: {err}")
+
+            if gateway.status.connected:
+                return
+            attempt += 1
+
+    @staticmethod
+    def _reconnect_delay(attempt: int) -> float:
+        """Return capped exponential reconnect delay with bounded jitter."""
+        exponent = min(max(attempt, 0), 16)
+        base_delay = min(_RECONNECT_INITIAL_DELAY * (2**exponent), _RECONNECT_MAX_DELAY)
+        jitter = base_delay * _RECONNECT_JITTER_RATIO
+        return min(
+            _RECONNECT_MAX_DELAY,
+            max(0.0, random.uniform(base_delay - jitter, base_delay + jitter)),
+        )
+
+    async def _cancel_reconnect_tasks(self) -> None:
+        """Cancel and drain all reconnect loops."""
+        reconnect_tasks = list(self._reconnect_tasks.values())
+        for task in reconnect_tasks:
+            task.cancel()
+        if reconnect_tasks:
+            await asyncio.gather(*reconnect_tasks, return_exceptions=True)
+        for gateway_id, task in list(self._reconnect_tasks.items()):
+            if task in reconnect_tasks:
+                self._reconnect_tasks.pop(gateway_id, None)
 
     def _select_gateway(self, *, gateway_id: str | None, target_node: str | None) -> MeshGateway | None:
         if gateway_id:

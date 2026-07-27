@@ -14,7 +14,7 @@ MeshNet turns Home Assistant into one operating surface for Meshtastic and MeshC
 
 [Open MeshNet in HACS](https://my.home-assistant.io/redirect/hacs_repository/?owner=bouldinnathan&repository=home-assistant-mesh-radio&category=integration)
 
-MeshNet targets Home Assistant 2025.1 and newer. Evaluate the current custom
+MeshNet targets Home Assistant 2025.1.4 and newer. Evaluate the current custom
 integration only on a test Home Assistant OS or Container instance; the isolated
 App/sidecar described below is the intended production package. Existing Core
 and Supervised installations can run the integration only on a best-effort basis.
@@ -55,6 +55,12 @@ radio platform -> connection method -> relevant fields -> connection test -> add
 
 No YAML or gateway JSON is needed. Later, choose **Configure** on the MeshNet integration to add, edit, or remove gateways.
 
+For Meshtastic Bluetooth, Home Assistant commits verified connection metadata
+immediately with safe global defaults. MeshNet attempts rollback inside the
+active pairing transaction if verification fails. After that transaction ends,
+it preserves external BlueZ state instead of guessing that a same-address bond
+still belongs to MeshNet.
+
 For USB serial, the setup form lists local devices visible to Home Assistant. Choose one from the dropdown, or type an advanced path such as `/dev/serial/by-id/usb-YOUR_RADIO` or a custom container mapping.
 
 ## Pick the easiest connection
@@ -71,6 +77,42 @@ For USB serial, the setup form lists local devices visible to Home Assistant. Ch
 | MeshCore | MQTT/REST JSON bridge | Advanced; requires a bridge implementing the documented JSON contract |
 
 MQTT is not a magic replacement for a broker or bridge. Meshtastic MQTT consumes only the decoded `/json/` branch; MeshCore MQTT and REST require a compatible external JSON bridge.
+
+### Meshtastic Bluetooth pairing in version 0.4
+
+> [!NOTE]
+> This describes the version 0.4 behavior. Install a version 0.4 build before
+> expecting these pairing controls in Home Assistant.
+
+Version 0.4 adds a Home Assistant pairing wizard for Meshtastic radios on a
+local BlueZ adapter. Choose a discovered radio from the dropdown, or use the
+advanced field to enter its canonical MAC address (for example,
+`AA:BB:CC:DD:EE:FF`). Bluetooth proxies cannot perform this direct pairing.
+Because Meshtastic 2.7.11 cannot select a Linux controller, the paired adapter
+must be the only powered local Bluetooth adapter; additional adapters may stay
+installed but must be powered off. MeshNet records the controller's stable
+hardware address, so Linux `hciN` renumbering cannot redirect runtime validation
+or an explicitly confirmed cleanup to another adapter.
+
+Close the Meshtastic phone app before pairing; a radio normally accepts only
+one Bluetooth client at a time. Select **Start pairing**, then enter the
+six-digit code shown by a screened radio using `RANDOM_PIN`. A screenless radio
+can instead use its configured fixed PIN. The factory default may be `123456`,
+but change that default in Meshtastic before relying on Bluetooth.
+
+The PIN field is password-masked, and MeshNet does not store or log the PIN.
+The PIN prompt expires after about 50 seconds; the entire pairing transaction
+has a 75-second limit. On Home Assistant OS, this flow is intended to replace
+normal-use root-shell or `bluetoothctl` instructions.
+
+BlueZ provides no identifier for a particular generation of a bond. MeshNet
+therefore never removes a Bluetooth bond during config-entry deletion or HACS
+uninstall, and abandoning a flow after its pairing transaction has ended never
+starts delayed cleanup. Canceling an active pairing transaction may immediately
+roll back the still-uncommitted bond using identity-guarded D-Bus state.
+**Configure → Remove gateway** offers an optional current-bond removal checkbox
+that is off by default and warns that other apps may be disconnected. Leaving it
+off preserves the BlueZ bond.
 
 ## Container hardware access
 
@@ -95,7 +137,9 @@ volumes:
   - /run/dbus:/run/dbus:ro
 ```
 
-The radio SDKs currently require a local Bluetooth adapter; Home Assistant Bluetooth proxies are not supported for these direct connections.
+The radio SDKs require a local Bluetooth adapter; Home Assistant Bluetooth
+proxies are not supported for these direct connections or for the version 0.4
+pairing wizard.
 
 ## Verify and troubleshoot
 

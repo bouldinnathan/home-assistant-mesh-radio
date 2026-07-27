@@ -287,6 +287,60 @@ Configure MeshNet with:
 serial_path: /dev/meshtastic0
 ```
 
+### Meshtastic Bluetooth Pairing Fails (version 0.4)
+
+The version 0.4 pairing wizard works only through a local BlueZ adapter on the
+Home Assistant host. Bluetooth proxies cannot pair a Meshtastic radio or carry
+this direct SDK connection.
+
+Only one local Bluetooth adapter may be powered. Meshtastic 2.7.11 cannot
+select a controller, so MeshNet refuses pairing and runtime startup when more
+than one is powered or when the verified adapter is off. Installed extra
+adapters can remain powered off.
+
+Before retrying:
+
+1. Close the Meshtastic phone app and disconnect other Bluetooth clients. A
+   radio normally accepts only one Bluetooth client at a time.
+2. Confirm Bluetooth is enabled on the radio. Some Meshtastic hardware disables
+   Bluetooth while Wi-Fi is enabled.
+3. Move the radio close to the Home Assistant host's local adapter.
+4. Select the radio from the dropdown. If entering it manually, use the exact
+   canonical MAC form `AA:BB:CC:DD:EE:FF`.
+5. Select **Start pairing** again and answer within about 50 seconds.
+
+For a screened radio using `RANDOM_PIN`, the display should show a six-digit
+code only after pairing starts. Enter that code in the password-masked field.
+For a screenless radio, use its configured fixed PIN. The factory value may be
+`123456`, but change that default in Meshtastic before regular use.
+
+If no PIN appears:
+
+- Verify that the radio is configured for `RANDOM_PIN`, not fixed-PIN or
+  no-PIN mode.
+- Wake the screen and restart the pairing request.
+- Disconnect the phone app completely; merely putting it in the background may
+  leave its Bluetooth connection open.
+- Restart Bluetooth on the radio, then retry from MeshNet.
+
+If the radio pairs but no data arrives, another client may have reclaimed its
+single Bluetooth connection. Close that client and reload the MeshNet config
+entry. MeshNet never removes a bond during entry/HACS teardown. If you
+deliberately want to delete the current address-scoped bond, use **Configure →
+Remove gateway** and enable **Remove this radio's current Bluetooth bond (may
+disconnect other apps)**. The option is off by default because BlueZ cannot
+distinguish a bond another app recreated at the same address.
+
+On Home Assistant OS, do not use root-shell or `bluetoothctl` steps for the
+normal version 0.4 path. The wizard creates a temporary agent scoped to the
+selected radio and cleans it up after success, error, cancellation, or timeout.
+If the wizard reports that the local BlueZ service is unavailable, restart the
+host Bluetooth service or Home Assistant and retry; a proxy cannot substitute
+for the missing local adapter.
+
+MeshNet never stores or logs the PIN or raw BlueZ daemon error text. The UI shows
+a safe failure category; it cannot recover a lost code, so start a new request.
+
 ### TCP Connection Refused
 
 Check:

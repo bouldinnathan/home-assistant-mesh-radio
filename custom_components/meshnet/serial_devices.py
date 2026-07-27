@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from glob import glob
-import os
-
 
 DEFAULT_BY_ID_DIRECTORY = "/dev/serial/by-id"
 DEFAULT_FALLBACK_PATTERNS = ("/dev/ttyACM*", "/dev/ttyUSB*")

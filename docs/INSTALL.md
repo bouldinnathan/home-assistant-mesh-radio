@@ -5,7 +5,7 @@ This guide installs the MeshNet Home Assistant custom integration and verifies t
 ## Supported Systems
 
 Supported test deployments for the current in-process integration (Home
-Assistant 2025.1 or newer):
+Assistant 2025.1.4 or newer):
 
 - Home Assistant OS
 - Home Assistant Container with Docker or Docker Compose
@@ -19,7 +19,8 @@ Home Assistant ended production support for Core and Supervised with 2025.12. Ne
 
 For a production deployment that requires fault isolation, use the standalone
 App/MQTT architecture in [Distribution and isolation](DISTRIBUTION.md). It has
-not yet been implemented in this repository.
+not yet been implemented in this repository. HACS installs the integration into
+the Home Assistant Core process; it does not provide process or crash isolation.
 
 Supported host operating systems for the helper scripts:
 
@@ -323,7 +324,9 @@ After installing and restarting:
 6. Choose a filtered connection method.
 7. Enter only the fields shown for that method.
 8. Keep **Test before saving** enabled to catch network, device, MQTT, and REST problems from inside Home Assistant.
-9. Add another gateway if needed, then finish setup.
+9. Add another gateway if needed, then finish setup. A verified Meshtastic
+   Bluetooth gateway instead saves immediately; use **Configure** afterward to
+   add more gateways or change global options.
 
 Use the integration's **Configure** button later to add, edit, or remove gateways without editing JSON.
 
@@ -336,6 +339,30 @@ Required transport fields:
 | Bluetooth | `ble_address` |
 | MQTT | Home Assistant MQTT configured and a decoded JSON subscribe topic |
 | REST | `api_url` |
+
+### Meshtastic Bluetooth first pairing (version 0.4)
+
+Version 0.4 performs Meshtastic pairing in the Home Assistant form. It requires
+a local BlueZ adapter; a Home Assistant Bluetooth proxy is not a supported
+pairing or connection path. Select a discovered radio, or use the advanced
+field with a canonical MAC address such as `AA:BB:CC:DD:EE:FF`.
+
+The verified adapter must be the only powered local Bluetooth adapter because
+Meshtastic 2.7.11 cannot select between Linux controllers. Additional adapters
+can remain installed while powered off.
+
+Close the Meshtastic phone app and any other Bluetooth client first. Select
+**Start pairing**, then enter the six-digit `RANDOM_PIN` displayed by a screened
+radio. For a screenless radio, enter its configured fixed PIN. The factory
+default may be `123456`; change it in Meshtastic before regular use. The PIN
+field is masked and the value is never stored or logged. The PIN prompt expires
+after about 50 seconds, and the entire pairing transaction has a 75-second
+limit.
+
+Home Assistant OS users do not need a root shell or `bluetoothctl` for this
+normal version 0.4 pairing path. Home Assistant Container still needs host
+BlueZ, the system D-Bus mount, and the Bluetooth capabilities described in the
+[README](../README.md#container-hardware-access).
 
 ## Verify Everything Works
 
@@ -505,7 +532,18 @@ Restart Home Assistant after restoring.
 
 ## Uninstall
 
-First delete the MeshNet integration entry while its code is still loaded:
+Deleting the config entry or uninstalling through HACS never changes external
+BlueZ bonds. This is deliberate: BlueZ exposes no bond-generation identifier,
+so a stored address cannot prove that another app did not recreate the current
+bond later.
+
+If you intentionally want to remove the radio's current bond, first open
+**Configure → Remove gateway**, enable **Remove this radio's current Bluetooth
+bond (may disconnect other apps)**, and confirm. That option is off by default.
+If cleanup fails, the gateway is kept; leaving the option off removes only the
+MeshNet gateway and preserves Bluetooth state.
+
+Then delete the MeshNet integration entry:
 
 ```text
 Settings -> Devices & Services -> MeshNet -> three-dot menu -> Delete

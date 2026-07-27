@@ -9,8 +9,8 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import DOMAIN
 from .coordinator import MeshNetCoordinator
 from .entities.sensors import (
-    MeshNetSummarySensor,
     SUMMARY_SENSORS,
+    MeshNetSummarySensor,
     gateway_sensor_entities_for_gateway,
     sensor_entities_for_node,
 )

@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import asyncio
 import hashlib
 import json
 import logging
+import re
+from datetime import UTC, datetime
 from typing import Any
 
 from .const import (
+    CONF_BLUETOOTH_ADAPTER,
+    CONF_BLUETOOTH_ADAPTER_ADDRESS,
     DEFAULT_MESHTASTIC_MQTT_TOPIC,
     PROTOCOL_MESHTASTIC,
     TRANSPORT_BLUETOOTH,
@@ -18,6 +22,7 @@ from .const import (
 )
 from .gateway import MeshGateway
 from .models import (
+    GatewayConfig,
     MeshPacket,
     NodeState,
     canonical_node_key,
@@ -27,8 +32,88 @@ from .models import (
     utcnow,
 )
 
-
 _LOGGER = logging.getLogger(__name__)
+
+_STOP_WAIT_TIMEOUT = 2.0
+_BLUEZ_ADAPTER_INTERFACE = "org.bluez.Adapter1"
+_LOCAL_ADAPTER_RE = re.compile(r"hci[0-9]+\Z")
+_BLUETOOTH_ADDRESS_RE = re.compile(r"[0-9A-F]{2}(?::[0-9A-F]{2}){5}\Z")
+
+
+async def _async_get_local_bluetooth_adapter_details() -> dict[str, Any]:
+    """Return local BlueZ adapter details through the public HA dependency."""
+    try:
+        from bluetooth_adapters import get_bluetooth_adapter_details
+    except ImportError as err:
+        raise RuntimeError(
+            "The local Bluetooth adapter service is unavailable"
+        ) from err
+
+    try:
+        details = await get_bluetooth_adapter_details()
+    except Exception as err:
+        raise RuntimeError(
+            "Home Assistant could not verify the local Bluetooth adapters"
+        ) from err
+    if not isinstance(details, dict):
+        raise RuntimeError(
+            "Home Assistant returned invalid local Bluetooth adapter data"
+        )
+    return details
+
+
+async def _async_validate_ble_adapter(config: GatewayConfig) -> None:
+    """Fail closed unless the paired adapter is the only powered local one.
+
+    Meshtastic 2.7.11 does not expose an adapter argument for ``BLEInterface``.
+    Allowing it to start with multiple usable adapters could therefore connect
+    through a controller other than the one whose BlueZ bond we verified.
+    """
+    saved_adapter = config.options.get(CONF_BLUETOOTH_ADAPTER)
+    saved_adapter_address = config.options.get(CONF_BLUETOOTH_ADAPTER_ADDRESS)
+    if (
+        not isinstance(saved_adapter, str)
+        or _LOCAL_ADAPTER_RE.fullmatch(saved_adapter) is None
+        or not isinstance(saved_adapter_address, str)
+        or _BLUETOOTH_ADDRESS_RE.fullmatch(saved_adapter_address.upper()) is None
+        or saved_adapter_address.upper()
+        in {"00:00:00:00:00:00", "FF:FF:FF:FF:FF:FF"}
+    ):
+        raise RuntimeError(
+            "Bluetooth setup has no verified local adapter; reconfigure this gateway"
+        )
+
+    details = await _async_get_local_bluetooth_adapter_details()
+    saved_adapter_address = saved_adapter_address.upper()
+    powered_adapters: set[tuple[str, str]] = set()
+    for adapter, interfaces in details.items():
+        if (
+            not isinstance(adapter, str)
+            or _LOCAL_ADAPTER_RE.fullmatch(adapter) is None
+            or not isinstance(interfaces, dict)
+        ):
+            raise RuntimeError("Bluetooth adapter data is incomplete or invalid")
+        adapter_properties = interfaces.get(_BLUEZ_ADAPTER_INTERFACE)
+        if not isinstance(adapter_properties, dict):
+            raise RuntimeError("Bluetooth adapter data is incomplete or invalid")
+        powered = adapter_properties.get("Powered")
+        if not isinstance(powered, bool):
+            raise RuntimeError("Bluetooth adapter data is incomplete or invalid")
+        adapter_address = adapter_properties.get("Address")
+        if (
+            not isinstance(adapter_address, str)
+            or _BLUETOOTH_ADDRESS_RE.fullmatch(adapter_address.upper()) is None
+            or adapter_address.upper()
+            in {"00:00:00:00:00:00", "FF:FF:FF:FF:FF:FF"}
+        ):
+            raise RuntimeError("Bluetooth adapter data is incomplete or invalid")
+        if powered:
+            powered_adapters.add((adapter, adapter_address.upper()))
+
+    if len(powered_adapters) != 1 or next(iter(powered_adapters))[1] != saved_adapter_address:
+        raise RuntimeError(
+            "The paired Bluetooth adapter must be the only powered local adapter"
+        )
 
 
 class MeshtasticClient(MeshGateway):
@@ -39,6 +124,8 @@ class MeshtasticClient(MeshGateway):
         self._interface: Any | None = None
         self._unsub_mqtt: Any | None = None
         self._stopping = False
+        self._start_task: asyncio.Task[None] | None = None
+        self._stop_task: asyncio.Task[None] | None = None
         self._pub = None
         self._receive_handler = None
         self._connect_handler = None
@@ -48,46 +135,173 @@ class MeshtasticClient(MeshGateway):
         """Return whether a process-global pubsub event belongs to this client."""
         return self._interface is not None and interface is self._interface
 
+    @property
+    def start_pending(self) -> bool:
+        """Return whether this client already has a transport start in flight."""
+        return self._start_task is not None and not self._start_task.done()
+
     async def async_start(self) -> None:
         """Start the Meshtastic transport."""
+        stop_task = self._stop_task
+        if stop_task is not None:
+            await asyncio.shield(stop_task)
+
+        # An explicit start after a completed stop may safely adopt a still-
+        # running constructor. It must never enqueue a second constructor.
         self._stopping = False
+        start_task = self._start_task
+        if start_task is None:
+            start_task = self.hass.async_create_task(self._async_start_once())
+            self._start_task = start_task
+            start_task.add_done_callback(self._start_done)
+
+        # Cancellation of one waiter must not abandon a synchronous interface
+        # constructor that is still occupying Home Assistant's executor. A
+        # concurrent stop waits for the same task and disposes of a late result.
+        await asyncio.shield(start_task)
+
+    async def _async_start_once(self) -> None:
+        """Start one transport instance."""
         if self.config.transport == TRANSPORT_MQTT:
+            if self._unsub_mqtt is not None:
+                return
             await self._start_mqtt()
+            return
+        if self._interface is not None:
             return
         await self._start_native()
 
+    def _start_done(self, task: asyncio.Task[None]) -> None:
+        """Clear the single-flight start task without disturbing a newer one."""
+        if self._start_task is task:
+            self._start_task = None
+        if not task.cancelled():
+            # Retrieve a failure even if every public waiter was cancelled. The
+            # start path has already emitted the user-visible error.
+            task.exception()
+        if self._stopping:
+            # async_stop is intentionally bounded. If a synchronous constructor
+            # outlives that bound, its completion gets one final idempotent
+            # cleanup pass without blocking Home Assistant unload.
+            self.hass.async_create_task(self._async_cleanup_after_late_start())
+
+    def _stop_done(self, task: asyncio.Task[None]) -> None:
+        """Clear the single-flight stop task without disturbing a newer one."""
+        if self._stop_task is task:
+            self._stop_task = None
+        if not task.cancelled():
+            task.exception()
+
     async def async_stop(self) -> None:
         """Stop the Meshtastic transport."""
-        self._stopping = True
+        stop_task = self._stop_task
+        if stop_task is None:
+            # Set this before scheduling cleanup so an executor constructor that
+            # finishes concurrently cannot publish its interface as connected.
+            self._stopping = True
+            stop_task = self.hass.async_create_task(self._async_stop_once())
+            self._stop_task = stop_task
+            stop_task.add_done_callback(self._stop_done)
+        await asyncio.shield(stop_task)
+
+    async def _async_stop_once(self) -> None:
+        """Stop one transport instance and wait out any pending constructor."""
+        start_task = self._start_task
+        try:
+            if start_task is not None:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(start_task),
+                        timeout=_STOP_WAIT_TIMEOUT,
+                    )
+                except TimeoutError:
+                    self._logger.debug(
+                        "Meshtastic start did not finish within %.1f seconds; "
+                        "continuing bounded shutdown",
+                        _STOP_WAIT_TIMEOUT,
+                    )
+                except asyncio.CancelledError:
+                    if not start_task.cancelled():
+                        raise
+                except Exception:
+                    # Start errors are reported by the start path. Cleanup must
+                    # still remove subscriptions and partial state.
+                    pass
+        finally:
+            await self._async_cleanup_transport(emit_status=True)
+
+    async def _async_cleanup_transport(self, *, emit_status: bool) -> None:
+        """Detach transport state and close its interface idempotently."""
         if self._unsub_mqtt:
-            self._unsub_mqtt()
+            unsubscribe = self._unsub_mqtt
             self._unsub_mqtt = None
-        if self._pub and self._receive_handler:
             try:
-                self._pub.unsubscribe(self._receive_handler, "meshtastic.receive")
+                unsubscribe()
             except Exception as err:
-                self._logger.debug("Failed to unsubscribe Meshtastic receive handler: %s", err)
-        if self._pub and self._connect_handler:
-            try:
-                self._pub.unsubscribe(
-                    self._connect_handler,
-                    "meshtastic.connection.established",
-                )
-            except Exception as err:
-                self._logger.debug("Failed to unsubscribe Meshtastic connect handler: %s", err)
-        if self._pub and self._disconnect_handler:
-            try:
-                self._pub.unsubscribe(
-                    self._disconnect_handler,
-                    "meshtastic.connection.lost",
-                )
-            except Exception as err:
-                self._logger.debug("Failed to unsubscribe Meshtastic disconnect handler: %s", err)
+                self._logger.debug("Failed to unsubscribe Meshtastic MQTT handler: %s", err)
+        self._unsubscribe_native_events()
         if self._interface is not None:
             interface = self._interface
             self._interface = None
+            await self._async_close_interface(interface)
+        if emit_status:
+            await self._set_connected(False)
+
+    async def _async_cleanup_after_late_start(self) -> None:
+        """Clean a late start only if the client has not been started again."""
+        if not self._stopping:
+            return
+        await self._async_cleanup_transport(emit_status=False)
+
+    async def _async_close_interface(self, interface: Any) -> None:
+        """Close an interface without allowing a stuck close to hang unload."""
+        async def close_interface() -> None:
             await self.hass.async_add_executor_job(interface.close)
-        await self._set_connected(False)
+
+        close_job = self.hass.async_create_task(close_interface())
+
+        def close_done(task: asyncio.Future[Any]) -> None:
+            if task.cancelled():
+                return
+            try:
+                error = task.exception()
+            except asyncio.CancelledError:
+                return
+            if error is not None:
+                self._logger.debug("Failed to close Meshtastic interface: %s", error)
+
+        close_job.add_done_callback(close_done)
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(close_job),
+                timeout=_STOP_WAIT_TIMEOUT,
+            )
+        except TimeoutError:
+            self._logger.debug(
+                "Meshtastic interface close exceeded %.1f seconds; "
+                "continuing bounded shutdown",
+                _STOP_WAIT_TIMEOUT,
+            )
+
+    def _unsubscribe_native_events(self) -> None:
+        """Remove all process-global pubsub handlers idempotently."""
+        subscriptions = (
+            (self._receive_handler, "meshtastic.receive"),
+            (self._connect_handler, "meshtastic.connection.established"),
+            (self._disconnect_handler, "meshtastic.connection.lost"),
+        )
+        if self._pub:
+            for handler, topic in subscriptions:
+                if handler is None:
+                    continue
+                try:
+                    self._pub.unsubscribe(handler, topic)
+                except Exception as err:
+                    self._logger.debug("Failed to unsubscribe %s handler: %s", topic, err)
+        self._pub = None
+        self._receive_handler = None
+        self._connect_handler = None
+        self._disconnect_handler = None
 
     async def async_send_message(
         self,
@@ -139,6 +353,16 @@ class MeshtasticClient(MeshGateway):
             await self._emit_node(normalized)
 
     async def _start_native(self) -> None:
+        if self.config.transport == TRANSPORT_BLUETOOTH:
+            try:
+                await _async_validate_ble_adapter(self.config)
+            except Exception as err:
+                if not self._stopping:
+                    await self._emit_error(err)
+                raise
+            if self._stopping:
+                return
+
         try:
             from pubsub import pub
         except ImportError as err:
@@ -146,8 +370,6 @@ class MeshtasticClient(MeshGateway):
                 "pypubsub is unavailable; Home Assistant must install meshtastic requirements"
             )
             raise err
-
-        self._pub = pub
 
         def receive_handler(packet: dict[str, Any], interface: Any = None) -> None:
             if not self._owns_interface(interface):
@@ -170,19 +392,36 @@ class MeshtasticClient(MeshGateway):
                 lambda: self.hass.async_create_task(self._set_connected(False))
             )
 
+        try:
+            interface = await self.hass.async_add_executor_job(self._make_native_interface)
+        except Exception as err:
+            if not self._stopping:
+                await self._emit_error(err)
+            raise
+
+        if self._stopping:
+            await self._async_close_interface(interface)
+            return
+
+        self._interface = interface
+        self._pub = pub
         self._receive_handler = receive_handler
         self._connect_handler = connect_handler
         self._disconnect_handler = disconnect_handler
-        pub.subscribe(receive_handler, "meshtastic.receive")
-        pub.subscribe(connect_handler, "meshtastic.connection.established")
-        pub.subscribe(disconnect_handler, "meshtastic.connection.lost")
-
         try:
-            self._interface = await self.hass.async_add_executor_job(self._make_native_interface)
+            pub.subscribe(receive_handler, "meshtastic.receive")
+            pub.subscribe(connect_handler, "meshtastic.connection.established")
+            pub.subscribe(disconnect_handler, "meshtastic.connection.lost")
         except Exception as err:
-            await self._emit_error(err)
+            self._unsubscribe_native_events()
+            self._interface = None
+            await self._async_close_interface(interface)
+            if not self._stopping:
+                await self._emit_error(err)
             raise
         await self._set_connected(True)
+        if self._stopping:
+            return
         await self.async_refresh()
 
     def _make_native_interface(self) -> Any:
@@ -232,7 +471,14 @@ class MeshtasticClient(MeshGateway):
             )
             await self._handle_packet(packet)
 
-        self._unsub_mqtt = await mqtt.async_subscribe(self.hass, topic, message_received, 0)
+        unsubscribe = await mqtt.async_subscribe(self.hass, topic, message_received, 0)
+        if self._stopping:
+            try:
+                unsubscribe()
+            except Exception as err:
+                self._logger.debug("Failed to unsubscribe late Meshtastic MQTT handler: %s", err)
+            return
+        self._unsub_mqtt = unsubscribe
         await self._set_connected(True, mqtt_topic=topic)
 
     async def _mqtt_publish_message(

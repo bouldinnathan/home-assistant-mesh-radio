@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
 import hashlib
 import json
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
-
 
 JsonDict = dict[str, Any]
 
@@ -125,7 +124,7 @@ class GatewayConfig:
     options: JsonDict = field(default_factory=dict)
 
     @classmethod
-    def from_dict(cls, data: JsonDict) -> "GatewayConfig":
+    def from_dict(cls, data: JsonDict) -> GatewayConfig:
         """Build a gateway configuration from config-entry data."""
         return cls(
             gateway_id=str(data["gateway_id"]),
@@ -235,7 +234,7 @@ class MessageRecord:
         }
 
     @classmethod
-    def from_dict(cls, data: JsonDict) -> "MessageRecord":
+    def from_dict(cls, data: JsonDict) -> MessageRecord:
         """Deserialize a message."""
         return cls(
             message_id=str(data["message_id"]),
@@ -343,7 +342,7 @@ class NodeState:
     sensors: JsonDict = field(default_factory=dict)
     raw: JsonDict = field(default_factory=dict)
 
-    def merge(self, other: "NodeState") -> "NodeState":
+    def merge(self, other: NodeState) -> NodeState:
         """Merge newer state into this node and return self."""
         if other.node_id:
             self.node_id = other.node_id
@@ -413,7 +412,7 @@ class NodeState:
         }
 
     @classmethod
-    def from_dict(cls, data: JsonDict) -> "NodeState":
+    def from_dict(cls, data: JsonDict) -> NodeState:
         """Deserialize a node."""
         return cls(
             node_key=str(data["node_key"]),

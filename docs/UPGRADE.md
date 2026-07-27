@@ -2,7 +2,18 @@
 
 ## From 0.2.x
 
-0.3.0 adds the USB-device picker and keeps config entry version 1 and SQLite schema version 1, so existing gateway and history data do not need migration.
+0.4.0 adds the bounded Meshtastic Bluetooth pairing wizard. Config entry major
+version 1 and SQLite schema version 1 remain unchanged; minor version 2 removes
+v0.4-only pairing-authority/adapter metadata from older entries without changing
+gateway or history data. Existing Bluetooth gateways are treated as pre-paired,
+and MeshNet never marks their BlueZ bonds as originally paired by MeshNet.
+
+Existing Meshtastic Bluetooth gateways do not yet contain verified adapter
+metadata. Open **Configure → Edit gateway** and complete the guided pairing
+check once after upgrading. Only one local Bluetooth adapter may be powered
+during pairing and runtime; its stable controller address is then recorded.
+
+0.3.0 added the USB-device picker.
 
 ## From 0.1.x
 

@@ -8,12 +8,13 @@ runtime.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 import re
+from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlparse
 from uuid import uuid4
 
+from .bluetooth_devices import normalize_bluetooth_address
 from .const import (
     DEFAULT_MESHCORE_MQTT_TOPIC,
     DEFAULT_MESHTASTIC_MQTT_TOPIC,
@@ -28,7 +29,6 @@ from .const import (
     TRANSPORT_TCP,
     TRANSPORTS,
 )
-
 
 SUPPORTED_TRANSPORTS: dict[str, tuple[str, ...]] = {
     PROTOCOL_MESHTASTIC: (
@@ -191,6 +191,11 @@ def validate_gateway_dict(data: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("options must be an object")
     if isinstance(options, Mapping):
         cleaned["options"] = dict(options)
+
+    if cleaned["transport"] == TRANSPORT_BLUETOOTH:
+        cleaned["ble_address"] = normalize_bluetooth_address(
+            cleaned.get("ble_address")
+        )
 
     _validate_transport_requirements(cleaned)
     return {

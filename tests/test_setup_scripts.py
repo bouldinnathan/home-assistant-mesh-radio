@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import re
 import stat
 import subprocess
-
+from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -134,7 +133,7 @@ def test_setup_warns_when_home_assistant_is_too_old(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "targets Home Assistant 2025.1 or newer" in result.stdout
+    assert "targets Home Assistant 2025.1.4 or newer" in result.stdout
 
 
 def test_setup_dry_run_does_not_reconfigure_serial_device(tmp_path: Path) -> None:
@@ -247,7 +246,7 @@ def test_verify_rejects_home_assistant_older_than_minimum(tmp_path: Path) -> Non
     )
 
     assert result.returncode == 1
-    assert "older than the supported minimum 2025.1" in result.stdout
+    assert "older than the supported minimum 2025.1.4" in result.stdout
 
 
 def test_uninstall_removes_only_validated_meshnet_component(tmp_path: Path) -> None:

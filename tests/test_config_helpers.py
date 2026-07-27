@@ -5,16 +5,42 @@ import pytest
 from custom_components.meshnet.config_helpers import (
     DEFAULT_TCP_PORTS,
     gateway_from_form,
+    normalize_bluetooth_address,
     supported_transports,
     validate_gateway_dict,
 )
 from custom_components.meshnet.const import (
     PROTOCOL_MESHCORE,
     PROTOCOL_MESHTASTIC,
+    TRANSPORT_BLUETOOTH,
     TRANSPORT_MQTT,
     TRANSPORT_REST,
     TRANSPORT_TCP,
 )
+
+
+def test_bluetooth_address_is_strict_and_canonical() -> None:
+    assert normalize_bluetooth_address("aa:0b:cc:1d:ee:2f") == "AA:0B:CC:1D:EE:2F"
+
+    for invalid in (
+        "",
+        "AA:BB:CC:DD:EE",
+        "AA-BB-CC-DD-EE-FF",
+        "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF",
+        "meshtastic-radio",
+    ):
+        with pytest.raises(ValueError, match="Bluetooth address"):
+            normalize_bluetooth_address(invalid)
+
+
+def test_bluetooth_gateway_saves_only_a_canonical_address() -> None:
+    gateway = gateway_from_form(
+        PROTOCOL_MESHTASTIC,
+        TRANSPORT_BLUETOOTH,
+        {"name": "Radio", "ble_address": "aa:bb:cc:dd:ee:ff"},
+    )
+
+    assert gateway["ble_address"] == "AA:BB:CC:DD:EE:FF"
 
 
 def test_supported_transports_are_filtered_by_protocol() -> None:
