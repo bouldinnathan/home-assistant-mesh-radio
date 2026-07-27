@@ -229,7 +229,7 @@ check_ha_version() {
     local oldest
     oldest="$(printf '%s\n%s\n' "2025.1.4" "${detected}" | sort -V | head -1)"
     if [[ "${oldest}" != "2025.1.4" ]]; then
-      log "WARNING: MeshNet 0.4.0 targets Home Assistant 2025.1.4 or newer."
+      log "WARNING: MeshNet 0.4.1 targets Home Assistant 2025.1.4 or newer."
       log "Upgrade Home Assistant before installing this component."
     fi
   fi

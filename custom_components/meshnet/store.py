@@ -12,6 +12,8 @@ from typing import Any
 
 from .models import MeshPacket, MeshSnapshot, MessageRecord, NodeState, stable_json, timestamp_to_json, utcnow
 
+_STORE_CLOSE_WAIT_TIMEOUT = 2.0
+
 
 class MeshStore:
     """Durable SQLite cache for nodes, messages, packets, and routes."""
@@ -25,17 +27,36 @@ class MeshStore:
         self._executor = executor
         self._conn: sqlite3.Connection | None = None
         self._lock = asyncio.Lock()
+        self._inflight: set[asyncio.Future[Any]] = set()
+        self._close_task: asyncio.Task[None] | None = None
 
     async def async_open(self) -> None:
         """Open and initialize the database."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = await self._run(
-            lambda: sqlite3.connect(
+
+        def connect() -> sqlite3.Connection:
+            return sqlite3.connect(
                 self.path,
                 check_same_thread=False,
                 isolation_level=None,
             )
-        )
+
+        if self._executor is None:
+            conn = connect()
+        else:
+            connect_future = self._start_executor(connect)
+            try:
+                conn = await asyncio.shield(connect_future)
+            except asyncio.CancelledError:
+                # async_setup_entry rollback can call async_close before the
+                # executor returns, while _conn is still unset. Retain an exact
+                # owner that closes the late connection instead of losing it.
+                close_task = asyncio.create_task(
+                    self._async_close_cancelled_open(connect_future)
+                )
+                self._retain_close_task(close_task)
+                raise
+        self._conn = conn
         self._conn.row_factory = sqlite3.Row
         await self._execute("PRAGMA journal_mode=WAL")
         await self._execute("PRAGMA foreign_keys=ON")
@@ -104,10 +125,71 @@ class MeshStore:
 
     async def async_close(self) -> None:
         """Close the database connection."""
-        if self._conn is None:
+        async with self._lock:
+            close_task = self._close_task
+            if self._conn is not None:
+                conn = self._conn
+                self._conn = None
+                close_task = asyncio.create_task(
+                    self._async_finish_close(conn, set(self._inflight))
+                )
+                self._retain_close_task(close_task)
+        if close_task is None:
             return
-        conn = self._conn
-        self._conn = None
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(close_task), timeout=_STORE_CLOSE_WAIT_TIMEOUT
+            )
+        except TimeoutError:
+            # The close task retains the connection and waits for any executor
+            # operation that outlived cancellation. Never close SQLite beneath
+            # a running thread, and never hold Home Assistant unload forever.
+            return
+
+    def _retain_close_task(self, close_task: asyncio.Task[None]) -> None:
+        """Retain one close owner and consume any late failure."""
+        self._close_task = close_task
+
+        def close_done(task: asyncio.Task[None]) -> None:
+            if self._close_task is task:
+                self._close_task = None
+            if not task.cancelled():
+                task.exception()
+
+        close_task.add_done_callback(close_done)
+
+    async def _async_close_cancelled_open(
+        self, connect_future: asyncio.Future[Any]
+    ) -> None:
+        """Close a connection whose setup waiter was cancelled before publish."""
+        await asyncio.wait({connect_future})
+        if connect_future.cancelled():
+            return
+        try:
+            conn = connect_future.result()
+        except BaseException:
+            return
+        await self._run(conn.close)
+
+    async def _async_finish_close(
+        self,
+        conn: sqlite3.Connection,
+        pending: set[asyncio.Future[Any]],
+    ) -> None:
+        """Close only after executor work using this connection has finished."""
+        if pending:
+            remaining = {future for future in pending if not future.done()}
+            if remaining:
+                finished = asyncio.Event()
+
+                def executor_finished(future: asyncio.Future[Any]) -> None:
+                    remaining.discard(future)
+                    if not remaining:
+                        finished.set()
+
+                for future in remaining.copy():
+                    future.add_done_callback(executor_finished)
+                await finished.wait()
         await self._run(conn.close)
 
     async def async_load_snapshot(self, *, recent_limit: int = 100) -> MeshSnapshot:
@@ -246,24 +328,43 @@ class MeshStore:
         return int(row["count"] if row else 0)
 
     async def _execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
-        if self._conn is None:
-            raise RuntimeError("MeshStore is not open")
         async with self._lock:
-            await self._run(lambda: self._conn.execute(sql, params))
+            conn = self._conn
+            if conn is None:
+                raise RuntimeError("MeshStore is not open")
+            await self._run(lambda: conn.execute(sql, params))
 
     async def _fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Row | None:
-        if self._conn is None:
-            raise RuntimeError("MeshStore is not open")
         async with self._lock:
-            return await self._run(lambda: self._conn.execute(sql, params).fetchone())
+            conn = self._conn
+            if conn is None:
+                raise RuntimeError("MeshStore is not open")
+            return await self._run(lambda: conn.execute(sql, params).fetchone())
 
     async def _fetchall(self, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
-        if self._conn is None:
-            raise RuntimeError("MeshStore is not open")
         async with self._lock:
-            return await self._run(lambda: self._conn.execute(sql, params).fetchall())
+            conn = self._conn
+            if conn is None:
+                raise RuntimeError("MeshStore is not open")
+            return await self._run(lambda: conn.execute(sql, params).fetchall())
 
     async def _run(self, func: Callable[[], Any]) -> Any:
         if self._executor is not None:
-            return await self._executor(func)
+            future = self._start_executor(func)
+            return await asyncio.shield(future)
         return func()
+
+    def _start_executor(self, func: Callable[[], Any]) -> asyncio.Future[Any]:
+        """Start, retain, and observe one executor operation."""
+        if self._executor is None:
+            raise RuntimeError("MeshStore executor is unavailable")
+        future = asyncio.ensure_future(self._executor(func))
+        self._inflight.add(future)
+
+        def executor_done(done_future: asyncio.Future[Any]) -> None:
+            self._inflight.discard(done_future)
+            if not done_future.cancelled():
+                done_future.exception()
+
+        future.add_done_callback(executor_done)
+        return future

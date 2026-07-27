@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any
 
 from .models import GatewayConfig, GatewayStatus, MeshPacket, NodeState, utcnow
@@ -42,6 +43,18 @@ class MeshGateway(ABC):
             protocol=config.protocol,
             transport=config.transport,
         )
+
+    def _async_create_background_task(
+        self, target: Coroutine[Any, Any, Any], name: str
+    ) -> asyncio.Task[Any]:
+        """Create long-lived work without making it block HA startup."""
+        creator = getattr(self.hass, "async_create_background_task", None)
+        if callable(creator):
+            return creator(target, name)
+        # Lightweight test doubles and older embedding callers may expose only
+        # the normal task API. Supported Home Assistant releases use the branch
+        # above.
+        return self.hass.async_create_task(target)
 
     @abstractmethod
     async def async_start(self) -> None:

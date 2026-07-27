@@ -323,6 +323,14 @@ If no PIN appears:
   leave its Bluetooth connection open.
 - Restart Bluetooth on the radio, then retry from MeshNet.
 
+If the UI says **Loading next step for MeshNet** after accepting the PIN, first
+check **Settings → Devices & services** before starting another pairing request.
+Home Assistant may already have created the entry. Version 0.4.1 and newer start
+the radio SDK in an entry-owned background task, so the Meshtastic SDK's long
+BLE discovery and configuration waits cannot hold the config-flow response
+open. After updating, restart Home Assistant and reload the existing entry; the
+verified BlueZ bond is preserved.
+
 If the radio pairs but no data arrives, another client may have reclaimed its
 single Bluetooth connection. Close that client and reload the MeshNet config
 entry. MeshNet never removes a bond during entry/HACS teardown. If you

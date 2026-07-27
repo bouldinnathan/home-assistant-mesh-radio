@@ -7,8 +7,10 @@ import hashlib
 import json
 import logging
 import re
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
+from weakref import WeakKeyDictionary
 
 from .const import (
     CONF_BLUETOOTH_ADAPTER,
@@ -38,6 +40,23 @@ _STOP_WAIT_TIMEOUT = 2.0
 _BLUEZ_ADAPTER_INTERFACE = "org.bluez.Adapter1"
 _LOCAL_ADAPTER_RE = re.compile(r"hci[0-9]+\Z")
 _BLUETOOTH_ADDRESS_RE = re.compile(r"[0-9A-F]{2}(?::[0-9A-F]{2}){5}\Z")
+_NATIVE_ENDPOINT_LOCKS: WeakKeyDictionary[
+    Any, dict[tuple[str, str], asyncio.Lock]
+] = WeakKeyDictionary()
+
+
+def _native_endpoint_lock(endpoint: tuple[str, str]) -> asyncio.Lock:
+    """Return one process-wide native transport lock for this HA event loop."""
+    loop = asyncio.get_running_loop()
+    locks = _NATIVE_ENDPOINT_LOCKS.get(loop)
+    if locks is None:
+        locks = {}
+        _NATIVE_ENDPOINT_LOCKS[loop] = locks
+    lock = locks.get(endpoint)
+    if lock is None:
+        lock = asyncio.Lock()
+        locks[endpoint] = lock
+    return lock
 
 
 async def _async_get_local_bluetooth_adapter_details() -> dict[str, Any]:
@@ -126,6 +145,8 @@ class MeshtasticClient(MeshGateway):
         self._stopping = False
         self._start_task: asyncio.Task[None] | None = None
         self._stop_task: asyncio.Task[None] | None = None
+        self._native_lock: asyncio.Lock | None = None
+        self._native_executor_tasks: dict[int, set[asyncio.Future[Any]]] = {}
         self._pub = None
         self._receive_handler = None
         self._connect_handler = None
@@ -151,7 +172,10 @@ class MeshtasticClient(MeshGateway):
         self._stopping = False
         start_task = self._start_task
         if start_task is None:
-            start_task = self.hass.async_create_task(self._async_start_once())
+            start_task = self._async_create_background_task(
+                self._async_start_once(),
+                "MeshNet Meshtastic transport startup",
+            )
             self._start_task = start_task
             start_task.add_done_callback(self._start_done)
 
@@ -183,7 +207,10 @@ class MeshtasticClient(MeshGateway):
             # async_stop is intentionally bounded. If a synchronous constructor
             # outlives that bound, its completion gets one final idempotent
             # cleanup pass without blocking Home Assistant unload.
-            self.hass.async_create_task(self._async_cleanup_after_late_start())
+            self._async_create_background_task(
+                self._async_cleanup_after_late_start(),
+                "MeshNet late Meshtastic transport cleanup",
+            )
 
     def _stop_done(self, task: asyncio.Task[None]) -> None:
         """Clear the single-flight stop task without disturbing a newer one."""
@@ -243,7 +270,7 @@ class MeshtasticClient(MeshGateway):
         if self._interface is not None:
             interface = self._interface
             self._interface = None
-            await self._async_close_interface(interface)
+            await self._async_close_interface(interface, release_native_lock=True)
         if emit_status:
             await self._set_connected(False)
 
@@ -253,12 +280,26 @@ class MeshtasticClient(MeshGateway):
             return
         await self._async_cleanup_transport(emit_status=False)
 
-    async def _async_close_interface(self, interface: Any) -> None:
+    async def _async_close_interface(
+        self,
+        interface: Any,
+        *,
+        release_native_lock: bool = False,
+    ) -> None:
         """Close an interface without allowing a stuck close to hang unload."""
         async def close_interface() -> None:
+            pending = set(self._native_executor_tasks.get(id(interface), set()))
+            if pending:
+                await asyncio.gather(
+                    *(asyncio.shield(future) for future in pending),
+                    return_exceptions=True,
+                )
             await self.hass.async_add_executor_job(interface.close)
 
-        close_job = self.hass.async_create_task(close_interface())
+        close_job = self._async_create_background_task(
+            close_interface(),
+            "MeshNet Meshtastic interface close",
+        )
 
         def close_done(task: asyncio.Future[Any]) -> None:
             if task.cancelled():
@@ -269,6 +310,9 @@ class MeshtasticClient(MeshGateway):
                 return
             if error is not None:
                 self._logger.debug("Failed to close Meshtastic interface: %s", error)
+                return
+            if release_native_lock:
+                self._release_native_lock()
 
         close_job.add_done_callback(close_done)
         try:
@@ -282,6 +326,69 @@ class MeshtasticClient(MeshGateway):
                 "continuing bounded shutdown",
                 _STOP_WAIT_TIMEOUT,
             )
+
+    async def _async_run_native_executor(
+        self,
+        interface: Any,
+        target: Callable[[], Any],
+        *,
+        name: str,
+    ) -> Any:
+        """Run and retain work that owns one native interface.
+
+        Cancelling an asyncio waiter cannot stop a function already running in
+        Home Assistant's executor. Keep the raw executor future strongly owned
+        and delay cancellation completion until that owner finishes. Interface
+        close also waits for the same retained future before touching the SDK.
+        """
+
+        future = asyncio.ensure_future(self.hass.async_add_executor_job(target))
+        if isinstance(future, asyncio.Task):
+            future.set_name(name)
+        interface_key = id(interface)
+        tasks = self._native_executor_tasks.setdefault(interface_key, set())
+        tasks.add(future)
+
+        def executor_done(done_future: asyncio.Future[Any]) -> None:
+            current_tasks = self._native_executor_tasks.get(interface_key)
+            if current_tasks is not None:
+                current_tasks.discard(done_future)
+                if not current_tasks:
+                    self._native_executor_tasks.pop(interface_key, None)
+            if not done_future.cancelled():
+                done_future.exception()
+
+        future.add_done_callback(executor_done)
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            try:
+                await asyncio.wait({future})
+            except asyncio.CancelledError:
+                # A second cancellation may end the public waiter. The raw
+                # future remains retained for interface-close ordering.
+                pass
+            raise
+
+    def _native_endpoint(self) -> tuple[str, str]:
+        """Return a non-secret key that serializes one native endpoint."""
+        if self.config.transport == TRANSPORT_BLUETOOTH:
+            endpoint = (self.config.ble_address or "").upper()
+        elif self.config.transport == TRANSPORT_SERIAL:
+            endpoint = self.config.serial_path or ""
+        else:
+            host = self.config.host or self.config.api_url or ""
+            endpoint = f"{host}:{self.config.port or 0}"
+        return self.config.transport, endpoint
+
+    def _release_native_lock(self) -> None:
+        """Release this client's endpoint lease exactly once."""
+        lock = self._native_lock
+        if lock is None:
+            return
+        self._native_lock = None
+        if lock.locked():
+            lock.release()
 
     def _unsubscribe_native_events(self) -> None:
         """Remove all process-global pubsub handlers idempotently."""
@@ -326,14 +433,21 @@ class MeshtasticClient(MeshGateway):
                 message_id=message_id,
             )
         else:
-            if self._interface is None:
+            interface = self._interface
+            if interface is None:
                 raise RuntimeError("Meshtastic interface is not connected")
             destination = target_node if target_node else "^all"
             kwargs: dict[str, Any] = {}
             if channel is not None:
                 kwargs["channelIndex"] = coerce_int(channel) or 0
-            await self.hass.async_add_executor_job(
-                lambda: self._interface.sendText(message, destinationId=destination, **kwargs)
+            await self._async_run_native_executor(
+                interface,
+                lambda: interface.sendText(
+                    message,
+                    destinationId=destination,
+                    **kwargs,
+                ),
+                name=f"MeshNet Meshtastic message send {self.config.gateway_id}",
             )
         self.status.packets_sent += 1
         await self._emit_status()
@@ -341,9 +455,14 @@ class MeshtasticClient(MeshGateway):
 
     async def async_refresh(self) -> None:
         """Refresh node DB from the native interface."""
-        if self._interface is None:
+        interface = self._interface
+        if interface is None:
             return
-        nodes = await self.hass.async_add_executor_job(lambda: dict(self._interface.nodes))
+        nodes = await self._async_run_native_executor(
+            interface,
+            lambda: dict(interface.nodes),
+            name=f"MeshNet Meshtastic node refresh {self.config.gateway_id}",
+        )
         for node_id, node in nodes.items():
             normalized = meshtastic_node_to_state(
                 node,
@@ -392,15 +511,26 @@ class MeshtasticClient(MeshGateway):
                 lambda: self.hass.async_create_task(self._set_connected(False))
             )
 
+        native_lock = _native_endpoint_lock(self._native_endpoint())
+        await native_lock.acquire()
+        self._native_lock = native_lock
+        if self._stopping:
+            self._release_native_lock()
+            return
+
         try:
             interface = await self.hass.async_add_executor_job(self._make_native_interface)
         except Exception as err:
+            self._release_native_lock()
             if not self._stopping:
                 await self._emit_error(err)
             raise
 
         if self._stopping:
-            await self._async_close_interface(interface)
+            await self._async_close_interface(
+                interface,
+                release_native_lock=True,
+            )
             return
 
         self._interface = interface
@@ -415,14 +545,27 @@ class MeshtasticClient(MeshGateway):
         except Exception as err:
             self._unsubscribe_native_events()
             self._interface = None
-            await self._async_close_interface(interface)
+            await self._async_close_interface(
+                interface,
+                release_native_lock=True,
+            )
             if not self._stopping:
                 await self._emit_error(err)
             raise
-        await self._set_connected(True)
-        if self._stopping:
-            return
-        await self.async_refresh()
+        try:
+            await self._set_connected(True)
+            if self._stopping:
+                return
+            await self.async_refresh()
+        except BaseException:
+            if self._interface is interface:
+                self._unsubscribe_native_events()
+                self._interface = None
+                await self._async_close_interface(
+                    interface,
+                    release_native_lock=True,
+                )
+            raise
 
     def _make_native_interface(self) -> Any:
         if self.config.transport == TRANSPORT_SERIAL:

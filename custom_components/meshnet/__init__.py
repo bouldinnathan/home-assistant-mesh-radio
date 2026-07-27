@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +24,8 @@ from .const import (
     MESSAGE_TYPE_BROADCAST,
     PLATFORMS,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 SERVICE_SEND_MESSAGE = "send_message"
 SERVICE_BROADCAST_MESSAGE = "broadcast_message"
@@ -56,20 +59,60 @@ async def async_setup_entry(hass, entry) -> bool:
     from .coordinator import MeshNetCoordinator
 
     coordinator = MeshNetCoordinator(hass, entry)
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
-    await coordinator.async_config_entry_first_refresh()
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+    forwarding_started = False
+    try:
+        await coordinator.async_config_entry_first_refresh()
+        hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+        forwarding_started = True
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        coordinator.async_start_gateways_background()
+        entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+    except BaseException:
+        # A config entry that never finishes setup is not guaranteed to receive
+        # async_unload_entry. Roll back every resource opened by first refresh,
+        # while preserving the original setup exception for Home Assistant.
+        domain_data = hass.data.get(DOMAIN)
+        owns_registration = (
+            domain_data is not None
+            and domain_data.get(entry.entry_id) is coordinator
+        )
+        if forwarding_started and owns_registration:
+            try:
+                await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+            except BaseException as err:
+                _LOGGER.warning(
+                    "Failed to roll back MeshNet platforms after setup error: %s",
+                    err,
+                )
+        try:
+            await coordinator.async_shutdown()
+        except BaseException as err:
+            _LOGGER.warning(
+                "Failed to finish MeshNet coordinator rollback after setup error: %s",
+                err,
+            )
+        domain_data = hass.data.get(DOMAIN)
+        if (
+            domain_data is not None
+            and domain_data.get(entry.entry_id) is coordinator
+        ):
+            domain_data.pop(entry.entry_id, None)
+        raise
     return True
 
 
 async def async_unload_entry(hass, entry) -> bool:
     """Unload MeshNet."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    coordinator = hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
-    if coordinator:
+    if not unload_ok:
+        return False
+    domain_data = hass.data.get(DOMAIN, {})
+    coordinator = domain_data.get(entry.entry_id)
+    if coordinator is not None:
         await coordinator.async_shutdown()
-    return unload_ok
+        if domain_data.get(entry.entry_id) is coordinator:
+            domain_data.pop(entry.entry_id, None)
+    return True
 
 
 async def async_remove_entry(hass, entry) -> None:

@@ -148,6 +148,26 @@ The coordinator owns:
 
 The coordinator uses `always_update=True` so periodic changes such as stale-node marking and health score updates are published to entities.
 
+Config-entry setup opens persistence, restores cached state, and builds gateway
+objects synchronously. Actual radio SDK startup and queued-message replay run in
+a Home Assistant entry-owned background task. This is a deliberate isolation
+boundary: Meshtastic's synchronous BLE constructor may spend minutes waiting for
+discovery and configuration, but it cannot keep config-entry creation or the
+frontend's final setup request open. Home Assistant cancels the background
+waiter on unload, while each provider's shutdown path handles its transport.
+Startup, reconnect, polling, direct-send, and outbox work is retained and
+cancelled with finite waits. Provider callbacks carry a gateway-generation
+token, so work from a replaced or unloaded gateway cannot publish state or
+write storage. SQLite close is likewise deferred behind any executor operation
+that already owns the connection; even a connect result that arrives after
+cancelled setup keeps an exact close owner while config-entry unload remains
+bounded.
+Meshtastic send and refresh executor work is retained against the exact SDK
+interface, and interface close waits behind that work without making Home
+Assistant unload wait indefinitely. Failed entry setup rolls back forwarded
+platforms and closes the coordinator; a failed platform unload leaves the live
+coordinator in place for Home Assistant to retry safely.
+
 ## Persistence
 
 File:

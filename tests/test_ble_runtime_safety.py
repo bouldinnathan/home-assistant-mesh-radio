@@ -28,8 +28,13 @@ class _ControlledExecutorHass:
         self.constructor_started = asyncio.Event()
         self.release_constructor = asyncio.Event()
         self.executor_calls = 0
+        self.background_task_names: list[str] = []
 
     def async_create_task(self, coroutine):
+        return asyncio.create_task(coroutine)
+
+    def async_create_background_task(self, coroutine, name):
+        self.background_task_names.append(name)
         return asyncio.create_task(coroutine)
 
     async def async_add_executor_job(self, target, *args):
@@ -47,6 +52,65 @@ class _FakeInterface:
 
     def close(self) -> None:
         self.close_calls += 1
+
+
+class _CancellationResistantExecutorHass:
+    """Model a worker that continues after its asyncio waiter is cancelled."""
+
+    def __init__(self) -> None:
+        self.operation_started = asyncio.Event()
+        self.release_operation = asyncio.Event()
+        self.background_task_names: list[str] = []
+        self.interface = None
+
+    def async_create_task(self, coroutine):
+        return asyncio.create_task(coroutine)
+
+    def async_create_background_task(self, coroutine, name):
+        self.background_task_names.append(name)
+        return asyncio.create_task(coroutine)
+
+    async def async_add_executor_job(self, target, *args):
+        if getattr(target, "__self__", None) is self.interface:
+            return target(*args)
+        self.operation_started.set()
+        try:
+            await self.release_operation.wait()
+        except asyncio.CancelledError:
+            # A running executor function cannot actually be cancelled. Model
+            # that ownership even if a wrapper task is cancelled by shutdown.
+            await self.release_operation.wait()
+        return target(*args)
+
+
+class _BlockingNativeInterface:
+    """Expose independently blocking send and refresh executor operations."""
+
+    def __init__(self) -> None:
+        self.send_started = False
+        self.send_finished = False
+        self.refresh_started = False
+        self.refresh_finished = False
+        self.close_started = asyncio.Event()
+        self.close_calls = 0
+        self.close_overlapped_send = False
+        self.close_overlapped_refresh = False
+
+    def sendText(self, *_args, **_kwargs) -> None:
+        self.send_finished = True
+
+    @property
+    def nodes(self) -> dict:
+        self.refresh_finished = True
+        return {}
+
+    def close(self) -> None:
+        self.close_overlapped_send = self.send_started and not self.send_finished
+        self.close_overlapped_refresh = (
+            self.refresh_started and not self.refresh_finished
+        )
+        self.close_calls += 1
+        self.close_started.set()
 
 
 class _FakePub:
@@ -431,5 +495,268 @@ def test_cancelled_start_waiter_does_not_duplicate_ble_constructor(monkeypatch) 
         await surviving_waiter
         assert client._interface is interface
         await client.async_stop()
+
+    asyncio.run(run())
+
+
+def test_successive_ble_clients_serialize_constructor_and_close_late_result(
+    monkeypatch,
+) -> None:
+    """A replacement client must wait for the old late result to be closed."""
+
+    class EndpointExecutorHass(_ControlledExecutorHass):
+        def __init__(self) -> None:
+            super().__init__()
+            self.old_constructor_started = asyncio.Event()
+            self.release_old_constructor = asyncio.Event()
+            self.old_close_started = asyncio.Event()
+            self.release_old_close = asyncio.Event()
+            self.new_constructor_started = asyncio.Event()
+            self.constructor_submissions = 0
+            self.active_constructors = 0
+            self.max_active_constructors = 0
+            self.old_interface = None
+
+        async def async_add_executor_job(self, target, *args):
+            if target.__name__.startswith("make_"):
+                self.constructor_submissions += 1
+                self.active_constructors += 1
+                self.max_active_constructors = max(
+                    self.max_active_constructors,
+                    self.active_constructors,
+                )
+                try:
+                    if target.__name__ == "make_old_interface":
+                        self.old_constructor_started.set()
+                        await self.release_old_constructor.wait()
+                    else:
+                        self.new_constructor_started.set()
+                    return target(*args)
+                finally:
+                    self.active_constructors -= 1
+            if getattr(target, "__self__", None) is self.old_interface:
+                self.old_close_started.set()
+                await self.release_old_close.wait()
+            self.executor_calls += 1
+            return target(*args)
+
+    async def run() -> None:
+        _install_fake_pubsub(monkeypatch)
+        monkeypatch.setattr(meshtastic_client_module, "_STOP_WAIT_TIMEOUT", 0.01)
+        hass = EndpointExecutorHass()
+        old_interface = _FakeInterface()
+        new_interface = _FakeInterface()
+        old_statuses = []
+        new_statuses = []
+        hass.old_interface = old_interface
+        old_client = _client(hass, old_interface, old_statuses)
+        new_client = _client(hass, new_interface, new_statuses)
+
+        def make_old_interface():
+            return old_interface
+
+        def make_new_interface():
+            return new_interface
+
+        old_client._make_native_interface = make_old_interface
+        new_client._make_native_interface = make_new_interface
+
+        old_waiter = asyncio.create_task(old_client.async_start())
+        await hass.old_constructor_started.wait()
+        await asyncio.wait_for(old_client.async_stop(), timeout=0.2)
+        old_waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await old_waiter
+
+        new_waiter = asyncio.create_task(new_client.async_start())
+        await asyncio.sleep(0)
+        assert hass.constructor_submissions == 1
+        assert not hass.new_constructor_started.is_set()
+
+        hass.release_old_constructor.set()
+        await asyncio.wait_for(hass.old_close_started.wait(), timeout=0.2)
+        await asyncio.sleep(0)
+        assert not hass.new_constructor_started.is_set()
+        assert old_interface.close_calls == 0
+
+        hass.release_old_close.set()
+        await asyncio.wait_for(hass.new_constructor_started.wait(), timeout=0.2)
+        await asyncio.wait_for(new_waiter, timeout=0.2)
+
+        assert hass.constructor_submissions == 2
+        assert hass.max_active_constructors == 1
+        assert old_interface.close_calls == 1
+        assert old_client._interface is None
+        assert True not in old_statuses
+        assert new_client._interface is new_interface
+        assert new_statuses == [True]
+
+        await new_client.async_stop()
+        assert new_interface.close_calls == 1
+        assert any("transport startup" in name for name in hass.background_task_names)
+        assert any("interface close" in name for name in hass.background_task_names)
+
+    asyncio.run(run())
+
+
+def test_failed_close_keeps_replacement_constructor_blocked(monkeypatch) -> None:
+    """An unconfirmed native close must keep the endpoint lease held."""
+
+    class TrackingExecutorHass(_ControlledExecutorHass):
+        def __init__(self) -> None:
+            super().__init__()
+            self.constructor_submissions = 0
+
+        async def async_add_executor_job(self, target, *args):
+            if getattr(target, "__name__", "").startswith("make_"):
+                self.constructor_submissions += 1
+            return await super().async_add_executor_job(target, *args)
+
+    class FailingCloseInterface(_FakeInterface):
+        def close(self) -> None:
+            self.close_calls += 1
+            raise RuntimeError("native close failed")
+
+    async def run() -> None:
+        _install_fake_pubsub(monkeypatch)
+        hass = TrackingExecutorHass()
+        hass.release_constructor.set()
+        old_interface = FailingCloseInterface()
+        new_interface = _FakeInterface()
+        old_client = _client(hass, old_interface, [])
+        new_client = _client(hass, new_interface, [])
+
+        def make_old_interface():
+            return old_interface
+
+        def make_new_interface():
+            return new_interface
+
+        old_client._make_native_interface = make_old_interface
+        new_client._make_native_interface = make_new_interface
+
+        await old_client.async_start()
+        assert hass.constructor_submissions == 1
+
+        with pytest.raises(RuntimeError, match="native close failed"):
+            await old_client.async_stop()
+
+        assert old_interface.close_calls == 1
+        assert old_client._native_lock is not None
+        assert old_client._native_lock.locked()
+
+        new_waiter = asyncio.create_task(new_client.async_start())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        # The failed close means it is unsafe to submit a second native
+        # constructor for the same Bluetooth address.
+        assert hass.constructor_submissions == 1
+        assert new_client._native_lock is None
+        assert not new_waiter.done()
+
+        new_waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await new_waiter
+
+        pending_start = new_client._start_task
+        assert pending_start is not None
+        pending_start.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending_start
+
+    asyncio.run(run())
+
+
+def test_cancelled_native_send_finishes_before_interface_close(monkeypatch) -> None:
+    """A canceled service waiter cannot hide a running SDK executor thread."""
+
+    async def run() -> None:
+        monkeypatch.setattr(meshtastic_client_module, "_STOP_WAIT_TIMEOUT", 0.01)
+        hass = _CancellationResistantExecutorHass()
+        interface = _BlockingNativeInterface()
+        hass.interface = interface
+        client = _client(hass, interface, [])
+        client._interface = interface
+        client.status.connected = True
+
+        send_task = asyncio.create_task(
+            client.async_send_message(
+                target_node=None,
+                message="thread-owned send",
+                channel=None,
+                priority="normal",
+                message_type="broadcast",
+            )
+        )
+        try:
+            await asyncio.wait_for(hass.operation_started.wait(), timeout=1)
+            interface.send_started = True
+            send_task.cancel()
+            await asyncio.sleep(0)
+
+            # Cancellation is retained until the executor owner drains, so the
+            # coordinator cannot mistake the SDK operation for completed work.
+            assert send_task.done() is False
+
+            await asyncio.wait_for(client.async_stop(), timeout=0.2)
+
+            # Public stop is bounded, but close remains retained behind the
+            # exact interface operation rather than racing its worker thread.
+            assert interface.close_started.is_set() is False
+            assert client._native_executor_tasks
+        finally:
+            hass.release_operation.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await send_task
+        await asyncio.wait_for(interface.close_started.wait(), timeout=1)
+        await asyncio.sleep(0)
+
+        assert interface.close_calls == 1
+        assert interface.close_overlapped_send is False
+        assert client._native_executor_tasks == {}
+
+    asyncio.run(run())
+
+
+def test_cancelled_native_refresh_finishes_before_interface_close(
+    monkeypatch,
+) -> None:
+    """A canceled refresh cannot let close race an SDK node snapshot thread."""
+
+    async def run() -> None:
+        monkeypatch.setattr(meshtastic_client_module, "_STOP_WAIT_TIMEOUT", 0.01)
+        hass = _CancellationResistantExecutorHass()
+        interface = _BlockingNativeInterface()
+        hass.interface = interface
+        client = _client(hass, interface, [])
+        client._interface = interface
+        client.status.connected = True
+
+        refresh_task = asyncio.create_task(client.async_refresh())
+        try:
+            await asyncio.wait_for(hass.operation_started.wait(), timeout=1)
+            interface.refresh_started = True
+            refresh_task.cancel()
+            await asyncio.sleep(0)
+
+            assert refresh_task.done() is False
+
+            await asyncio.wait_for(client.async_stop(), timeout=0.2)
+
+            assert interface.close_started.is_set() is False
+            assert client._native_executor_tasks
+        finally:
+            hass.release_operation.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await refresh_task
+        await asyncio.wait_for(interface.close_started.wait(), timeout=1)
+        await asyncio.sleep(0)
+
+        assert interface.close_calls == 1
+        assert interface.close_overlapped_refresh is False
+        assert client._native_executor_tasks == {}
 
     asyncio.run(run())

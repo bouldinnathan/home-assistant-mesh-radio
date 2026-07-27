@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
+from custom_components.meshnet import store as store_module
 from custom_components.meshnet.models import MeshPacket, MessageRecord, NodeState
 from custom_components.meshnet.store import MeshStore
 
@@ -74,3 +77,159 @@ async def _pending_outbox(tmp_path) -> None:
     pending = await store.async_pending_outbox()
     assert [message.message_id for message in pending] == ["queued"]
     await store.async_close()
+
+
+def test_close_waits_for_active_database_operation(tmp_path) -> None:
+    """Storage close must serialize behind an in-flight operation."""
+
+    async def run() -> None:
+        store = MeshStore(tmp_path / "meshnet.sqlite3")
+        await store.async_open()
+        operation_started = asyncio.Event()
+        release_operation = asyncio.Event()
+
+        async def controlled_executor(target):
+            operation_started.set()
+            await release_operation.wait()
+            return target()
+
+        store._executor = controlled_executor
+        write_task = asyncio.create_task(
+            store.async_upsert_node(
+                NodeState(
+                    node_key="meshtastic:1",
+                    protocol="meshtastic",
+                    node_id="1",
+                )
+            )
+        )
+        await operation_started.wait()
+        close_task = asyncio.create_task(store.async_close())
+        await asyncio.sleep(0)
+
+        assert close_task.done() is False
+        assert store._conn is not None
+
+        release_operation.set()
+        await write_task
+        await close_task
+        assert store._conn is None
+
+    asyncio.run(run())
+
+
+def test_cancelled_database_operation_drains_executor_before_close(tmp_path) -> None:
+    """Cancellation cannot release SQLite ownership while its thread is active."""
+
+    async def run() -> None:
+        store = MeshStore(tmp_path / "meshnet.sqlite3")
+        await store.async_open()
+        operation_started = asyncio.Event()
+        release_operation = asyncio.Event()
+        close_executor_started = asyncio.Event()
+        executor_calls = 0
+
+        async def controlled_executor(target):
+            nonlocal executor_calls
+            executor_calls += 1
+            if executor_calls == 1:
+                operation_started.set()
+                await release_operation.wait()
+                return target()
+            close_executor_started.set()
+            return target()
+
+        store._executor = controlled_executor
+        write_task = asyncio.create_task(
+            store.async_upsert_node(
+                NodeState(
+                    node_key="meshtastic:1",
+                    protocol="meshtastic",
+                    node_id="1",
+                )
+            )
+        )
+        await operation_started.wait()
+        write_task.cancel()
+        close_task = asyncio.create_task(store.async_close())
+        try:
+            await asyncio.sleep(0.01)
+            assert close_task.done() is False
+            assert close_executor_started.is_set() is False
+            # New callers can no longer acquire the detached connection, while
+            # the retained close task waits for its active executor user.
+            assert store._conn is None
+        finally:
+            release_operation.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await write_task
+        await close_task
+
+        assert close_executor_started.is_set()
+        assert store._conn is None
+
+    asyncio.run(run())
+
+
+def test_cancelled_initial_connect_is_closed_after_bounded_rollback(
+    monkeypatch, tmp_path
+) -> None:
+    """A late SQLite connect result must retain an exact close owner."""
+
+    async def run() -> None:
+        monkeypatch.setattr(store_module, "_STORE_CLOSE_WAIT_TIMEOUT", 0.01)
+        connect_started = asyncio.Event()
+        release_connect = asyncio.Event()
+        connection_closed = asyncio.Event()
+        executor_calls = 0
+
+        class Connection:
+            closed = False
+
+            def close(self) -> None:
+                self.closed = True
+                connection_closed.set()
+
+        connection = Connection()
+
+        async def controlled_executor(target):
+            nonlocal executor_calls
+            executor_calls += 1
+            if executor_calls == 1:
+                connect_started.set()
+                await release_connect.wait()
+            return target()
+
+        monkeypatch.setattr(store_module.sqlite3, "connect", lambda *_args, **_kwargs: connection)
+        store = MeshStore(
+            tmp_path / "meshnet.sqlite3",
+            executor=controlled_executor,
+        )
+        open_task = asyncio.create_task(store.async_open())
+        await connect_started.wait()
+
+        open_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await open_task
+
+        assert store._conn is None
+        assert store._close_task is not None
+
+        # Rollback remains bounded even though the executor still owns connect.
+        await asyncio.wait_for(store.async_close(), timeout=0.2)
+        assert connection.closed is False
+        close_owner = store._close_task
+        assert close_owner is not None
+
+        release_connect.set()
+        await asyncio.wait_for(connection_closed.wait(), timeout=0.2)
+        await asyncio.wait_for(close_owner, timeout=0.2)
+        await asyncio.sleep(0)
+
+        assert connection.closed is True
+        assert store._conn is None
+        assert store._close_task is None
+        assert store._inflight == set()
+
+    asyncio.run(run())

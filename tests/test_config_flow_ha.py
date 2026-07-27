@@ -82,6 +82,13 @@ from custom_components.meshnet.serial_devices import SerialDevice  # noqa: E402
 ADAPTER_ADDRESS = "00:11:22:33:44:55"
 
 
+def test_supported_home_assistant_has_entry_owned_background_tasks() -> None:
+    """The declared HA floor must support non-blocking transport startup."""
+    from homeassistant.config_entries import ConfigEntry
+
+    assert callable(getattr(ConfigEntry, "async_create_background_task", None))
+
+
 def _keys(schema) -> set[str]:
     return {marker.schema for marker in schema.schema}
 
@@ -912,6 +919,110 @@ def test_home_assistant_flow_manager_success_commits_before_cleanup(
             ("hci0", ADAPTER_ADDRESS, pairing_result.address)
         ]
         stored = config_entries.async_entries(DOMAIN)[0].data[CONF_GATEWAYS][0]
+        assert stored["options"] == {
+            CONF_BLUETOOTH_ADAPTER: "hci0",
+            CONF_BLUETOOTH_ADAPTER_ADDRESS: ADAPTER_ADDRESS,
+            CONF_BLUETOOTH_BOND_MANAGED: True,
+        }
+
+    asyncio.run(run())
+
+
+def test_home_assistant_flow_manager_finishes_after_pin_progress_poll(
+    monkeypatch, tmp_path
+) -> None:
+    """Reproduce the frontend PIN submit and progress-poll transition."""
+
+    async def run() -> None:
+        from homeassistant.config_entries import ConfigEntries
+        from homeassistant.core import HomeAssistant
+
+        pairing_result = PairingResult(
+            "AA:BB:CC:DD:EE:17", "hci0", ADAPTER_ADDRESS, True
+        )
+
+        class DeferredPinAttempt(_FakePairingAttempt):
+            def __init__(self) -> None:
+                super().__init__(requires_pin=True, result=pairing_result)
+                self.pin_received = asyncio.Event()
+                self.release_result = asyncio.Event()
+
+            async def async_submit_pin(self, pin: str) -> PairingResult:
+                self.submit_count += 1
+                self.submitted_pin = pin
+                self.pin_received.set()
+                await self.release_result.wait()
+                self.requires_pin = False
+                self.result = self._result
+                return self._result
+
+        attempt = DeferredPinAttempt()
+        manager = _FakePairingManager(attempt)
+        monkeypatch.setattr(
+            config_flow_module,
+            "_async_pairing_manager",
+            lambda _hass: manager,
+        )
+        hass = HomeAssistant(str(tmp_path))
+        config_entries = ConfigEntries(hass, {})
+        hass.config_entries = config_entries
+        monkeypatch.setattr(
+            config_entries, "async_setup", AsyncMock(return_value=True)
+        )
+        flow = MeshNetConfigFlow()
+        flow.hass = hass
+        flow.handler = DOMAIN
+        flow.flow_id = "meshnet_pin_progress_poll_test"
+        flow.context = {"source": "user"}
+        flow.init_data = None
+        flow._pairing_gateway = {
+            "gateway_id": "screen_radio",
+            "name": "Screen radio",
+            "protocol": PROTOCOL_MESHTASTIC,
+            "transport": TRANSPORT_BLUETOOTH,
+            CONF_BLE_ADDRESS: pairing_result.address,
+        }
+        flow._pairing_return_step = "gateway"
+        flow._pairing_attempt = attempt
+        flow.cur_step = await flow.async_step_pair_pin()
+        config_entries.flow._async_add_flow_progress(flow)
+
+        progress = await config_entries.flow.async_configure(
+            flow.flow_id, {CONF_PAIRING_PIN: "000123"}
+        )
+        assert progress["type"] == "progress"
+        assert progress["step_id"] == "pairing_submit"
+        await attempt.pin_received.wait()
+
+        # This is the poll issued while the frontend displays
+        # "Loading next step for MeshNet". It must remain bounded to the same
+        # progress task and must not start a second PIN submission.
+        pending = await config_entries.flow.async_configure(flow.flow_id)
+        assert pending["type"] == "progress"
+        assert pending["step_id"] == "pairing_submit"
+        assert attempt.submit_count == 1
+
+        # Home Assistant's progress-task callback must consume
+        # SHOW_PROGRESS_DONE. The frontend then polls that next step without
+        # resubmitting the secret, which must invoke pair_finish.
+        attempt.release_result.set()
+        await hass.async_block_till_done()
+
+        assert flow.cur_step is not None
+        assert flow.cur_step["type"] == "progress_done"
+        assert flow.cur_step["step_id"] == "pair_finish"
+        finished = await config_entries.flow.async_configure(flow.flow_id)
+        await hass.async_block_till_done()
+
+        assert finished["type"] == "create_entry"
+        assert len(config_entries.async_entries(DOMAIN)) == 1
+        assert config_entries.flow.async_progress() == []
+        assert attempt.submitted_pin == "000123"
+        assert manager.released == [
+            ("hci0", ADAPTER_ADDRESS, pairing_result.address)
+        ]
+        stored = config_entries.async_entries(DOMAIN)[0].data[CONF_GATEWAYS][0]
+        assert CONF_PAIRING_PIN not in repr(stored)
         assert stored["options"] == {
             CONF_BLUETOOTH_ADAPTER: "hci0",
             CONF_BLUETOOTH_ADAPTER_ADDRESS: ADAPTER_ADDRESS,

@@ -1,5 +1,14 @@
 # Upgrade Guide
 
+## From 0.4.0
+
+0.4.1 moves radio SDK connection work out of Home Assistant's config-entry
+setup request. This prevents Meshtastic Bluetooth discovery and configuration
+waits from leaving the pairing dialog at **Loading next step for MeshNet**.
+Restart Home Assistant after updating. If the dialog previously stalled, check
+**Settings → Devices & services** before pairing again: the entry or verified
+BlueZ bond may already exist.
+
 ## From 0.2.x
 
 0.4.0 adds the bounded Meshtastic Bluetooth pairing wizard. Config entry major

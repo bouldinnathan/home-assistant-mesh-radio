@@ -59,7 +59,9 @@ For Meshtastic Bluetooth, Home Assistant commits verified connection metadata
 immediately with safe global defaults. MeshNet attempts rollback inside the
 active pairing transaction if verification fails. After that transaction ends,
 it preserves external BlueZ state instead of guessing that a same-address bond
-still belongs to MeshNet.
+still belongs to MeshNet. Radio SDK startup then runs as an entry-owned
+background task, so a slow BLE discovery or configuration exchange cannot hold
+the setup dialog or Home Assistant startup open.
 
 For USB serial, the setup form lists local devices visible to Home Assistant. Choose one from the dropdown, or type an advanced path such as `/dev/serial/by-id/usb-YOUR_RADIO` or a custom container mapping.
 
