@@ -1,5 +1,19 @@
 # Upgrade Guide
 
+## From 0.4.1
+
+0.4.2 restores Home Assistant's native **Download diagnostics** action in the
+MeshNet three-dot menu and greatly expands its cached health report. The
+diagnostics platform now uses the supported Home Assistant import path and
+reports integration/library versions, coordinator and transport task state,
+gateway counters, safe node radio and power telemetry, deduplication/rate-limit
+state, and detailed SQLite/outbox aggregates.
+
+Diagnostics never connect, pair, scan, refresh, or transmit. Identifiers,
+addresses, names, credentials, message content, raw provider data, precise
+locations, and occupancy-related values remain omitted or redacted. Restart
+Home Assistant after updating so it reloads the diagnostics platform.
+
 ## From 0.4.0
 
 0.4.1 moves radio SDK connection work out of Home Assistant's config-entry

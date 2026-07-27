@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+from collections import Counter
 from collections.abc import Coroutine, Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -41,6 +42,7 @@ from .const import (
     TRANSPORT_REST,
 )
 from .dedupe import PacketDeduplicator
+from .diagnostic_safety import safe_node_metadata
 from .gateway import MeshGateway
 from .meshcore_client import MeshCoreClient
 from .meshtastic_client import MeshtasticClient
@@ -64,6 +66,39 @@ _RECONNECT_INITIAL_DELAY = 30.0
 _RECONNECT_MAX_DELAY = 300.0
 _RECONNECT_JITTER_RATIO = 0.2
 _GATEWAY_TASK_CANCEL_TIMEOUT = 2.0
+_DIAGNOSTIC_STORE_TIMEOUT = 2.0
+
+
+def _diagnostic_task_state(task: asyncio.Future[Any] | None) -> str:
+    """Return task state without evaluating or exposing an exception."""
+    if task is None:
+        return "not_created"
+    if task.cancelled():
+        return "cancelled"
+    if task.done():
+        return "finished"
+    if isinstance(task, asyncio.Task) and task.cancelling():
+        return "cancelling"
+    return "pending"
+
+
+def _diagnostic_error_category(error: str) -> str:
+    """Classify an error without returning endpoint or credential-bearing text."""
+    lowered = error.casefold()
+    categories = (
+        ("authentication", ("auth", "credential", "password", "pin", "token")),
+        ("bluetooth", ("bluetooth", "bluez", "ble", "dbus")),
+        ("configuration", ("config", "invalid", "missing", "required", "unsupported")),
+        ("connection", ("connect", "disconnect", "socket", "network", "unreachable")),
+        ("data", ("decode", "json", "parse", "payload", "protobuf")),
+        ("permission", ("permission", "access denied", "read-only")),
+        ("serial", ("serial", "tty", "baud")),
+        ("timeout", ("timeout", "timed out")),
+    )
+    for category, markers in categories:
+        if any(marker in lowered for marker in markers):
+            return category
+    return "other"
 
 
 class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
@@ -361,7 +396,9 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                 return message_id
             self.async_set_updated_data(self.snapshot)
             self._create_issue(
-                issue_id=f"send_failed_{gateway.config.gateway_id}",
+                issue_id=self._gateway_issue_id(
+                    "send_failed", gateway.config.gateway_id
+                ),
                 message=f"Message queued after send failure on {gateway.config.name}: {err}",
             )
             return message_id
@@ -393,35 +430,214 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             await gateway.async_refresh()
 
     async def async_diagnostics(self) -> dict[str, Any]:
-        """Return aggregate diagnostics without identifiers or mesh content."""
+        """Return thorough cached diagnostics without identity or mesh content."""
+        gateway_items = sorted(self.gateways.items(), key=lambda item: item[0])
+        nodes = list(self.snapshot.nodes.values())
+        gateway_diagnostics: list[dict[str, Any]] = []
+        for index, (_gateway_id, gateway) in enumerate(gateway_items, start=1):
+            status = gateway.status
+            error_categories = Counter(
+                _diagnostic_error_category(error) for error in status.errors
+            )
+            client_snapshot = getattr(gateway, "diagnostic_snapshot", None)
+            try:
+                client = client_snapshot() if callable(client_snapshot) else {}
+            except Exception as err:
+                client = {
+                    "available": False,
+                    "collection_error": type(err).__name__,
+                }
+            config = getattr(gateway, "config", None)
+            options = getattr(config, "options", {}) or {}
+            numeric_options = {
+                key: options[key]
+                for key in (
+                    "baudrate",
+                    "message_poll_interval",
+                    "scan_interval",
+                )
+                if isinstance(options.get(key), (int, float))
+            }
+            gateway_diagnostics.append(
+                {
+                    "diagnostic_id": f"gateway_{index:03d}",
+                    "protocol": status.protocol,
+                    "transport": status.transport,
+                    "connected": status.connected,
+                    "last_connected": timestamp_to_json(status.last_connected),
+                    "last_packet": timestamp_to_json(status.last_packet),
+                    "packets_received": status.packets_received,
+                    "packets_sent": status.packets_sent,
+                    "duplicate_packets": status.duplicate_packets,
+                    "error_count": len(status.errors),
+                    "error_categories": dict(sorted(error_categories.items())),
+                    "status_detail_field_count": len(status.detail),
+                    "configured": {
+                        "host_configured": bool(getattr(config, "host", None)),
+                        "port": getattr(config, "port", None),
+                        "serial_endpoint": bool(
+                            getattr(config, "serial_path", None)
+                        ),
+                        "bluetooth_endpoint": bool(
+                            getattr(config, "ble_address", None)
+                        ),
+                        "mqtt_subscription": bool(
+                            getattr(config, "mqtt_topic", None)
+                        ),
+                        "rest_endpoint": bool(getattr(config, "api_url", None)),
+                        "api_key_configured": bool(
+                            getattr(config, "api_key", None)
+                        ),
+                        "publish_endpoint_configured": bool(
+                            options.get("publish_topic")
+                        ),
+                        "custom_send_endpoint_configured": bool(
+                            options.get("send_url")
+                        ),
+                        "bluetooth_adapter_metadata": bool(
+                            options.get("bluetooth_adapter")
+                            and options.get("bluetooth_adapter_address")
+                        ),
+                        "bluetooth_bond_managed": bool(
+                            options.get("bluetooth_bond_managed")
+                        ),
+                        "debug": bool(options.get("debug")),
+                        **numeric_options,
+                    },
+                    "client": client,
+                }
+            )
+
+        reconnect_tasks = getattr(self, "_reconnect_tasks", {})
+        send_tasks = getattr(self, "_send_tasks", set())
+        reconnect_states = Counter(
+            _diagnostic_task_state(task) for task in reconnect_tasks.values()
+        )
+        send_states = Counter(
+            _diagnostic_task_state(task) for task in send_tasks
+        )
+        update_interval = getattr(self, "update_interval", None)
+        last_update_success_time = getattr(self, "last_update_success_time", None)
+
+        try:
+            async with asyncio.timeout(_DIAGNOSTIC_STORE_TIMEOUT):
+                store_diagnostics = await self.store.async_diagnostics()
+        except TimeoutError:
+            store_diagnostics = {
+                "available": False,
+                "collection_error": "timeout",
+            }
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            store_diagnostics = {
+                "available": False,
+                "collection_error": type(err).__name__,
+            }
+
+        gateway_configs = getattr(self, "_gateway_configs", [])
+        protocol_counts = Counter(node.protocol for node in nodes)
+        role_counts = Counter(
+            safe_node_metadata(node.role, "role") or "redacted_or_unknown"
+            for node in nodes
+        )
+        hardware_counts = Counter(
+            safe_node_metadata(node.hardware_model, "hardware_model")
+            or "redacted_or_unknown"
+            for node in nodes
+        )
+        firmware_counts = Counter(
+            safe_node_metadata(node.firmware_version, "firmware_version")
+            or "redacted_or_unknown"
+            for node in nodes
+        )
+        radio_type_counts = Counter(
+            safe_node_metadata(node.radio_type, "radio_type")
+            or "redacted_or_unknown"
+            for node in nodes
+        )
+        gateway_reachability = Counter(str(len(node.gateway_ids)) for node in nodes)
+        last_heard_values = [node.last_heard for node in nodes if node.last_heard]
+
         return {
             "configuration": {
                 "node_timeout": self.node_timeout,
                 "history_days": self.history_days,
                 "gateway_count": len(self.gateways),
+                "protocol_counts": dict(
+                    sorted(
+                        Counter(config.protocol for config in gateway_configs).items()
+                    )
+                ),
+                "transport_counts": dict(
+                    sorted(
+                        Counter(config.transport for config in gateway_configs).items()
+                    )
+                ),
             },
-            "gateways": [
-                {
-                    "protocol": gateway.status.protocol,
-                    "transport": gateway.status.transport,
-                    "connected": gateway.status.connected,
-                    "last_connected": timestamp_to_json(gateway.status.last_connected),
-                    "last_packet": timestamp_to_json(gateway.status.last_packet),
-                    "packets_received": gateway.status.packets_received,
-                    "packets_sent": gateway.status.packets_sent,
-                    "duplicate_packets": gateway.status.duplicate_packets,
-                    "error_count": len(gateway.status.errors),
-                }
-                for gateway in self.gateways.values()
-            ],
+            "lifecycle": {
+                "shutting_down": getattr(self, "_shutting_down", False),
+                "reconnect_suspended": getattr(
+                    self, "_reconnect_suspended", False
+                ),
+                "gateway_generation": getattr(self, "_gateway_generation", 0),
+                "last_update_success": getattr(self, "last_update_success", None),
+                "last_update_success_time": timestamp_to_json(last_update_success_time),
+                "update_interval_seconds": (
+                    update_interval.total_seconds() if update_interval else None
+                ),
+                "coordinator_data_available": getattr(self, "data", None) is not None,
+            },
+            "tasks": {
+                "gateway_startup": _diagnostic_task_state(
+                    getattr(self, "_gateway_startup_task", None)
+                ),
+                "reconnect_count": len(reconnect_tasks),
+                "reconnect_states": dict(sorted(reconnect_states.items())),
+                "outbox_flush": _diagnostic_task_state(
+                    getattr(self, "_outbox_flush_owner", None)
+                ),
+                "outbox_lock_held": bool(
+                    getattr(self, "_outbox_lock", None)
+                    and self._outbox_lock.locked()
+                ),
+                "send_count": len(send_tasks),
+                "send_states": dict(sorted(send_states.items())),
+                "active_send_count": len(
+                    getattr(self, "_active_send_message_ids", set())
+                ),
+            },
+            "gateways": gateway_diagnostics,
             "dedupe": self.deduplicator.stats(),
             "rate_limit": self.tx_limiter.snapshot(),
             "snapshot": {
-                "node_count": len(self.snapshot.nodes),
+                "node_count": len(nodes),
+                "online_node_count": sum(node.online for node in nodes),
+                "offline_node_count": sum(not node.online for node in nodes),
                 "message_count": len(self.snapshot.recent_messages),
+                "messages_today": self.snapshot.messages_today,
                 "mesh_health_score": self.snapshot.mesh_health_score,
+                "nodes_with_location": sum(bool(node.location) for node in nodes),
+                "nodes_with_power": sum(bool(node.power) for node in nodes),
+                "nodes_with_radio": sum(bool(node.radio) for node in nodes),
+                "nodes_with_routing": sum(bool(node.routing) for node in nodes),
+                "nodes_with_sensors": sum(bool(node.sensors) for node in nodes),
+                "protocol_counts": dict(sorted(protocol_counts.items())),
+                "role_counts": dict(sorted(role_counts.items())),
+                "hardware_model_counts": dict(sorted(hardware_counts.items())),
+                "firmware_version_counts": dict(sorted(firmware_counts.items())),
+                "radio_type_counts": dict(sorted(radio_type_counts.items())),
+                "gateway_reachability_counts": dict(
+                    sorted(gateway_reachability.items())
+                ),
+                "oldest_last_heard": timestamp_to_json(
+                    min(last_heard_values) if last_heard_values else None
+                ),
+                "newest_last_heard": timestamp_to_json(
+                    max(last_heard_values) if last_heard_values else None
+                ),
             },
-            "store": await self.store.async_diagnostics(),
+            "store": store_diagnostics,
         }
 
     async def _handle_packet(
@@ -538,7 +754,9 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                 )
             else:
                 self._create_issue(
-                    issue_id=f"unsupported_protocol_{config.gateway_id}",
+                    issue_id=self._gateway_issue_id(
+                        "unsupported_protocol", config.gateway_id
+                    ),
                     message=f"Unsupported protocol {config.protocol}",
                 )
                 continue
@@ -560,7 +778,9 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         for gateway, result in zip(self.gateways.values(), results, strict=False):
             if isinstance(result, Exception):
                 self._create_issue(
-                    issue_id=f"gateway_start_{gateway.config.gateway_id}",
+                    issue_id=self._gateway_issue_id(
+                        "gateway_start", gateway.config.gateway_id
+                    ),
                     message=f"{gateway.config.name} failed to start: {result}",
                     severity=ir.IssueSeverity.WARNING,
                 )
@@ -858,6 +1078,19 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             translation_key="gateway_issue",
             translation_placeholders={"message": message},
         )
+
+    def _gateway_issue_id(self, category: str, gateway_id: str) -> str:
+        """Return a stable issue key that does not expose a gateway identifier."""
+        gateway_configs = list(getattr(self, "_gateway_configs", []))
+        for index, config in enumerate(gateway_configs, start=1):
+            if config.gateway_id == gateway_id:
+                return f"{category}_gateway_{index:03d}"
+        gateway_ids = sorted(getattr(self, "gateways", {}))
+        try:
+            index = gateway_ids.index(gateway_id) + 1
+        except ValueError:
+            return f"{category}_gateway_unknown"
+        return f"{category}_gateway_{index:03d}"
 
     @staticmethod
     def _message_id(

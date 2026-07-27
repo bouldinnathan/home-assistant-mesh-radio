@@ -161,6 +161,35 @@ class MeshtasticClient(MeshGateway):
         """Return whether this client already has a transport start in flight."""
         return self._start_task is not None and not self._start_task.done()
 
+    def diagnostic_snapshot(self) -> dict[str, Any]:
+        """Return cached Meshtastic lifecycle state without SDK or endpoint data."""
+        snapshot = super().diagnostic_snapshot()
+        snapshot.update(
+            {
+                "interface_active": self._interface is not None,
+                "mqtt_subscription_active": self._unsub_mqtt is not None,
+                "stopping": self._stopping,
+                "start_task": self._diagnostic_task_state(self._start_task),
+                "stop_task": self._diagnostic_task_state(self._stop_task),
+                "native_endpoint_lock_held": (
+                    self._native_lock is not None and self._native_lock.locked()
+                ),
+                "native_executor_operation_count": sum(
+                    len(tasks) for tasks in self._native_executor_tasks.values()
+                ),
+                "native_interface_executor_count": len(self._native_executor_tasks),
+                "native_subscription_count": sum(
+                    handler is not None
+                    for handler in (
+                        self._receive_handler,
+                        self._connect_handler,
+                        self._disconnect_handler,
+                    )
+                ),
+            }
+        )
+        return snapshot
+
     async def async_start(self) -> None:
         """Start the Meshtastic transport."""
         stop_task = self._stop_task

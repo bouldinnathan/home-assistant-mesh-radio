@@ -80,6 +80,25 @@ class MeshGateway(ABC):
         """Refresh gateway state if supported."""
         return None
 
+    @staticmethod
+    def _diagnostic_task_state(task: asyncio.Future[Any] | None) -> str:
+        """Return a task state without inspecting or exposing its exception."""
+        if task is None:
+            return "not_created"
+        if task.cancelled():
+            return "cancelled"
+        if task.done():
+            return "finished"
+        if isinstance(task, asyncio.Task) and task.cancelling():
+            return "cancelling"
+        return "pending"
+
+    def diagnostic_snapshot(self) -> dict[str, Any]:
+        """Return cached client lifecycle state without endpoint identity."""
+        return {
+            "implementation": type(self).__name__,
+        }
+
     async def _emit_packet(self, packet: MeshPacket) -> None:
         self.status.packets_received += 1
         self.status.last_packet = packet.timestamp

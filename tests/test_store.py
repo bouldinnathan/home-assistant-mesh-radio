@@ -44,11 +44,21 @@ async def _store_round_trip(tmp_path) -> None:
     assert snapshot.nodes["meshtastic:1"].long_name == "Node 1"
     assert snapshot.recent_messages[0].text == "hello"
     diagnostics = await store.async_diagnostics()
-    assert diagnostics == {
-        "node_count": 1,
-        "message_count": 1,
-        "packet_count": 1,
+    assert diagnostics["available"] is True
+    assert diagnostics["node_count"] == 1
+    assert diagnostics["message_count"] == 1
+    assert diagnostics["packet_count"] == 1
+    assert diagnostics["route_count"] == 0
+    assert diagnostics["message_direction_counts"] == {
+        "received": 1,
+        "sent": 0,
+        "queued": 0,
     }
+    assert diagnostics["node_protocol_counts"] == {"meshtastic": 1}
+    assert diagnostics["message_protocol_counts"] == {"meshtastic": 1}
+    assert diagnostics["packet_protocol_counts"] == {"meshtastic": 1}
+    assert diagnostics["journal_mode"] == "wal"
+    assert diagnostics["file_sizes"]["database_bytes"] > 0
     assert "hello" not in repr(diagnostics)
     assert str(store.path) not in repr(diagnostics)
     await store.async_close()
@@ -76,7 +86,16 @@ async def _pending_outbox(tmp_path) -> None:
     )
     pending = await store.async_pending_outbox()
     assert [message.message_id for message in pending] == ["queued"]
+    diagnostics = await store.async_diagnostics()
+    assert diagnostics["message_direction_counts"] == {
+        "received": 0,
+        "sent": 1,
+        "queued": 1,
+    }
     await store.async_close()
+    closed_diagnostics = await store.async_diagnostics()
+    assert closed_diagnostics["available"] is False
+    assert "node_count" not in closed_diagnostics
 
 
 def test_close_waits_for_active_database_operation(tmp_path) -> None:
@@ -156,9 +175,9 @@ def test_cancelled_database_operation_drains_executor_before_close(tmp_path) -> 
             await asyncio.sleep(0.01)
             assert close_task.done() is False
             assert close_executor_started.is_set() is False
-            # New callers can no longer acquire the detached connection, while
-            # the retained close task waits for its active executor user.
-            assert store._conn is None
+            # The close owner is queued behind the exact executor lease and
+            # cannot detach or close the connection underneath it.
+            assert store._conn is not None
         finally:
             release_operation.set()
 
@@ -168,6 +187,59 @@ def test_cancelled_database_operation_drains_executor_before_close(tmp_path) -> 
 
         assert close_executor_started.is_set()
         assert store._conn is None
+
+    asyncio.run(run())
+
+
+def test_cancelled_diagnostics_keep_sqlite_serialized_until_executor_drains(
+    tmp_path,
+) -> None:
+    """A timed-out download cannot overlap its query with a later store write."""
+
+    async def run() -> None:
+        store = MeshStore(tmp_path / "meshnet.sqlite3")
+        await store.async_open()
+        first_executor_started = asyncio.Event()
+        release_first_executor = asyncio.Event()
+        second_executor_started = asyncio.Event()
+        executor_calls = 0
+
+        async def controlled_executor(target):
+            nonlocal executor_calls
+            executor_calls += 1
+            if executor_calls == 1:
+                first_executor_started.set()
+                await release_first_executor.wait()
+            else:
+                second_executor_started.set()
+            return target()
+
+        store._executor = controlled_executor
+        diagnostics_task = asyncio.create_task(store.async_diagnostics())
+        await first_executor_started.wait()
+
+        diagnostics_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await diagnostics_task
+
+        write_task = asyncio.create_task(
+            store.async_upsert_node(
+                NodeState(
+                    node_key="meshtastic:1",
+                    protocol="meshtastic",
+                    node_id="1",
+                )
+            )
+        )
+        await asyncio.sleep(0.01)
+
+        assert second_executor_started.is_set() is False
+        assert store._conn is not None
+
+        release_first_executor.set()
+        await asyncio.wait_for(second_executor_started.wait(), timeout=0.2)
+        await write_task
+        await store.async_close()
 
     asyncio.run(run())
 

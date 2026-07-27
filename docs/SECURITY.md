@@ -190,10 +190,13 @@ current bond is the historical one MeshNet created.
 
 ## Diagnostics
 
-Diagnostics contain aggregate health and count information only. They exclude
-raw packets, message text, gateway and node identifiers, network addresses,
-precise locations, and configuration values. A broad defensive redaction list
-also covers keys named like:
+Diagnostics contain detailed cached health, lifecycle, version, telemetry, and
+aggregate database information. Collection performs no radio connection,
+pairing, scan, refresh, or transmit operation. Reports exclude raw packets,
+message text, gateway and node identities/names, network addresses, serial
+paths, URLs, MQTT topics, precise locations, occupancy-related state, and raw
+provider/configuration values. A broad defensive redaction layer covers keys
+named like:
 
 - `api_key`
 - `authorization`
@@ -203,6 +206,18 @@ also covers keys named like:
 - `token`
 - `private_key`
 - `secret`
+
+It also removes common credentials, URLs, IP/MAC addresses, serial paths, and
+long identifiers embedded inside diagnostic strings. Repair issue IDs use
+non-identifying gateway ordinals because Home Assistant appends repair metadata
+outside the integration's own diagnostic payload.
+
+Home Assistant wraps MeshNet's payload with system information, installed
+custom-component metadata, setup timing, manifest data, and repair issues. It
+also builds the downloaded filename from registry metadata: config-entry files
+contain the entry ID, while device files can contain the device name and
+registry ID even though MeshNet's JSON section is redacted. Inspect the entire
+Home Assistant wrapper and rename the file before sharing it publicly.
 
 Before sharing diagnostics publicly, still inspect the file manually.
 

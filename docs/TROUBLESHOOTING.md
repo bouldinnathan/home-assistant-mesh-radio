@@ -452,7 +452,7 @@ data: {}
 Then download diagnostics:
 
 ```text
-Settings -> Devices & Services -> MeshNet -> Download diagnostics
+Settings -> Devices & Services -> MeshNet -> three-dot menu -> Download diagnostics
 ```
 
 Look for:

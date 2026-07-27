@@ -10,7 +10,17 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .models import MeshPacket, MeshSnapshot, MessageRecord, NodeState, stable_json, timestamp_to_json, utcnow
+from .const import STORAGE_SCHEMA_VERSION
+from .models import (
+    MeshPacket,
+    MeshSnapshot,
+    MessageRecord,
+    NodeState,
+    parse_timestamp,
+    stable_json,
+    timestamp_to_json,
+    utcnow,
+)
 
 _STORE_CLOSE_WAIT_TIMEOUT = 2.0
 
@@ -28,6 +38,7 @@ class MeshStore:
         self._conn: sqlite3.Connection | None = None
         self._lock = asyncio.Lock()
         self._inflight: set[asyncio.Future[Any]] = set()
+        self._operation_tasks: set[asyncio.Task[Any]] = set()
         self._close_task: asyncio.Task[None] | None = None
 
     async def async_open(self) -> None:
@@ -125,15 +136,10 @@ class MeshStore:
 
     async def async_close(self) -> None:
         """Close the database connection."""
-        async with self._lock:
-            close_task = self._close_task
-            if self._conn is not None:
-                conn = self._conn
-                self._conn = None
-                close_task = asyncio.create_task(
-                    self._async_finish_close(conn, set(self._inflight))
-                )
-                self._retain_close_task(close_task)
+        close_task = self._close_task
+        if close_task is None:
+            close_task = asyncio.create_task(self._async_close_serialized())
+            self._retain_close_task(close_task)
         if close_task is None:
             return
         try:
@@ -145,6 +151,15 @@ class MeshStore:
             # operation that outlived cancellation. Never close SQLite beneath
             # a running thread, and never hold Home Assistant unload forever.
             return
+
+    async def _async_close_serialized(self) -> None:
+        """Detach and close the connection behind all serialized operations."""
+        async with self._lock:
+            conn = self._conn
+            self._conn = None
+            pending = set(self._inflight)
+        if conn is not None:
+            await self._async_finish_close(conn, pending)
 
     def _retain_close_task(self, close_task: asyncio.Task[None]) -> None:
         """Retain one close owner and consume any late failure."""
@@ -312,15 +327,145 @@ class MeshStore:
         await self._execute("DELETE FROM messages WHERE timestamp < ?", (cutoff_text,))
         await self._execute("DELETE FROM packets WHERE timestamp < ?", (cutoff_text,))
 
-    async def async_diagnostics(self) -> dict[str, int]:
-        """Return aggregate database diagnostics without stored mesh content."""
-        node_count = await self._count("nodes")
-        message_count = await self._count("messages")
-        packet_count = await self._count("packets")
+    async def async_diagnostics(self) -> dict[str, Any]:
+        """Return store health and aggregate metadata without stored content."""
+        diagnostics: dict[str, Any] = {
+            "available": self._conn is not None,
+            "schema_version": STORAGE_SCHEMA_VERSION,
+            "sqlite_version": sqlite3.sqlite_version,
+            "close_pending": self._close_task is not None,
+            "inflight_operation_count": len(self._inflight),
+        }
+        if self._conn is None:
+            return diagnostics
+
+        table_rows = await self._fetchall(
+            """
+            SELECT 'nodes' AS table_name, COUNT(*) AS count FROM nodes
+            UNION ALL
+            SELECT 'messages', COUNT(*) FROM messages
+            UNION ALL
+            SELECT 'packets', COUNT(*) FROM packets
+            UNION ALL
+            SELECT 'routes', COUNT(*) FROM routes
+            """
+        )
+        table_counts = {
+            str(row["table_name"]): int(row["count"]) for row in table_rows
+        }
+        message_summary = await self._fetchone(
+            """
+            SELECT
+                MIN(timestamp) AS oldest_timestamp,
+                MAX(timestamp) AS newest_timestamp,
+                SUM(CASE WHEN direction = 'rx' THEN 1 ELSE 0 END) AS received_count,
+                SUM(CASE WHEN direction = 'tx' THEN 1 ELSE 0 END) AS sent_count,
+                SUM(
+                    CASE
+                        WHEN direction = 'tx'
+                        AND json_extract(data, '$.raw.status') = 'queued'
+                        THEN 1 ELSE 0
+                    END
+                ) AS queued_count
+            FROM messages
+            """
+        )
+        packet_summary = await self._fetchone(
+            """
+            SELECT
+                MIN(timestamp) AS oldest_timestamp,
+                MAX(timestamp) AS newest_timestamp
+            FROM packets
+            """
+        )
+        node_protocol_rows = await self._fetchall(
+            "SELECT protocol, COUNT(*) AS count FROM nodes GROUP BY protocol"
+        )
+        message_protocol_rows = await self._fetchall(
+            "SELECT protocol, COUNT(*) AS count FROM messages GROUP BY protocol"
+        )
+        packet_protocol_rows = await self._fetchall(
+            "SELECT protocol, COUNT(*) AS count FROM packets GROUP BY protocol"
+        )
+        journal_row = await self._fetchone("PRAGMA journal_mode")
+
+        def file_sizes() -> dict[str, int]:
+            def size(path: Path) -> int:
+                try:
+                    return path.stat().st_size
+                except OSError:
+                    return 0
+
+            return {
+                "database_bytes": size(self.path),
+                "wal_bytes": size(self.path.with_name(f"{self.path.name}-wal")),
+                "shared_memory_bytes": size(
+                    self.path.with_name(f"{self.path.name}-shm")
+                ),
+            }
+
+        sizes = await self._run(file_sizes)
+        diagnostics.update(
+            {
+                "node_count": table_counts.get("nodes", 0),
+                "message_count": table_counts.get("messages", 0),
+                "packet_count": table_counts.get("packets", 0),
+                "route_count": table_counts.get("routes", 0),
+                "table_counts": table_counts,
+                "message_direction_counts": {
+                    "received": int(message_summary["received_count"] or 0)
+                    if message_summary
+                    else 0,
+                    "sent": int(message_summary["sent_count"] or 0)
+                    if message_summary
+                    else 0,
+                    "queued": int(message_summary["queued_count"] or 0)
+                    if message_summary
+                    else 0,
+                },
+                "node_protocol_counts": self._diagnostic_group_counts(
+                    node_protocol_rows
+                ),
+                "message_protocol_counts": self._diagnostic_group_counts(
+                    message_protocol_rows
+                ),
+                "packet_protocol_counts": self._diagnostic_group_counts(
+                    packet_protocol_rows
+                ),
+                "message_age_seconds": self._diagnostic_age_range(message_summary),
+                "packet_age_seconds": self._diagnostic_age_range(packet_summary),
+                "journal_mode": (
+                    str(journal_row["journal_mode"]) if journal_row else "unknown"
+                ),
+                "file_sizes": sizes,
+            }
+        )
+        return diagnostics
+
+    @staticmethod
+    def _diagnostic_group_counts(rows: list[sqlite3.Row]) -> dict[str, int]:
+        """Return counts grouped by a non-identifying protocol field."""
         return {
-            "node_count": node_count,
-            "message_count": message_count,
-            "packet_count": packet_count,
+            str(row["protocol"]): int(row["count"])
+            for row in rows
+            if row["protocol"]
+        }
+
+    @staticmethod
+    def _diagnostic_age_range(row: sqlite3.Row | None) -> dict[str, int | None]:
+        """Return record age bounds instead of activity timestamps."""
+        if row is None:
+            return {"oldest": None, "newest": None}
+
+        def age(value: Any) -> int | None:
+            parsed = parse_timestamp(value)
+            if parsed is None:
+                return None
+            return max(0, int((utcnow() - parsed).total_seconds()))
+
+        return {
+            "oldest": age(row["oldest_timestamp"]),
+            "newest": age(row["newest_timestamp"]),
         }
 
     async def _count(self, table: str) -> int:
@@ -328,25 +473,61 @@ class MeshStore:
         return int(row["count"] if row else 0)
 
     async def _execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
-        async with self._lock:
-            conn = self._conn
-            if conn is None:
-                raise RuntimeError("MeshStore is not open")
-            await self._run(lambda: conn.execute(sql, params))
+        await self._run_serialized(lambda conn: conn.execute(sql, params))
 
     async def _fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Row | None:
-        async with self._lock:
-            conn = self._conn
-            if conn is None:
-                raise RuntimeError("MeshStore is not open")
-            return await self._run(lambda: conn.execute(sql, params).fetchone())
+        return await self._run_serialized(
+            lambda conn: conn.execute(sql, params).fetchone()
+        )
 
     async def _fetchall(self, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
-        async with self._lock:
+        return await self._run_serialized(
+            lambda conn: conn.execute(sql, params).fetchall()
+        )
+
+    async def _run_serialized(
+        self,
+        target: Callable[[sqlite3.Connection], Any],
+    ) -> Any:
+        """Run one connection operation whose owner survives caller cancellation."""
+        owner = asyncio.create_task(self._async_run_serialized(target))
+        self._operation_tasks.add(owner)
+
+        def operation_done(task: asyncio.Task[Any]) -> None:
+            self._operation_tasks.discard(task)
+            if not task.cancelled():
+                task.exception()
+
+        owner.add_done_callback(operation_done)
+        return await asyncio.shield(owner)
+
+    async def _async_run_serialized(
+        self,
+        target: Callable[[sqlite3.Connection], Any],
+    ) -> Any:
+        """Hold the SQLite lease until the exact executor future has drained."""
+        await self._lock.acquire()
+        try:
             conn = self._conn
             if conn is None:
                 raise RuntimeError("MeshStore is not open")
-            return await self._run(lambda: conn.execute(sql, params).fetchall())
+            if self._executor is None:
+                try:
+                    return target(conn)
+                finally:
+                    self._lock.release()
+            future = self._start_executor(lambda: target(conn))
+        except BaseException:
+            if self._lock.locked():
+                self._lock.release()
+            raise
+
+        def release_connection_lease(_future: asyncio.Future[Any]) -> None:
+            if self._lock.locked():
+                self._lock.release()
+
+        future.add_done_callback(release_connection_lease)
+        return await asyncio.shield(future)
 
     async def _run(self, func: Callable[[], Any]) -> Any:
         if self._executor is not None:

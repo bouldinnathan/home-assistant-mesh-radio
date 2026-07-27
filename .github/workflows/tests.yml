@@ -54,6 +54,7 @@ jobs:
           import homeassistant.const
           import custom_components.meshnet.config_flow
           import custom_components.meshnet.coordinator
+          import custom_components.meshnet.diagnostics
           import custom_components.meshnet.entities.binary_sensors
           import custom_components.meshnet.entities.device_tracker
           import custom_components.meshnet.entities.sensors
@@ -64,4 +65,5 @@ jobs:
           pytest -q
           tests/test_config_flow_ha.py
           tests/test_bluetooth_pairing.py
+          tests/test_diagnostics.py
       - run: python -m pip check

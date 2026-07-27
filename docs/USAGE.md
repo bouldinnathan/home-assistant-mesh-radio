@@ -192,14 +192,33 @@ Settings -> Devices & Services -> MeshNet -> three-dot menu -> Download diagnost
 
 Diagnostics include:
 
-- Aggregate gateway status without names, IDs, addresses, or error text
-- Deduplication counters
-- Rate limiter state
-- Snapshot counts
-- SQLite counts
+- MeshNet, Meshtastic, MeshCore, Bluetooth, D-Bus, and SQLite versions
+- Redacted config-entry structure and safe gateway capability flags
+- Coordinator update health and background startup/reconnect/send/outbox state
+- Per-gateway protocol, transport, connection timestamps, packet counters,
+  categorized errors, and provider-client lifecycle state
+- Per-node hardware, firmware, role, online state, last-heard time, and safe
+  cached connectivity, power, radio, routing-hop, and environmental telemetry
+- Mesh-wide online/offline, protocol, role, hardware, firmware, location-
+  presence, gateway-reachability, and telemetry-presence summaries
+- Deduplication and transmit-rate limiter state
+- SQLite schema/runtime versions, journal mode, table/protocol/direction/outbox
+  counts, age ranges, executor/close state, and database/WAL size totals
 
-Configuration values, raw packets, messages, node identifiers, and locations
-are not included. Secret-like fields are also redacted defensively.
+The download is built exclusively from cached state. It never connects, pairs,
+scans, refreshes, or transmits through a radio. Identifiers, names, network
+addresses, serial paths, URLs, MQTT topics, credentials, message content, raw
+packets/provider data, precise locations, and occupancy-related values are
+omitted or redacted. Home Assistant also supplies its normal system,
+integration-manifest, setup-time, and custom-component metadata around the
+MeshNet report.
+
+The same action is available from MeshNet hub, gateway, and node device pages;
+device downloads select the relevant cached detail automatically. An
+administrator account is required. Mesh-wide summaries always cover the full
+snapshot; config-entry downloads cap the per-node detail list at 1,000 cached
+nodes and report whether that list was truncated, preventing an unusually large
+mesh from exhausting Home Assistant memory while building the JSON file.
 
 ## Database
 

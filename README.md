@@ -180,7 +180,7 @@ python -m ruff check .
 bash -n setup.sh install.sh verify_setup.sh uninstall.sh
 ```
 
-The integration source is `custom_components/meshnet`. Runtime history is stored as `meshnet.sqlite3` in the Home Assistant configuration directory. Diagnostics expose aggregate health/count data only—not configuration, message content, node identifiers, or locations—and the panel and WebSocket API require an administrator account.
+The integration source is `custom_components/meshnet`. Runtime history is stored as `meshnet.sqlite3` in the Home Assistant configuration directory. The admin-only three-dot menu provides a detailed, cached **Download diagnostics** report covering versions, lifecycle/task state, gateway and node radio health, and SQLite/outbox aggregates. It performs no radio operations and redacts or omits identities, endpoints, credentials, message/raw content, precise locations, and occupancy-related state. The panel and WebSocket API also require an administrator account.
 
 ## License
 

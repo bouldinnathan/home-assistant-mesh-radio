@@ -1183,7 +1183,16 @@ def test_diagnostics_exclude_gateway_identity_errors_and_mesh_content(monkeypatc
             snapshot=lambda: {"rate": 0.5, "capacity": 5.0, "tokens": 4.0}
         )
         coordinator.snapshot = MeshSnapshot(
-            nodes={"private-node-id": object()},
+            nodes={
+                "private-node-id": NodeState(
+                    node_key="private-node-id",
+                    protocol=PROTOCOL_MESHTASTIC,
+                    hardware_model="Private Owner's Bedroom Radio",
+                    firmware_version="Private Owner Firmware",
+                    radio_type="Private Owner Radio Type",
+                    role="Private Owner Bedroom Role",
+                )
+            },
             recent_messages=[
                 MessageRecord(
                     message_id="private-message-id",
@@ -1224,11 +1233,37 @@ def test_diagnostics_exclude_gateway_identity_errors_and_mesh_content(monkeypatc
             "private-sender",
             "private-channel",
             "192.0.2.99",
-            "token=private",
-        ):
+                "token=private",
+                "Private Owner's Bedroom Radio",
+                "Private Owner Firmware",
+                "Private Owner Radio Type",
+                "Private Owner Bedroom Role",
+            ):
             assert private_value not in serialized
 
     asyncio.run(run())
+
+
+def test_gateway_issue_ids_do_not_expose_gateway_identity(monkeypatch) -> None:
+    """HA appends issue IDs outside integration-controlled diagnostic redaction."""
+    coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+    coordinator = object.__new__(coordinator_class)
+    coordinator._gateway_configs = [
+        GatewayConfig(
+            gateway_id="private-gateway-id",
+            name="Private Home Gateway",
+            protocol=PROTOCOL_MESHTASTIC,
+            transport=TRANSPORT_TCP,
+        )
+    ]
+    coordinator.gateways = {}
+
+    issue_id = coordinator._gateway_issue_id(
+        "gateway_start", "private-gateway-id"
+    )
+
+    assert issue_id == "gateway_start_gateway_001"
+    assert "private-gateway-id" not in issue_id
 
 
 def test_reconnect_loop_retries_with_increasing_backoff(monkeypatch) -> None:

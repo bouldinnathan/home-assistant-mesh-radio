@@ -50,6 +50,31 @@ class MeshCoreClient(MeshGateway):
         self._contacts: dict[str, Any] = {}
         self._native_subscribed_events: set[str] = set()
 
+    def diagnostic_snapshot(self) -> dict[str, Any]:
+        """Return cached MeshCore lifecycle state without contacts or endpoints."""
+        snapshot = super().diagnostic_snapshot()
+        task_states: dict[str, int] = {}
+        for task in self._tasks:
+            state = self._diagnostic_task_state(task)
+            task_states[state] = task_states.get(state, 0) + 1
+        snapshot.update(
+            {
+                "interface_active": self._meshcore is not None,
+                "mqtt_subscription_active": self._unsub_mqtt is not None,
+                "stopping": self._stopping,
+                "lifecycle_epoch": self._lifecycle_epoch,
+                "interface_epoch_is_current": (
+                    self._meshcore is not None
+                    and self._meshcore_epoch == self._lifecycle_epoch
+                ),
+                "background_task_count": len(self._tasks),
+                "background_task_states": task_states,
+                "contact_count": len(self._contacts),
+                "native_subscription_count": len(self._native_subscribed_events),
+            }
+        )
+        return snapshot
+
     async def async_start(self) -> None:
         """Start the MeshCore transport."""
         self._lifecycle_epoch += 1
