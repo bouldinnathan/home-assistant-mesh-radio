@@ -1,0 +1,19 @@
+[project]
+name = "homeassistant-meshnet"
+version = "0.2.0"
+description = "Home Assistant custom integration for Meshtastic and MeshCore mesh networks"
+license = { file = "LICENSE" }
+requires-python = ">=3.12,<3.15"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]

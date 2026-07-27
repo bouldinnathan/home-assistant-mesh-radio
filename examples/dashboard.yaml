@@ -1,0 +1,94 @@
+title: MeshNet
+views:
+  - title: Overview
+    path: meshnet-overview
+    icon: mdi:radio-tower
+    cards:
+      - type: entities
+        title: Mesh Overview
+        entities:
+          - sensor.meshnet_total_nodes
+          - sensor.meshnet_active_nodes
+          - sensor.meshnet_offline_nodes
+          - sensor.meshnet_average_battery
+          - sensor.meshnet_mesh_health_score
+          - sensor.meshnet_messages_today
+
+      - type: entities
+        title: Gateway Status
+        show_header_toggle: false
+        entities:
+          - entity: sensor.meshnet_mesh_health_score
+            name: Mesh health
+          - entity: sensor.meshnet_messages_today
+            name: Messages today
+
+      - type: history-graph
+        title: Mesh Health Trend
+        hours_to_show: 24
+        entities:
+          - sensor.meshnet_mesh_health_score
+          - sensor.meshnet_average_battery
+
+      - type: markdown
+        title: Message Log
+        content: >
+          Open the MeshNet sidebar panel as an admin user for the live message log and topology.
+
+  - title: Nodes
+    path: meshnet-nodes
+    icon: mdi:access-point-network
+    cards:
+      - type: entities
+        title: Low Battery Nodes
+        entities:
+          # Replace these with real discovered battery entities.
+          - sensor.meshtastic_repeater_battery
+          - sensor.meshcore_sensor_battery
+
+      - type: entities
+        title: Offline Nodes
+        entities:
+          # Replace these with real discovered online entities.
+          - binary_sensor.meshtastic_repeater_online
+          - binary_sensor.meshcore_mobile_online
+
+      - type: entities
+        title: RF Quality Sensors
+        entities:
+          # Replace these with real discovered RF entities.
+          - sensor.meshtastic_repeater_rssi
+          - sensor.meshtastic_repeater_snr
+          - sensor.meshcore_mobile_rssi
+          - sensor.meshcore_mobile_snr
+
+  - title: Map
+    path: meshnet-map
+    icon: mdi:map-marker-path
+    cards:
+      - type: map
+        title: Mesh Node Locations
+        hours_to_show: 24
+        entities:
+          # Replace with real device_tracker entities after nodes are discovered.
+          - device_tracker.meshtastic_repeater_location
+          - device_tracker.meshcore_mobile_location
+
+  - title: Telemetry
+    path: meshnet-telemetry
+    icon: mdi:chart-line
+    cards:
+      - type: history-graph
+        title: Battery Trend
+        hours_to_show: 72
+        entities:
+          - sensor.meshnet_average_battery
+
+      - type: entities
+        title: Environmental Telemetry
+        entities:
+          # Replace these with real discovered telemetry entities.
+          - sensor.mesh_sensor_temperature
+          - sensor.mesh_sensor_humidity
+          - sensor.mesh_sensor_pressure
+          - sensor.mesh_sensor_co2

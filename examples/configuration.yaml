@@ -1,0 +1,57 @@
+# Example Home Assistant configuration for MeshNet.
+#
+# Safer path:
+#   Add MeshNet from Settings -> Devices & Services and use the guided forms.
+#   Use Configure later to add, edit, or remove gateways.
+#
+# YAML import path:
+#   Copy the meshnet: block into configuration.yaml, validate, then restart.
+
+meshnet:
+  node_timeout: 900
+  history_days: 30
+  gateways:
+    meshtastic_wifi_1:
+      gateway_id: meshtastic_wifi_1
+      name: Meshtastic WiFi 1
+      protocol: meshtastic
+      transport: tcp
+      host: 192.0.2.50
+      port: 4403
+
+    meshtastic_usb_1:
+      gateway_id: meshtastic_usb_1
+      name: Meshtastic USB 1
+      protocol: meshtastic
+      transport: serial
+      serial_path: /dev/serial/by-id/usb-YOUR_MESHTASTIC_DEVICE
+
+    meshcore_wifi_1:
+      gateway_id: meshcore_wifi_1
+      name: MeshCore WiFi 1
+      protocol: meshcore
+      transport: tcp
+      host: 192.0.2.51
+      port: 12345
+      options:
+        # MeshCore TCP details vary by firmware/gateway.
+        # Add pin here only if your device requires it.
+        debug: false
+
+    meshcore_usb_1:
+      gateway_id: meshcore_usb_1
+      name: MeshCore USB 1
+      protocol: meshcore
+      transport: serial
+      serial_path: /dev/serial/by-id/usb-YOUR_MESHCORE_DEVICE
+      options:
+        baudrate: 115200
+        debug: false
+
+# Optional logger block while setting up.
+logger:
+  default: warning
+  logs:
+    custom_components.meshnet: debug
+    meshtastic: info
+    meshcore: info

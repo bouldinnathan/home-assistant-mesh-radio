@@ -1,0 +1,5 @@
+pytest
+ruff
+homeassistant==2025.1.4
+meshtastic==2.7.11
+meshcore==2.3.7

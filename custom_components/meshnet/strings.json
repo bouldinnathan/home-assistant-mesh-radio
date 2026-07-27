@@ -1,0 +1,192 @@
+{
+  "title": "MeshNet",
+  "config": {
+    "flow_title": "MeshNet",
+    "step": {
+      "user": {
+        "title": "Choose your mesh radio",
+        "description": "Select the software running on the gateway you want to add.",
+        "data": {
+          "protocol": "Radio platform"
+        },
+        "data_description": {
+          "protocol": "Choose Meshtastic or MeshCore. You can add more gateways before finishing."
+        }
+      },
+      "connection": {
+        "title": "How is {protocol} connected?",
+        "description": "Choose a connection Home Assistant can reach. Advanced bridge methods require decoded JSON.",
+        "data": {
+          "transport": "Connection method"
+        }
+      },
+      "gateway": {
+        "title": "Connect the gateway",
+        "description": "Set up {protocol} using {transport}. Only fields needed by this connection are shown.",
+        "data": {
+          "name": "Gateway name",
+          "host": "Host name or IP address",
+          "port": "TCP port",
+          "serial_path": "Serial device path",
+          "ble_address": "Bluetooth address",
+          "mqtt_topic": "MQTT subscribe topic",
+          "publish_topic": "MQTT downlink topic (optional)",
+          "mqtt_node_id": "Gateway node number for MQTT sends (optional)",
+          "api_url": "REST state URL",
+          "api_key": "API key (optional)",
+          "send_url": "REST send URL (optional)",
+          "baudrate": "Serial baud rate",
+          "debug": "SDK debug logging",
+          "pin": "Bluetooth PIN (optional)",
+          "verify_connection": "Test before saving"
+        },
+        "data_description": {
+          "host": "This address is reached from Home Assistant, which may be inside a container.",
+          "serial_path": "Use the path visible inside Home Assistant. Prefer /dev/serial/by-id when available.",
+          "ble_address": "Direct SDK Bluetooth requires a local adapter; remote Bluetooth proxies are not supported.",
+          "mqtt_topic": "Meshtastic must point to its /json/ topic. MeshCore requires a compatible decoded-JSON bridge.",
+          "publish_topic": "For Meshtastic, use the exact .../2/json/mqtt/ downlink topic. Leave blank for receive-only.",
+          "mqtt_node_id": "Decimal node ID of the Meshtastic gateway that transmits MQTT downlinks.",
+          "verify_connection": "Recommended. Turn this off only when intentionally configuring an offline gateway."
+        }
+      },
+      "more": {
+        "title": "Gateway added",
+        "description": "Configured gateways:\n\n{gateways}",
+        "data": {
+          "add_another": "Add another gateway"
+        }
+      },
+      "settings": {
+        "title": "Finish MeshNet setup",
+        "description": "MeshNet will start with {gateway_count} gateway(s). These defaults work well for most networks.",
+        "data": {
+          "node_timeout": "Mark nodes offline after (seconds)",
+          "history_days": "Keep message history (days)"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "MeshNet is already configured. Open its Configure dialog to manage gateways.",
+      "invalid_import": "The imported MeshNet configuration is invalid. Check gateway IDs and transport fields."
+    },
+    "error": {
+      "cannot_connect": "Home Assistant could not reach this gateway. Check its address, port, device mapping, and permissions, or turn off the connection test to save an offline gateway.",
+      "invalid_auth": "The gateway rejected the API key.",
+      "missing_dependency": "This method needs another Home Assistant integration. Configure MQTT first, then try again.",
+      "invalid_gateway": "The gateway settings are incomplete, duplicated, or invalid for this radio and connection method."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Manage MeshNet",
+        "description": "{gateway_count} gateway(s) are configured. Choose what you want to change.",
+        "data": {
+          "action": "Action"
+        }
+      },
+      "add_gateway": {
+        "title": "Add a gateway",
+        "description": "Choose the radio software.",
+        "data": {
+          "protocol": "Radio platform"
+        }
+      },
+      "add_connection": {
+        "title": "How is {protocol} connected?",
+        "data": {
+          "transport": "Connection method"
+        }
+      },
+      "add_details": {
+        "title": "Connect the new gateway",
+        "description": "Set up {protocol} using {transport}.",
+        "data": {
+          "name": "Gateway name",
+          "host": "Host name or IP address",
+          "port": "TCP port",
+          "serial_path": "Serial device path",
+          "ble_address": "Bluetooth address",
+          "mqtt_topic": "MQTT subscribe topic",
+          "publish_topic": "MQTT downlink topic (optional)",
+          "mqtt_node_id": "Gateway node number for MQTT sends (optional)",
+          "api_url": "REST state URL",
+          "api_key": "API key (optional)",
+          "send_url": "REST send URL (optional)",
+          "baudrate": "Serial baud rate",
+          "debug": "SDK debug logging",
+          "pin": "Bluetooth PIN (optional)",
+          "verify_connection": "Test before saving"
+        }
+      },
+      "edit_gateway": {
+        "title": "Edit a gateway",
+        "data": {
+          "gateway": "Gateway"
+        }
+      },
+      "edit_details": {
+        "title": "Update the gateway",
+        "description": "Edit {protocol} using {transport}.",
+        "data": {
+          "name": "Gateway name",
+          "host": "Host name or IP address",
+          "port": "TCP port",
+          "serial_path": "Serial device path",
+          "ble_address": "Bluetooth address",
+          "mqtt_topic": "MQTT subscribe topic",
+          "publish_topic": "MQTT downlink topic (optional)",
+          "mqtt_node_id": "Gateway node number for MQTT sends (optional)",
+          "api_url": "REST state URL",
+          "api_key": "API key (optional)",
+          "send_url": "REST send URL (optional)",
+          "baudrate": "Serial baud rate",
+          "debug": "SDK debug logging",
+          "pin": "Bluetooth PIN (optional)",
+          "verify_connection": "Test before saving"
+        }
+      },
+      "remove_gateway": {
+        "title": "Remove a gateway",
+        "description": "This removes the connection from MeshNet. It does not change or erase the radio.",
+        "data": {
+          "gateway": "Gateway",
+          "confirm": "I understand and want to remove this gateway"
+        }
+      },
+      "general": {
+        "title": "History and timing",
+        "data": {
+          "node_timeout": "Mark nodes offline after (seconds)",
+          "history_days": "Keep message history (days)",
+          "scan_interval": "Bridge polling interval (seconds)"
+        }
+      },
+      "advanced": {
+        "title": "Advanced gateway JSON",
+        "description": "This escape hatch is intended for custom bridge options. The guided Add and Edit forms are safer for normal use.",
+        "data": {
+          "gateways_json": "Gateway definitions"
+        }
+      }
+    },
+    "abort": {
+      "no_gateways": "There are no gateways to edit or remove. Choose Add a gateway instead."
+    },
+    "error": {
+      "cannot_connect": "Home Assistant could not reach this gateway. Check the endpoint or turn off the connection test to save it offline.",
+      "invalid_auth": "The gateway rejected the API key.",
+      "missing_dependency": "Configure the Home Assistant MQTT integration first.",
+      "invalid_gateway": "The gateway settings are incomplete, duplicated, or invalid.",
+      "invalid_gateways": "Gateway JSON must be a list of valid gateway objects with unique gateway IDs.",
+      "confirmation_required": "Check the confirmation box before removing the gateway."
+    }
+  },
+  "issues": {
+    "gateway_issue": {
+      "title": "MeshNet gateway issue",
+      "description": "{message}"
+    }
+  }
+}

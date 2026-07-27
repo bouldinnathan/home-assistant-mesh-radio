@@ -1,0 +1,142 @@
+# Example MeshNet automations.
+# Replace entity IDs with your real Home Assistant entity IDs.
+
+- alias: MeshNet Internet Outage Broadcast
+  id: meshnet_internet_outage_broadcast
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.wan_online
+      to: "off"
+      for: "00:02:00"
+  action:
+    - service: meshnet.broadcast_message
+      data:
+        message: "Internet outage detected by Home Assistant."
+        priority: emergency
+        message_type: emergency
+    - service: notify.notify
+      data:
+        message: "Internet outage detected. Mesh broadcast sent."
+
+- alias: MeshNet Node Battery Below 15
+  id: meshnet_node_battery_below_15
+  mode: queued
+  trigger:
+    - platform: numeric_state
+      entity_id:
+        - sensor.meshtastic_repeater_battery
+        - sensor.meshcore_sensor_battery
+      below: 15
+  action:
+    - service: notify.notify
+      data:
+        message: "{{ trigger.to_state.name }} is below 15%."
+    - service: meshnet.broadcast_message
+      data:
+        message: "{{ trigger.to_state.name }} battery below 15%."
+        priority: high
+
+- alias: MeshNet Node Not Heard For 30 Minutes
+  id: meshnet_node_not_heard_30_minutes
+  mode: queued
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.meshtastic_repeater_online
+      to: "off"
+      for: "00:30:00"
+  action:
+    - service: notify.notify
+      data:
+        message: "Mesh repeater has not been heard for 30 minutes."
+    - service: meshnet.broadcast_message
+      data:
+        message: "Mesh repeater has not been heard for 30 minutes."
+        priority: high
+
+- alias: MeshNet Door Sensor Open
+  id: meshnet_door_sensor_open
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.gate_door
+      to: "on"
+  action:
+    - service: meshnet.send_message
+      data:
+        target_node: "meshtastic:security"
+        message: "Gate door opened."
+        priority: high
+        message_type: direct
+
+- alias: MeshNet Emergency Message To Phone
+  id: meshnet_emergency_message_to_phone
+  mode: queued
+  trigger:
+    - platform: event
+      event_type: meshnet_message_received
+  condition:
+    - condition: template
+      value_template: "{{ trigger.event.data.priority == 'emergency' or trigger.event.data.message_type == 'emergency' }}"
+  action:
+    - service: notify.mobile_app_your_phone
+      data:
+        title: "Emergency mesh message"
+        message: "{{ trigger.event.data.sender }}: {{ trigger.event.data.text }}"
+
+- alias: MeshNet Log All Received Messages
+  id: meshnet_log_all_received_messages
+  mode: queued
+  trigger:
+    - platform: event
+      event_type: meshnet_message_received
+  action:
+    - service: logbook.log
+      data:
+        name: MeshNet
+        message: "{{ trigger.event.data.sender }} -> {{ trigger.event.data.receiver }}: {{ trigger.event.data.text }}"
+
+- alias: MeshNet Announce Emergency Message
+  id: meshnet_announce_emergency_message
+  mode: queued
+  trigger:
+    - platform: event
+      event_type: meshnet_message_received
+  condition:
+    - condition: template
+      value_template: "{{ trigger.event.data.priority == 'emergency' or trigger.event.data.message_type == 'emergency' }}"
+  action:
+    - service: tts.speak
+      target:
+        entity_id: tts.home_assistant_cloud
+      data:
+        media_player_entity_id: media_player.living_room
+        message: "Emergency mesh message. {{ trigger.event.data.text }}"
+
+- alias: MeshNet Proxmox Server Alert
+  id: meshnet_proxmox_server_alert
+  mode: queued
+  trigger:
+    - platform: numeric_state
+      entity_id: sensor.proxmox_cpu_temperature
+      above: 85
+  action:
+    - service: meshnet.broadcast_message
+      data:
+        message: "Proxmox CPU temperature above 85 C."
+        priority: emergency
+        message_type: emergency
+
+- alias: MeshNet UPS Battery Low
+  id: meshnet_ups_battery_low
+  mode: single
+  trigger:
+    - platform: numeric_state
+      entity_id: sensor.ups_battery_charge
+      below: 25
+  action:
+    - service: meshnet.broadcast_message
+      data:
+        message: "UPS battery below 25%."
+        priority: emergency
+        message_type: emergency

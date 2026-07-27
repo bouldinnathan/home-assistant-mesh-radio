@@ -1,0 +1,129 @@
+send_message:
+  target:
+  fields:
+    target_node:
+      required: false
+      selector:
+        text:
+      example: "meshtastic:123456789"
+    gateway_id:
+      required: false
+      selector:
+        text:
+    message:
+      required: true
+      selector:
+        text:
+          multiline: true
+      example: "Generator battery low"
+    priority:
+      required: false
+      default: "normal"
+      selector:
+        select:
+          options:
+            - normal
+            - high
+            - emergency
+    channel:
+      required: false
+      selector:
+        text:
+      example: "0"
+    message_type:
+      required: false
+      default: "broadcast"
+      selector:
+        select:
+          options:
+            - direct
+            - group
+            - broadcast
+            - emergency
+
+broadcast_message:
+  target:
+  fields:
+    gateway_id:
+      required: false
+      selector:
+        text:
+    message:
+      required: true
+      selector:
+        text:
+          multiline: true
+    priority:
+      required: false
+      default: "normal"
+      selector:
+        select:
+          options:
+            - normal
+            - high
+            - emergency
+    channel:
+      required: false
+      selector:
+        text:
+    message_type:
+      required: false
+      default: "broadcast"
+      selector:
+        select:
+          options:
+            - broadcast
+            - emergency
+
+schedule_message:
+  target:
+  fields:
+    when:
+      required: true
+      selector:
+        text:
+      example: "2026-05-14T21:00:00-05:00"
+    target_node:
+      required: false
+      selector:
+        text:
+    gateway_id:
+      required: false
+      selector:
+        text:
+    message:
+      required: true
+      selector:
+        text:
+          multiline: true
+    priority:
+      required: false
+      default: "normal"
+      selector:
+        select:
+          options:
+            - normal
+            - high
+            - emergency
+    channel:
+      required: false
+      selector:
+        text:
+    message_type:
+      required: false
+      default: "broadcast"
+      selector:
+        select:
+          options:
+            - direct
+            - group
+            - broadcast
+            - emergency
+
+refresh_gateway:
+  target:
+  fields:
+    gateway_id:
+      required: false
+      selector:
+        text:

@@ -1,0 +1,47 @@
+services:
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:${HA_VERSION:-stable}
+    container_name: meshnet-homeassistant
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Etc/UTC}
+    ports:
+      - "${HA_HTTP_PORT:-8123}:8123"
+    volumes:
+      # Persistent Home Assistant configuration and MeshNet SQLite data.
+      - ${HA_CONFIG_DOCKER:-./ha-config}:/config
+      # Live-mount this integration for local testing. For production, copy the
+      # directory into /config/custom_components/meshnet and remove this mount.
+      - ./custom_components/meshnet:/config/custom_components/meshnet:ro
+      - ./examples:/config/examples:ro
+      # Local Bluetooth only: uncomment after confirming /run/dbus exists.
+      # - /run/dbus:/run/dbus:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8123/', timeout=5)\"",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+    # USB examples. Uncomment and edit one or both mappings when using serial
+    # gateways from Docker. The path on the right is what you put in MeshNet.
+    #
+    # devices:
+    #   - /dev/serial/by-id/usb-YOUR_MESHTASTIC_DEVICE:/dev/meshtastic0
+    #   - /dev/serial/by-id/usb-YOUR_MESHCORE_DEVICE:/dev/meshcore0
+
+    # Local Bluetooth also requires these capabilities. Remote Home Assistant
+    # Bluetooth proxies cannot carry the SDK's direct BLE connection.
+    #
+    # cap_add:
+    #   - NET_ADMIN
+    #   - NET_RAW
+
+    # Host networking can simplify LAN discovery, but it is not a substitute
+    # for the D-Bus mount/capabilities above and it ignores the ports section.
+    #
+    # network_mode: host

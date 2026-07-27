@@ -1,0 +1,11 @@
+# This image only needs the integration. Keep local Home Assistant state,
+# credentials, VCS metadata, tests, and developer files out of the build context.
+**
+!Dockerfile
+!custom_components/
+!custom_components/meshnet/
+!custom_components/meshnet/**
+
+# Do not copy generated Python artifacts from the otherwise allowed tree.
+**/__pycache__/
+**/*.py[cod]

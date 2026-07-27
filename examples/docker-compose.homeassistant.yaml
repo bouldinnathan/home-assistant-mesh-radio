@@ -1,0 +1,19 @@
+# Example only. Merge with your real Home Assistant Docker Compose file.
+
+services:
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:${HA_VERSION:-stable}
+    container_name: homeassistant
+    network_mode: host
+    volumes:
+      - /opt/homeassistant/config:/config
+      # Uncomment for a local Bluetooth adapter:
+      # - /run/dbus:/run/dbus:ro
+    devices:
+      - /dev/serial/by-id/usb-YOUR_MESHTASTIC_DEVICE:/dev/meshtastic0
+      - /dev/serial/by-id/usb-YOUR_MESHCORE_DEVICE:/dev/meshcore0
+    # Uncomment for a local Bluetooth adapter:
+    # cap_add:
+    #   - NET_ADMIN
+    #   - NET_RAW
+    restart: unless-stopped

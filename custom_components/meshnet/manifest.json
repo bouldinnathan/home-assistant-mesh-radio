@@ -1,0 +1,14 @@
+{
+  "domain": "meshnet",
+  "name": "MeshNet",
+  "after_dependencies": ["mqtt", "bluetooth_adapters"],
+  "codeowners": [],
+  "config_flow": true,
+  "documentation": "https://github.com/local/meshnet",
+  "integration_type": "hub",
+  "iot_class": "local_push",
+  "loggers": ["meshtastic", "meshcore", "pubsub"],
+  "requirements": ["meshtastic==2.7.11", "meshcore==2.3.7"],
+  "single_config_entry": true,
+  "version": "0.2.0"
+}

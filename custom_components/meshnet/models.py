@@ -1,0 +1,463 @@
+"""Pure data models and normalization helpers for MeshNet."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+import hashlib
+import json
+from typing import Any
+
+
+JsonDict = dict[str, Any]
+
+
+def utcnow() -> datetime:
+    """Return an aware UTC timestamp."""
+    return datetime.now(UTC)
+
+
+def parse_timestamp(value: Any) -> datetime | None:
+    """Parse common timestamp representations into UTC datetimes."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=UTC)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(value, str):
+        try:
+            if value.endswith("Z"):
+                value = f"{value[:-1]}+00:00"
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+    return None
+
+
+def timestamp_to_json(value: datetime | None) -> str | None:
+    """Serialize a timestamp for JSON storage."""
+    if value is None:
+        return None
+    return value.astimezone(UTC).isoformat()
+
+
+def stable_json(data: Any) -> str:
+    """Serialize data deterministically for hashing and persistence."""
+    return json.dumps(data, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _clean_id(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def canonical_node_key(protocol: str, node_id: Any = None, mac: Any = None, public_key: Any = None) -> str:
+    """Return a stable cross-gateway node key."""
+    if mac_id := _clean_id(mac):
+        return f"mac:{mac_id.lower().replace(':', '')}"
+    if key_id := _clean_id(public_key):
+        return f"pub:{key_id.lower()}"
+    if node := _clean_id(node_id):
+        return f"{protocol}:{node}"
+    digest = hashlib.sha256(f"{protocol}:{utcnow().timestamp()}".encode()).hexdigest()[:12]
+    return f"{protocol}:unknown:{digest}"
+
+
+def coerce_float(value: Any) -> float | None:
+    """Return a float or None for noisy radio payload values."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def coerce_int(value: Any) -> int | None:
+    """Return an int or None for noisy radio payload values."""
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def merge_dict(base: JsonDict, update: JsonDict) -> JsonDict:
+    """Merge dictionaries without dropping existing values when updates are empty."""
+    merged = dict(base)
+    for key, value in update.items():
+        if value is None:
+            continue
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = merge_dict(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+@dataclass(slots=True)
+class GatewayConfig:
+    """Configuration for a single mesh gateway."""
+
+    gateway_id: str
+    name: str
+    protocol: str
+    transport: str
+    host: str | None = None
+    port: int | None = None
+    serial_path: str | None = None
+    ble_address: str | None = None
+    mqtt_topic: str | None = None
+    api_url: str | None = None
+    api_key: str | None = None
+    options: JsonDict = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: JsonDict) -> "GatewayConfig":
+        """Build a gateway configuration from config-entry data."""
+        return cls(
+            gateway_id=str(data["gateway_id"]),
+            name=str(data.get("name") or data.get("gateway_name") or data["gateway_id"]),
+            protocol=str(data["protocol"]),
+            transport=str(data["transport"]),
+            host=data.get("host"),
+            port=coerce_int(data.get("port")),
+            serial_path=data.get("serial_path"),
+            ble_address=data.get("ble_address"),
+            mqtt_topic=data.get("mqtt_topic"),
+            api_url=data.get("api_url"),
+            api_key=data.get("api_key"),
+            options=dict(data.get("options") or {}),
+        )
+
+    def as_dict(self, *, redact: bool = False) -> JsonDict:
+        """Serialize the gateway configuration."""
+        data = {
+            "gateway_id": self.gateway_id,
+            "name": self.name,
+            "protocol": self.protocol,
+            "transport": self.transport,
+            "host": self.host,
+            "port": self.port,
+            "serial_path": self.serial_path,
+            "ble_address": self.ble_address,
+            "mqtt_topic": self.mqtt_topic,
+            "api_url": self.api_url,
+            "api_key": "***" if redact and self.api_key else self.api_key,
+            "options": dict(self.options),
+        }
+        return {key: value for key, value in data.items() if value not in (None, {}, "")}
+
+
+@dataclass(slots=True)
+class GatewayStatus:
+    """Runtime status for a gateway connection."""
+
+    gateway_id: str
+    name: str
+    protocol: str
+    transport: str
+    connected: bool = False
+    last_connected: datetime | None = None
+    last_packet: datetime | None = None
+    packets_received: int = 0
+    packets_sent: int = 0
+    duplicate_packets: int = 0
+    errors: list[str] = field(default_factory=list)
+    detail: JsonDict = field(default_factory=dict)
+
+    def as_dict(self) -> JsonDict:
+        """Serialize the gateway status."""
+        return {
+            "gateway_id": self.gateway_id,
+            "name": self.name,
+            "protocol": self.protocol,
+            "transport": self.transport,
+            "connected": self.connected,
+            "last_connected": timestamp_to_json(self.last_connected),
+            "last_packet": timestamp_to_json(self.last_packet),
+            "packets_received": self.packets_received,
+            "packets_sent": self.packets_sent,
+            "duplicate_packets": self.duplicate_packets,
+            "errors": list(self.errors[-10:]),
+            "detail": dict(self.detail),
+        }
+
+
+@dataclass(slots=True)
+class MessageRecord:
+    """A normalized mesh message."""
+
+    message_id: str
+    protocol: str
+    gateway_id: str
+    sender: str | None
+    receiver: str | None
+    channel: str | None
+    text: str
+    message_type: str = "broadcast"
+    priority: str = "normal"
+    encrypted: bool | None = None
+    hops: int | None = None
+    timestamp: datetime = field(default_factory=utcnow)
+    direction: str = "rx"
+    raw: JsonDict = field(default_factory=dict)
+
+    def as_dict(self) -> JsonDict:
+        """Serialize the message."""
+        return {
+            "message_id": self.message_id,
+            "protocol": self.protocol,
+            "gateway_id": self.gateway_id,
+            "sender": self.sender,
+            "receiver": self.receiver,
+            "channel": self.channel,
+            "text": self.text,
+            "message_type": self.message_type,
+            "priority": self.priority,
+            "encrypted": self.encrypted,
+            "hops": self.hops,
+            "timestamp": timestamp_to_json(self.timestamp),
+            "direction": self.direction,
+            "raw": self.raw,
+        }
+
+    @classmethod
+    def from_dict(cls, data: JsonDict) -> "MessageRecord":
+        """Deserialize a message."""
+        return cls(
+            message_id=str(data["message_id"]),
+            protocol=str(data["protocol"]),
+            gateway_id=str(data["gateway_id"]),
+            sender=data.get("sender"),
+            receiver=data.get("receiver"),
+            channel=data.get("channel"),
+            text=str(data.get("text") or ""),
+            message_type=str(data.get("message_type") or "broadcast"),
+            priority=str(data.get("priority") or "normal"),
+            encrypted=data.get("encrypted"),
+            hops=coerce_int(data.get("hops")),
+            timestamp=parse_timestamp(data.get("timestamp")) or utcnow(),
+            direction=str(data.get("direction") or "rx"),
+            raw=dict(data.get("raw") or {}),
+        )
+
+
+@dataclass(slots=True)
+class MeshPacket:
+    """A normalized packet from any supported mesh gateway."""
+
+    protocol: str
+    gateway_id: str
+    packet_id: str | None = None
+    sender: str | None = None
+    receiver: str | None = None
+    channel: str | None = None
+    portnum: str | None = None
+    payload: Any = None
+    text: str | None = None
+    encrypted: bool | None = None
+    rssi: float | None = None
+    snr: float | None = None
+    hops: int | None = None
+    hop_limit: int | None = None
+    timestamp: datetime = field(default_factory=utcnow)
+    raw: JsonDict = field(default_factory=dict)
+
+    def fingerprint(self) -> str:
+        """Return a stable packet fingerprint for deduplication."""
+        if self.packet_id:
+            return f"{self.protocol}:{self.packet_id}"
+        bucket = int(self.timestamp.timestamp() // 5)
+        payload = {
+            "protocol": self.protocol,
+            "sender": self.sender,
+            "receiver": self.receiver,
+            "channel": self.channel,
+            "portnum": self.portnum,
+            "text": self.text,
+            "payload": self.payload,
+            "bucket": bucket,
+        }
+        return hashlib.sha256(stable_json(payload).encode()).hexdigest()
+
+    def as_dict(self) -> JsonDict:
+        """Serialize the packet."""
+        return {
+            "protocol": self.protocol,
+            "gateway_id": self.gateway_id,
+            "packet_id": self.packet_id,
+            "sender": self.sender,
+            "receiver": self.receiver,
+            "channel": self.channel,
+            "portnum": self.portnum,
+            "payload": self.payload,
+            "text": self.text,
+            "encrypted": self.encrypted,
+            "rssi": self.rssi,
+            "snr": self.snr,
+            "hops": self.hops,
+            "hop_limit": self.hop_limit,
+            "timestamp": timestamp_to_json(self.timestamp),
+            "raw": self.raw,
+        }
+
+
+@dataclass(slots=True)
+class NodeState:
+    """The current normalized state for one mesh node."""
+
+    node_key: str
+    protocol: str
+    node_id: str | None = None
+    mac: str | None = None
+    public_key: str | None = None
+    user_name: str | None = None
+    long_name: str | None = None
+    short_name: str | None = None
+    hardware_model: str | None = None
+    firmware_version: str | None = None
+    radio_type: str | None = None
+    role: str | None = None
+    online: bool = False
+    last_heard: datetime | None = None
+    last_gateway_id: str | None = None
+    gateway_ids: set[str] = field(default_factory=set)
+    connectivity: JsonDict = field(default_factory=dict)
+    power: JsonDict = field(default_factory=dict)
+    radio: JsonDict = field(default_factory=dict)
+    location: JsonDict = field(default_factory=dict)
+    routing: JsonDict = field(default_factory=dict)
+    sensors: JsonDict = field(default_factory=dict)
+    raw: JsonDict = field(default_factory=dict)
+
+    def merge(self, other: "NodeState") -> "NodeState":
+        """Merge newer state into this node and return self."""
+        if other.node_id:
+            self.node_id = other.node_id
+        if other.mac:
+            self.mac = other.mac
+        if other.public_key:
+            self.public_key = other.public_key
+        for attr in (
+            "user_name",
+            "long_name",
+            "short_name",
+            "hardware_model",
+            "firmware_version",
+            "radio_type",
+            "role",
+        ):
+            value = getattr(other, attr)
+            if value:
+                setattr(self, attr, value)
+        if other.last_heard and (not self.last_heard or other.last_heard >= self.last_heard):
+            self.last_heard = other.last_heard
+            self.last_gateway_id = other.last_gateway_id
+            self.online = other.online
+        self.gateway_ids.update(other.gateway_ids)
+        if other.last_gateway_id:
+            self.gateway_ids.add(other.last_gateway_id)
+        self.connectivity = merge_dict(self.connectivity, other.connectivity)
+        self.power = merge_dict(self.power, other.power)
+        self.radio = merge_dict(self.radio, other.radio)
+        self.location = merge_dict(self.location, other.location)
+        self.routing = merge_dict(self.routing, other.routing)
+        self.sensors = merge_dict(self.sensors, other.sensors)
+        self.raw = merge_dict(self.raw, other.raw)
+        return self
+
+    @property
+    def display_name(self) -> str:
+        """Return a useful display name."""
+        return self.long_name or self.user_name or self.short_name or self.node_id or self.node_key
+
+    def as_dict(self) -> JsonDict:
+        """Serialize the node."""
+        return {
+            "node_key": self.node_key,
+            "protocol": self.protocol,
+            "node_id": self.node_id,
+            "mac": self.mac,
+            "public_key": self.public_key,
+            "user_name": self.user_name,
+            "long_name": self.long_name,
+            "short_name": self.short_name,
+            "hardware_model": self.hardware_model,
+            "firmware_version": self.firmware_version,
+            "radio_type": self.radio_type,
+            "role": self.role,
+            "online": self.online,
+            "last_heard": timestamp_to_json(self.last_heard),
+            "last_gateway_id": self.last_gateway_id,
+            "gateway_ids": sorted(self.gateway_ids),
+            "connectivity": self.connectivity,
+            "power": self.power,
+            "radio": self.radio,
+            "location": self.location,
+            "routing": self.routing,
+            "sensors": self.sensors,
+            "raw": self.raw,
+        }
+
+    @classmethod
+    def from_dict(cls, data: JsonDict) -> "NodeState":
+        """Deserialize a node."""
+        return cls(
+            node_key=str(data["node_key"]),
+            protocol=str(data["protocol"]),
+            node_id=data.get("node_id"),
+            mac=data.get("mac"),
+            public_key=data.get("public_key"),
+            user_name=data.get("user_name"),
+            long_name=data.get("long_name"),
+            short_name=data.get("short_name"),
+            hardware_model=data.get("hardware_model"),
+            firmware_version=data.get("firmware_version"),
+            radio_type=data.get("radio_type"),
+            role=data.get("role"),
+            online=bool(data.get("online")),
+            last_heard=parse_timestamp(data.get("last_heard")),
+            last_gateway_id=data.get("last_gateway_id"),
+            gateway_ids=set(data.get("gateway_ids") or []),
+            connectivity=dict(data.get("connectivity") or {}),
+            power=dict(data.get("power") or {}),
+            radio=dict(data.get("radio") or {}),
+            location=dict(data.get("location") or {}),
+            routing=dict(data.get("routing") or {}),
+            sensors=dict(data.get("sensors") or {}),
+            raw=dict(data.get("raw") or {}),
+        )
+
+
+@dataclass(slots=True)
+class MeshSnapshot:
+    """Current complete mesh view exposed by the coordinator."""
+
+    nodes: dict[str, NodeState] = field(default_factory=dict)
+    gateways: dict[str, GatewayStatus] = field(default_factory=dict)
+    recent_messages: list[MessageRecord] = field(default_factory=list)
+    mesh_health_score: float | None = None
+    messages_today: int = 0
+
+    def as_dict(self) -> JsonDict:
+        """Serialize the snapshot."""
+        return {
+            "nodes": {key: node.as_dict() for key, node in self.nodes.items()},
+            "gateways": {key: gateway.as_dict() for key, gateway in self.gateways.items()},
+            "recent_messages": [message.as_dict() for message in self.recent_messages],
+            "mesh_health_score": self.mesh_health_score,
+            "messages_today": self.messages_today,
+        }
