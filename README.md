@@ -12,6 +12,8 @@ MeshNet turns Home Assistant into one operating surface for Meshtastic and MeshC
 
 ## Fast setup
 
+[Open MeshNet in HACS](https://my.home-assistant.io/redirect/hacs_repository/?owner=bouldinnathan&repository=home-assistant-mesh-radio&category=integration)
+
 MeshNet targets Home Assistant 2025.1 and newer. Evaluate the current custom
 integration only on a test Home Assistant OS or Container instance; the isolated
 App/sidecar described below is the intended production package. Existing Core

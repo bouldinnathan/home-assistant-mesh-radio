@@ -23,7 +23,7 @@ Before publishing a fork, complete these repository-specific items:
 Install on the test Home Assistant instance:
 
 1. Open HACS, select the three-dot menu, then **Custom repositories**.
-2. Paste `https://github.com/OWNER/home-assistant-mesh-radio`, choose **Integration**, and add it.
+2. Paste `https://github.com/bouldinnathan/home-assistant-mesh-radio`, choose **Integration**, and add it.
 3. Open MeshNet in HACS, choose **Download**, and restart Home Assistant.
 4. Open **Settings -> Devices & services -> Add integration -> MeshNet**.
 
@@ -31,7 +31,7 @@ Once the repository exists, this My Home Assistant link can be placed in the
 README to open it directly in HACS:
 
 ```text
-https://my.home-assistant.io/redirect/hacs_repository/?owner=OWNER&repository=home-assistant-mesh-radio&category=integration
+https://my.home-assistant.io/redirect/hacs_repository/?owner=bouldinnathan&repository=home-assistant-mesh-radio&category=integration
 ```
 
 Releases are recommended for stable versions but are not required for testing;

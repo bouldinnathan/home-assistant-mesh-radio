@@ -93,7 +93,7 @@ Log out and back in so the Docker group applies.
 2. Clone or copy this repository:
 
 ```bash
-git clone https://github.com/OWNER/home-assistant-mesh-radio.git home-assistant-mesh-radio
+git clone https://github.com/bouldinnathan/home-assistant-mesh-radio.git home-assistant-mesh-radio
 cd home-assistant-mesh-radio
 ```
 
