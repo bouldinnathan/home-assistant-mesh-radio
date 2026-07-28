@@ -1191,9 +1191,14 @@ def test_advanced_editor_requires_guided_pairing_for_new_bluetooth() -> None:
 
 @pytest.mark.parametrize(
     ("managed", "remove_bond", "expected_forget"),
-    [(True, True, True), (False, True, False), (True, False, False)],
+    [
+        (True, True, True),
+        (False, True, True),
+        (True, False, False),
+        (False, False, False),
+    ],
 )
-def test_options_remove_gateway_respects_owned_bond_boundary(
+def test_options_remove_gateway_requires_explicit_current_bond_cleanup(
     monkeypatch, managed: bool, remove_bond: bool, expected_forget: bool
 ) -> None:
     async def run() -> None:
@@ -1239,8 +1244,120 @@ def test_options_remove_gateway_respects_owned_bond_boundary(
 
         assert result["type"] == "create_entry"
         assert saved["gateways"] == []
-        assert bool(manager.forgotten) is expected_forget
+        assert manager.forgotten == (
+            [("hci0", ADAPTER_ADDRESS, gateway[CONF_BLE_ADDRESS])]
+            if expected_forget
+            else []
+        )
         assert bool(manager.released) is (managed and not remove_bond)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "broken_identity",
+    [
+        "missing_adapter",
+        "malformed_adapter",
+        "missing_adapter_address",
+        "malformed_adapter_address",
+        "malformed_device_address",
+    ],
+)
+def test_options_cleanup_without_exact_adapter_identity_keeps_gateway(
+    monkeypatch, broken_identity: str
+) -> None:
+    async def run() -> None:
+        gateway = _owned_bluetooth_gateway()
+        if broken_identity == "missing_adapter":
+            gateway["options"].pop(CONF_BLUETOOTH_ADAPTER)
+        elif broken_identity == "malformed_adapter":
+            gateway["options"][CONF_BLUETOOTH_ADAPTER] = "hci-other"
+        elif broken_identity == "missing_adapter_address":
+            gateway["options"].pop(CONF_BLUETOOTH_ADAPTER_ADDRESS)
+        elif broken_identity == "malformed_adapter_address":
+            gateway["options"][CONF_BLUETOOTH_ADAPTER_ADDRESS] = "not-a-mac"
+        else:
+            gateway[CONF_BLE_ADDRESS] = "not-a-mac"
+        attempt = _FakePairingAttempt(
+            requires_pin=False,
+            result=PairingResult(
+                gateway[CONF_BLE_ADDRESS], "hci0", ADAPTER_ADDRESS, False
+            ),
+        )
+        manager = _FakePairingManager(attempt)
+        saved: dict = {}
+        flow = MeshNetOptionsFlow()
+        flow.hass = _pairing_hass()
+        monkeypatch.setattr(flow, "_gateways", lambda: [gateway])
+        monkeypatch.setattr(
+            flow,
+            "_save",
+            lambda **updates: saved.update(updates)
+            or {"type": "create_entry"},
+        )
+        monkeypatch.setattr(
+            config_flow_module,
+            "_async_pairing_manager",
+            lambda _hass: manager,
+        )
+
+        result = await flow.async_step_remove_gateway(
+            {
+                CONF_GATEWAY: gateway["gateway_id"],
+                CONF_CONFIRM: True,
+                CONF_REMOVE_BLUETOOTH_BOND: True,
+            }
+        )
+
+        assert result["type"] == "form"
+        assert result["errors"] == {"base": "bluetooth_cleanup_failed"}
+        assert manager.forgotten == []
+        assert manager.released == []
+        assert saved == {}
+
+    asyncio.run(run())
+
+
+def test_options_cleanup_requires_both_confirmation_controls(monkeypatch) -> None:
+    async def run() -> None:
+        gateway = _owned_bluetooth_gateway()
+        attempt = _FakePairingAttempt(
+            requires_pin=False,
+            result=PairingResult(
+                gateway[CONF_BLE_ADDRESS], "hci0", ADAPTER_ADDRESS, False
+            ),
+        )
+        manager = _FakePairingManager(attempt)
+        saved: dict = {}
+        flow = MeshNetOptionsFlow()
+        flow.hass = _pairing_hass()
+        monkeypatch.setattr(flow, "_gateways", lambda: [gateway])
+        monkeypatch.setattr(
+            flow,
+            "_save",
+            lambda **updates: saved.update(updates)
+            or {"type": "create_entry"},
+        )
+        monkeypatch.setattr(
+            config_flow_module,
+            "_async_pairing_manager",
+            lambda _hass: manager,
+        )
+
+        result = await flow.async_step_remove_gateway(
+            {
+                CONF_GATEWAY: gateway["gateway_id"],
+                CONF_CONFIRM: False,
+                CONF_REMOVE_BLUETOOTH_BOND: True,
+            }
+        )
+
+        assert result["type"] == "form"
+        assert result["errors"] == {"base": "confirmation_required"}
+        assert manager.forgotten == []
+        assert manager.released == []
+        assert saved == {}
 
     asyncio.run(run())
 

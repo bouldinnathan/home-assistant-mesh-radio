@@ -27,6 +27,7 @@ BLUEZ_AGENT_MANAGER = "org.bluez.AgentManager1"
 BLUEZ_AGENT = "org.bluez.Agent1"
 BLUEZ_ADAPTER = "org.bluez.Adapter1"
 BLUEZ_DEVICE = "org.bluez.Device1"
+DBUS_PROPERTIES = "org.freedesktop.DBus.Properties"
 DBUS_OBJECT_MANAGER = "org.freedesktop.DBus.ObjectManager"
 MESHTASTIC_SERVICE_UUID = "6ba1b218-15a8-461f-9fa8-5dcae273eafd"
 
@@ -180,6 +181,7 @@ class _ResolvedDevice:
     adapter_path: str
     adapter_address: str
     paired: bool
+    trusted: bool
     uuids: frozenset[str]
 
 
@@ -300,6 +302,10 @@ def _device_at_path(
     if not isinstance(raw_paired, bool):
         raise BluetoothUnavailableError("BlueZ returned invalid bond state")
     paired = raw_paired
+    raw_trusted = _value(properties.get("Trusted", False))
+    if not isinstance(raw_trusted, bool):
+        raise BluetoothUnavailableError("BlueZ returned invalid trust state")
+    trusted = raw_trusted
 
     # Before Pair(), the object path and Address must identify the exact user
     # selection.  BlueZ may replace Address with the identity address after a
@@ -345,6 +351,7 @@ def _device_at_path(
         adapter_path=adapter_path,
         adapter_address=adapter_address,
         paired=paired,
+        trusted=trusted,
         uuids=uuids,
     )
 
@@ -507,7 +514,7 @@ def _require_selected_powered_adapter(
 def _load_dbus_api() -> Any:
     """Load stable dbus-fast APIs only when the real backend is used."""
     try:
-        from dbus_fast import DBusError, Message
+        from dbus_fast import DBusError, Message, Variant
         from dbus_fast.aio import MessageBus
         from dbus_fast.constants import BusType, MessageType
         from dbus_fast.service import ServiceInterface, method
@@ -522,6 +529,7 @@ def _load_dbus_api() -> Any:
         MessageBus=MessageBus,
         MessageType=MessageType,
         ServiceInterface=ServiceInterface,
+        Variant=Variant,
         method=method,
     )
 
@@ -635,7 +643,9 @@ def _create_agent(
         @method()
         def AuthorizeService(self, device: "o", uuid: "s"):
             self._check_device(device)
-            self._reject()
+            if not isinstance(uuid, str) or uuid.lower() != MESHTASTIC_SERVICE_UUID:
+                self._reject()
+            return None
 
         @method()
         def Cancel(self):
@@ -764,6 +774,26 @@ class _BlueZPairingBackend:
         except BaseException:
             return False
         return True
+
+    async def _set_trusted(
+        self,
+        bus: Any,
+        api: Any,
+        owner: str,
+        device_path: str,
+        trusted: bool,
+    ) -> None:
+        """Set Device1.Trusted without exposing the device identity."""
+        await self._call_bluez(
+            bus,
+            api,
+            owner,
+            path=device_path,
+            interface=DBUS_PROPERTIES,
+            member="Set",
+            signature="ssv",
+            body=[BLUEZ_DEVICE, "Trusted", api.Variant("b", trusted)],
+        )
 
     async def _cleanup_pair_attempt(
         self,
@@ -1119,6 +1149,17 @@ class _BlueZPairingBackend:
                     device_path=device.path,
                     bluez_owner=owner,
                 )
+                # Pair() is the bond ownership boundary.  Trust only the bond
+                # whose creation BlueZ has just confirmed; this avoids
+                # changing a pre-existing bond or one created by a competing
+                # client after a failed Pair call.
+                await self._set_trusted(
+                    bus,
+                    api,
+                    owner,
+                    device.path,
+                    True,
+                )
 
             owner_after = await self._owner(bus, api)
             if owner_after != owner:
@@ -1141,6 +1182,8 @@ class _BlueZPairingBackend:
             )
             if not verified.paired:
                 raise PairingRejectedError("BlueZ did not create a Bluetooth bond")
+            if not verified.trusted:
+                raise PairingRejectedError("BlueZ did not trust the Bluetooth bond")
             if MESHTASTIC_SERVICE_UUID not in verified.uuids:
                 raise NotMeshtasticDeviceError(
                     "The paired device does not expose the Meshtastic service"
@@ -1658,11 +1701,11 @@ class BluetoothPairingManager:
     ) -> None:
         """Remove the current address-scoped bond after explicit user consent.
 
-        BlueZ does not expose bond generations.  The stored marker proves only
-        that MeshNet originally paired this radio; it cannot prove that the
-        current bond was not later recreated by another client.  This method
-        is therefore reserved for the warned Configure -> Remove gateway form
-        and must never be called by unattended entry/HACS teardown.
+        BlueZ does not expose bond generations.  The adapter/address identity
+        selects the configured radio but cannot prove which client created or
+        most recently replaced its current bond.  This method is therefore
+        reserved for the warned Configure -> Remove gateway form and must
+        never be called by unattended entry/HACS teardown.
         """
         if user_confirmed is not True:
             raise BondNotOwnedError(

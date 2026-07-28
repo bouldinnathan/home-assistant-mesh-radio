@@ -112,7 +112,11 @@ but change that default in Meshtastic before relying on Bluetooth.
 The PIN field is password-masked, and MeshNet does not store or log the PIN.
 The PIN prompt expires after about 50 seconds; the entire pairing transaction
 has a 75-second limit. On Home Assistant OS, this flow is intended to replace
-normal-use root-shell or `bluetoothctl` instructions.
+normal-use root-shell or `bluetoothctl` instructions. For a new bond, the
+temporary BlueZ agent authorizes only the selected device's Meshtastic service.
+MeshNet marks the bond trusted only after `Pair()` succeeds and verifies both
+paired and trusted state; a trust or verification failure rolls back only that
+newly created bond.
 
 BlueZ provides no identifier for a particular generation of a bond. MeshNet
 therefore never removes a Bluetooth bond during config-entry deletion or HACS
@@ -120,8 +124,12 @@ uninstall, and abandoning a flow after its pairing transaction has ended never
 starts delayed cleanup. Canceling an active pairing transaction may immediately
 roll back the still-uncommitted bond using identity-guarded D-Bus state.
 **Configure → Remove gateway** offers an optional current-bond removal checkbox
-that is off by default and warns that other apps may be disconnected. Leaving it
-off preserves the BlueZ bond.
+that is off by default and warns that other apps may be disconnected. When the
+user explicitly selects it, MeshNet resolves the exact radio through the stable
+local-adapter identity saved by guided setup, removes that current bond, and
+verifies the result. This also provides a GUI-only recovery path for a stale
+bond created before MeshNet. Leaving it off preserves the BlueZ bond; entry
+deletion, reload, and HACS uninstall never remove one.
 
 After pairing, MeshNet keeps one persistent, local BLE connection. Its async
 transport subscribes for radio notifications before requesting configuration,

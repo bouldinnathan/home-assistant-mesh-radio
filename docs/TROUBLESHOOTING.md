@@ -341,11 +341,32 @@ Home Assistant startup stuck.
 
 If the radio pairs but no data arrives, another client may have reclaimed its
 single Bluetooth connection. Close that client and reload the MeshNet config
-entry. MeshNet never removes a bond during entry/HACS teardown. If you
-deliberately want to delete the current address-scoped bond, use **Configure →
-Remove gateway** and enable **Remove this radio's current Bluetooth bond (may
-disconnect other apps)**. The option is off by default because BlueZ cannot
-distinguish a bond another app recreated at the same address.
+entry. A second failure mode is a stale pre-existing BlueZ bond: the host still
+reports the radio as paired, so no PIN appears, but the radio no longer accepts
+the stored security keys. Diagnostics commonly show
+`bluetooth_bond_managed: false`, successful GATT/notification setup, and a
+timeout at `bluetooth_requesting_configuration` or `writing_to_radio` with no
+received packets.
+
+Version 0.5.5 provides a GUI-only repair for that state. Open **Configure →
+Remove gateway**, select the affected radio, confirm removal, and enable
+**Remove this radio's current Bluetooth bond so it can be paired again (may
+disconnect other apps)**. MeshNet uses the exact stable adapter identity and
+radio address saved by guided setup, resolves the same configured local device,
+removes only that adapter-scoped BlueZ bond, and verifies removal before it
+removes the gateway. Add the gateway again and enter the newly displayed PIN.
+If exact identity or cleanup verification fails, MeshNet keeps the gateway for
+a safe retry.
+
+During that fresh pairing, MeshNet's temporary agent authorizes only the exact
+selected device and Meshtastic service. It sets BlueZ trust only after `Pair()`
+has succeeded, verifies the resulting paired/trusted state, and uses its
+existing transaction-owned rollback if that verification fails. A failed or
+raced `Pair()` call therefore cannot alter the trust state of an external bond.
+
+This option is off by default because BlueZ cannot distinguish a bond another
+app recreated at the same address. MeshNet never removes a bond automatically
+during reload, config-entry deletion, or HACS uninstall.
 
 Download diagnostics before reloading. The identity-free fields show the exact
 bounded stage, for example:

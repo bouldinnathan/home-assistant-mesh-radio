@@ -91,11 +91,17 @@ def _method(*args: Any, **kwargs: Any):
     return decorator
 
 
+def _variant(signature: str, value: Any) -> Any:
+    assert signature == "b"
+    return SimpleNamespace(value=value)
+
+
 _FAKE_API = SimpleNamespace(
     DBusError=_FakeDBusError,
     Message=_Message,
     MessageType=_MessageType,
     ServiceInterface=_ServiceInterface,
+    Variant=_variant,
     method=_method,
 )
 
@@ -120,6 +126,7 @@ class _FakeBlueZBus:
         self,
         *,
         paired: bool = False,
+        trusted: bool = False,
         initial_uuids: list[str] | None = None,
         post_uuids: list[str] | None = None,
         pair_mode: str = "prompt",
@@ -129,6 +136,7 @@ class _FakeBlueZBus:
         additional_adapters: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self.paired = paired
+        self.trusted = trusted
         self.initial_uuids = (
             [MESHTASTIC_SERVICE_UUID]
             if initial_uuids is None
@@ -172,6 +180,7 @@ class _FakeBlueZBus:
             BLUEZ_DEVICE: {
                 "Address": _Variant(self.current_address),
                 "Paired": _Variant(self.paired),
+                "Trusted": _Variant(self.trusted),
                 "UUIDs": _Variant(uuids),
             }
         }
@@ -186,6 +195,15 @@ class _FakeBlueZBus:
         if message.member == "GetManagedObjects":
             return _reply("a{oa{sa{sv}}}", [self._objects()])
         if message.member in ("RegisterAgent", "UnregisterAgent", "CancelPairing"):
+            return _reply()
+        if message.member == "Set":
+            assert message.interface == "org.freedesktop.DBus.Properties"
+            assert message.path == DEVICE_PATH
+            assert message.signature == "ssv"
+            assert message.body[:2] == [BLUEZ_DEVICE, "Trusted"]
+            trusted = message.body[2].value
+            assert isinstance(trusted, bool)
+            self.trusted = trusted
             return _reply()
         if message.member == "Pair":
             if self.pair_mode == "hang":
@@ -274,6 +292,8 @@ def test_real_backend_prompts_verifies_and_cleans_every_registration() -> None:
         assert "call:RequestDefaultAgent" not in bus.actions
         assert "call:RemoveDevice" not in bus.actions
         assert "call:CancelPairing" not in bus.actions
+        assert bus.trusted is True
+        assert bus.actions.index("call:Pair") < bus.actions.index("call:Set")
         assert bus.actions.index("call:UnregisterAgent") < bus.actions.index(
             "unexport"
         )
@@ -331,6 +351,7 @@ def test_preexisting_verified_bond_is_preserved_without_agent_or_pair_call() -> 
         assert "export" not in bus.actions
         assert "call:RegisterAgent" not in bus.actions
         assert "call:Pair" not in bus.actions
+        assert "call:Set" not in bus.actions
         assert "call:RemoveDevice" not in bus.actions
         assert bus.actions[-1] == "disconnect"
 
@@ -351,6 +372,30 @@ def test_failed_service_verification_rolls_back_only_new_bond() -> None:
             "call:UnregisterAgent"
         )
         assert bus.actions[-1] == "disconnect"
+
+    asyncio.run(scenario())
+
+
+def test_new_bond_must_be_trusted_before_pairing_succeeds() -> None:
+    class IgnoredTrustWriteBus(_FakeBlueZBus):
+        async def call(self, message: _Message) -> _Message:
+            if message.member == "Set":
+                self.actions.append("call:Set")
+                return _reply()
+            return await super().call(message)
+
+    async def scenario() -> None:
+        bus = IgnoredTrustWriteBus(pair_mode="no_prompt")
+
+        with pytest.raises(PairingRejectedError, match="trust"):
+            await _manager_for_bus(bus).async_begin(ADDRESS)
+
+        assert bus.removed is True
+        assert bus.trusted is False
+        assert bus.actions.index("call:Pair") < bus.actions.index("call:Set")
+        assert bus.actions.index("call:Set") < bus.actions.index(
+            "call:RemoveDevice"
+        )
 
     asyncio.run(scenario())
 
@@ -549,6 +594,8 @@ def test_prompt_timeout_runs_full_cleanup_and_never_creates_bond() -> None:
             await attempt.async_result()
 
         assert bus.paired is False
+        assert bus.trusted is False
+        assert "call:Set" not in bus.actions
         assert "call:UnregisterAgent" in bus.actions
         assert bus.actions[-1] == "disconnect"
 
@@ -618,6 +665,8 @@ def test_pair_error_after_external_bond_does_not_remove_or_cancel_it() -> None:
         assert bus.removed is False
         assert "call:CancelPairing" not in bus.actions
         assert "call:RemoveDevice" not in bus.actions
+        assert "call:Set" not in bus.actions
+        assert bus.trusted is False
         assert "call:UnregisterAgent" in bus.actions
         assert bus.actions[-1] == "disconnect"
 
@@ -814,8 +863,20 @@ def test_agent_rejects_wrong_device_and_confirmation_requests() -> None:
         agent.RequestConfirmation(DEVICE_PATH, 123456)
     with pytest.raises(_FakeDBusError):
         agent.RequestAuthorization(DEVICE_PATH)
+    assert agent.AuthorizeService(DEVICE_PATH, MESHTASTIC_SERVICE_UUID) is None
+    assert (
+        agent.AuthorizeService(DEVICE_PATH, MESHTASTIC_SERVICE_UUID.upper())
+        is None
+    )
     with pytest.raises(_FakeDBusError):
-        agent.AuthorizeService(DEVICE_PATH, MESHTASTIC_SERVICE_UUID)
+        agent.AuthorizeService(
+            DEVICE_PATH, "0000180f-0000-1000-8000-00805f9b34fb"
+        )
+    with pytest.raises(_FakeDBusError):
+        agent.AuthorizeService(
+            "/org/bluez/hci0/dev_00_00_00_00_00_00",
+            MESHTASTIC_SERVICE_UUID,
+        )
 
 
 def test_real_dbus_fast_agent_decorators_construct() -> None:
@@ -895,6 +956,24 @@ def test_resolver_rejects_malformed_bluez_paired_state(paired: Any) -> None:
     }
 
     with pytest.raises(BluetoothUnavailableError, match="bond state"):
+        _resolve_device(objects, ADDRESS)
+
+
+@pytest.mark.parametrize("trusted", ["false", 0, 1, None, [], {}])
+def test_resolver_rejects_malformed_bluez_trusted_state(trusted: Any) -> None:
+    objects = {
+        ADAPTER_PATH: {BLUEZ_ADAPTER: {"Powered": _Variant(True)}},
+        DEVICE_PATH: {
+            BLUEZ_DEVICE: {
+                "Address": _Variant(ADDRESS),
+                "Paired": _Variant(False),
+                "Trusted": _Variant(trusted),
+                "UUIDs": _Variant([MESHTASTIC_SERVICE_UUID]),
+            }
+        },
+    }
+
+    with pytest.raises(BluetoothUnavailableError, match="trust state"):
         _resolve_device(objects, ADDRESS)
 
 

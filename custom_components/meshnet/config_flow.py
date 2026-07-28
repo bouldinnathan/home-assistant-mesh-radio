@@ -997,21 +997,29 @@ class MeshNetOptionsFlow(_MeshtasticPairingFlowMixin, config_entries.OptionsFlow
                 errors["base"] = "confirmation_required"
             else:
                 selected = _find_gateway(gateways, user_input[CONF_GATEWAY])
+                configured_bond_key = _configured_bond_key(selected)
                 owned_bond_key = _owned_bond_key(selected)
-                if owned_bond_key and user_input.get(
+                remove_bond = user_input.get(
                     CONF_REMOVE_BLUETOOTH_BOND, False
-                ):
-                    pairing_manager = _async_pairing_manager(self.hass)
-                    adapter, adapter_address, address = owned_bond_key
-                    try:
-                        await pairing_manager.async_forget_current_bond(
-                            address,
-                            adapter=adapter,
-                            adapter_address=adapter_address,
-                            user_confirmed=True,
-                        )
-                    except PairingError:
+                )
+                if remove_bond and _is_meshtastic_bluetooth(selected):
+                    if configured_bond_key is None:
+                        # Never claim success when the exact adapter-scoped
+                        # target cannot be reconstructed from guided setup.
+                        # Keeping the gateway preserves a safe retry path.
                         errors["base"] = "bluetooth_cleanup_failed"
+                    else:
+                        pairing_manager = _async_pairing_manager(self.hass)
+                        adapter, adapter_address, address = configured_bond_key
+                        try:
+                            await pairing_manager.async_forget_current_bond(
+                                address,
+                                adapter=adapter,
+                                adapter_address=adapter_address,
+                                user_confirmed=True,
+                            )
+                        except PairingError:
+                            errors["base"] = "bluetooth_cleanup_failed"
                 elif owned_bond_key:
                     pairing_manager = _async_pairing_manager(self.hass)
                     adapter, adapter_address, address = owned_bond_key
@@ -1136,11 +1144,25 @@ def _owned_bond_key(
     gateway: dict[str, Any],
 ) -> tuple[str, str, str] | None:
     """Return the complete adapter-scoped ownership identity, if valid."""
-    if not _is_meshtastic_bluetooth(gateway):
-        return None
     options = gateway.get("options") or {}
     if options.get(CONF_BLUETOOTH_BOND_MANAGED) is not True:
         return None
+    return _configured_bond_key(gateway)
+
+
+def _configured_bond_key(
+    gateway: dict[str, Any],
+) -> tuple[str, str, str] | None:
+    """Return the exact guided-setup bond identity, regardless of ownership.
+
+    This weaker identity must only authorize an explicitly confirmed removal
+    from the warned options form.  Unattended cleanup continues to require
+    ``_owned_bond_key`` so entry deletion, reload, and uninstall cannot remove
+    a bond created or later replaced by another Bluetooth client.
+    """
+    if not _is_meshtastic_bluetooth(gateway):
+        return None
+    options = gateway.get("options") or {}
     adapter = options.get(CONF_BLUETOOTH_ADAPTER)
     if not (
         isinstance(adapter, str)

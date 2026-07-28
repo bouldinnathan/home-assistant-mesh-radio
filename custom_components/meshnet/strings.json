@@ -188,11 +188,11 @@
       },
       "remove_gateway": {
         "title": "Remove a gateway",
-        "description": "This removes the connection from MeshNet. Bluetooth cleanup is optional and off by default; removing the radio's current BlueZ bond may disconnect other apps that use it.",
+        "description": "This removes the connection from MeshNet. Bluetooth cleanup is optional and off by default. If explicitly selected, MeshNet removes only this configured radio's adapter-scoped BlueZ bond, including a pre-existing bond, so the radio can be paired again. This may disconnect other apps that use it.",
         "data": {
           "gateway": "Gateway",
           "confirm": "I understand and want to remove this gateway",
-          "remove_bluetooth_bond": "Remove this radio's current Bluetooth bond (may disconnect other apps)"
+          "remove_bluetooth_bond": "Remove this radio's current Bluetooth bond so it can be paired again (may disconnect other apps)"
         }
       },
       "pair_intro": {
@@ -240,7 +240,7 @@
       "invalid_gateway": "The gateway settings are incomplete, duplicated, or invalid.",
       "invalid_gateways": "Gateway JSON must be a list of valid gateway objects with unique gateway IDs.",
       "confirmation_required": "Check the confirmation box before removing the gateway.",
-      "bluetooth_cleanup_failed": "MeshNet could not verify removal of the current Bluetooth bond. The gateway was kept and no unattended cleanup will be attempted.",
+      "bluetooth_cleanup_failed": "MeshNet could not safely identify and verify removal of the current Bluetooth bond. The gateway was kept and no unattended cleanup will be attempted.",
       "bluetooth_requires_gui": "Add or replace a Meshtastic Bluetooth gateway with the guided Add/Edit form so its local bond is verified safely.",
       "owned_bond_requires_guided_change": "This change would move a MeshNet pairing record to a different radio. Remove the gateway, then add the replacement radio through guided setup.",
       "bluez_unavailable": "Home Assistant could not open the local BlueZ pairing service. Bluetooth proxies and remote adapters cannot perform this pairing.",

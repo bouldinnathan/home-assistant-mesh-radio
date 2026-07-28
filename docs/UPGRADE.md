@@ -1,5 +1,25 @@
 # Upgrade Guide
 
+## From 0.5.4
+
+0.5.5 fixes the explicitly confirmed stale-bond recovery path for direct
+Meshtastic Bluetooth. A radio paired before MeshNet has verified adapter
+metadata but is intentionally not marked as MeshNet-owned. Earlier releases
+showed the current-bond removal checkbox for that radio but skipped removal,
+which could leave BlueZ reusing invalid security keys without a new PIN prompt.
+
+The warned **Configure → Remove gateway** action can now remove either a
+MeshNet-created or pre-existing current bond only when the user checks the
+cleanup option and the exact saved controller/radio identity validates. It
+keeps the gateway if identification or verified removal fails. Reload, entry
+deletion, and HACS uninstall remain non-destructive and never remove a bond.
+
+Fresh MeshNet-created pairings also use a service-scoped temporary agent and
+set `Device1.Trusted` only after `Device1.Pair` succeeds. Paired and trusted
+state are then re-read before the bond is accepted; a failure remains inside
+the existing transaction-owned rollback boundary. Pre-existing bonds are not
+silently trusted or modified.
+
 ## From 0.5.3
 
 0.5.4 fixes the direct-Bluetooth configuration handshake by sending the
