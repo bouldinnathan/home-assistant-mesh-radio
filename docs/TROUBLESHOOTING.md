@@ -603,10 +603,36 @@ The MeshNet sidebar panel is admin-only by design. Use an admin Home Assistant a
 
 ### Updated Sidebar Still Looks Old
 
-MeshNet 0.5.8 version-stamps the sidebar JavaScript URL. Restart Home Assistant
+MeshNet 0.5.9 version-stamps the sidebar JavaScript URL. Restart Home Assistant
 after updating, then hard-refresh the browser once. The current panel has a
 separate **Delivery** selector, node sort selector, **Message** buttons, a Map
 link, and the heading **Cached passive topology — no traceroutes sent**.
+
+### Sidebar Data Looks Incomplete or Contains Distant Nodes
+
+The sidebar intentionally limits the visible node list and RF heat cells, caps
+its recurring projection at 1,000 retained nodes, and only draws passive graph
+links backed by received evidence. Nodes beyond the safety cap remain in Home
+Assistant and are counted as omitted in Panel diagnostics. A Bluetooth
+connection is local, but the radio's stored node database can still contain
+multi-hop, previously received, or MQTT-marked nodes. That mark does not mean
+the MeshNet integration itself uses MQTT. MeshNet also loads its durable node
+cache at startup; a location for a node that has not been seen recently can
+therefore remain on Home Assistant's native Map.
+
+Open **Panel diagnostics** in the sidebar and compare **Gateway-reported** with
+**Retained cache only**, **Recent**, **Located**, **Nodes marked MQTT**, and
+**Unknown**. A gateway report may come from the radio's stored node database;
+it is not proof of a fresh RF packet. These counts do not trigger radio traffic.
+Download integration diagnostics from the three-dot menu for the corresponding
+privacy-safe aggregates and bounded panel failure history.
+
+To capture every sanitized panel failure in the Home Assistant log, enable
+debug logging for `custom_components.meshnet` from the integration's debug
+logging action, reproduce the problem briefly, then disable debug logging and
+download the resulting log and diagnostics. MeshNet never intentionally logs
+message text, recipients, node or gateway IDs, names, coordinates, Bluetooth
+addresses, serial paths, URLs, credentials, or browser identity.
 
 ## Health Checks
 

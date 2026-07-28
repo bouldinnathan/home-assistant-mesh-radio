@@ -28,8 +28,15 @@ const vm = require("node:vm");
 globalThis.HTMLElement = class {{}};
 globalThis.window = {{ setTimeout() {{}}, clearTimeout() {{}} }};
 let PanelClass = null;
+let registeredPanel = null;
+let panelDefineCount = 0;
 globalThis.customElements = {{
-  define(_name, constructor) {{ PanelClass = constructor; }},
+  get(name) {{ return name === "meshnet-panel" ? registeredPanel : null; }},
+  define(_name, constructor) {{
+    panelDefineCount += 1;
+    registeredPanel = constructor;
+    PanelClass = constructor;
+  }},
 }};
 const panelPath = {json.dumps(str(PANEL))};
 vm.runInThisContext(fs.readFileSync(panelPath, "utf8"), {{ filename: panelPath }});
@@ -121,7 +128,11 @@ def test_panel_exposes_explicit_delivery_sorting_and_native_map_ui() -> None:
     assert "No cached nodes available yet" in source
     assert 'select id="meshnet-node-sort"' in source
     assert "Favorites + last seen" in source
-    assert '<a class="map-link" href="/map">Map · ${locatedNodeCount} located</a>' in source
+    assert '<a class="map-link" href="/map">Map · ${locatedNodeCount} cached locations</a>' in source
+    assert 'this._error || "Snapshot current"' in source
+    assert 'this._stat("Recently seen"' in source
+    assert 'this._stat("Cached health"' in source
+    assert '${node.online ? "recent" : "stale"}' in source
     assert "sortedNodes.slice(0, 24)" in source
     assert "node.favorite === true" in source
     assert "snapshot.panel_metadata.favorite_label_configured === true" in source
@@ -401,7 +412,7 @@ def test_send_status_is_safe_and_refreshes_after_acceptance() -> None:
         "  _messageByteLength(message) {", 1
     )[0]
 
-    assert "snapshot = await this._refreshSnapshot()" in send_method
+    assert 'snapshot = await this._refreshSnapshot(this._pollEpoch, "post_send_refresh")' in send_method
     assert 'status === "sent"' in send_method
     assert 'text: "Message sent."' in send_method
     assert 'text: "Message queued for delivery."' in send_method
@@ -409,3 +420,434 @@ def test_send_status_is_safe_and_refreshes_after_acceptance() -> None:
     assert "_err.message" not in send_method
     assert "String(_err)" not in send_method
     assert '${this._escape(this._sendStatus ? this._sendStatus.text : "")}' in source
+
+
+def test_failed_snapshot_retries_and_reports_only_backend_safe_vocabulary() -> None:
+    """A rejected snapshot remains retryable without exposing exception content."""
+    _run_panel_script(
+        r"""
+  let nextTimer = 0;
+  const timers = new Map();
+  window.setTimeout = (callback, delay) => {
+    nextTimer += 1;
+    timers.set(nextTimer, { callback, delay });
+    return nextTimer;
+  };
+  window.clearTimeout = (timer) => timers.delete(timer);
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...parts) => warnings.push(parts);
+  const reports = [];
+  let snapshotCalls = 0;
+  const privateError = new Error("private message /dev/ttyUSB0 44.1,-93.2");
+  privateError.name = "PrivateNodeIdentifier";
+  privateError.code = "meshtastic:!12345678";
+  panel._render = () => {};
+  panel.hass = {
+    async callWS(payload) {
+      if (payload.type === "meshnet/panel_log") {
+        reports.push(payload);
+        return { accepted: true };
+      }
+      snapshotCalls += 1;
+      throw privateError;
+    },
+  };
+
+  panel.connectedCallback();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(snapshotCalls, 1);
+  assert.equal(panel._error, "Snapshot unavailable");
+  assert.equal(panel._snapshotConsecutiveFailures, 1);
+  assert.equal(timers.size, 1);
+  assert.equal([...timers.values()][0].delay, 5000);
+  assert.equal(reports.length, 1);
+  assert.deepEqual(Object.keys(reports[0]).sort(), [
+    "category",
+    "consecutive",
+    "error_code",
+    "error_type",
+    "occurrence",
+    "operation",
+    "type",
+  ]);
+  assert.deepEqual(reports[0], {
+    type: "meshnet/panel_log",
+    operation: "snapshot",
+    category: "connection",
+    error_type: "other_error",
+    error_code: "snapshot_failed",
+    occurrence: 1,
+    consecutive: 1,
+  });
+  const operations = new Set([
+    "snapshot", "messages", "send_message", "render", "poll",
+    "snapshot_schema", "snapshot_timeout", "post_send_refresh",
+    "event_handler", "global_error", "unhandled_rejection",
+    "invalid_recipient", "reporting",
+  ]);
+  const categories = new Set([
+    "authentication", "availability", "connection", "data", "internal",
+    "lifecycle", "network", "permission", "timeout", "unknown", "validation",
+  ]);
+  const errorTypes = new Set([
+    "AbortError", "CancelledError", "ConnectionError", "DOMException", "Error",
+    "HomeAssistantError", "InvalidAuth", "NetworkError", "NotFoundError",
+    "OSError", "PermissionError", "RuntimeError", "SchemaError",
+    "ServiceValidationError", "SyntaxError", "TimeoutError", "TypeError",
+    "Unauthorized", "ValueError", "WebSocketError", "other_error", "unknown_error",
+  ]);
+  const errorCodes = new Set([
+    "callback_failed", "connection_failed", "favorite_device_lookup_failed",
+    "favorite_registry_failed", "handler_failed", "invalid_recipient",
+    "invalid_response", "invalid_schema", "message_load_failed",
+    "operation_cancelled", "operation_failed", "poll_failed",
+    "post_send_refresh_failed", "provenance_failed", "render_failed",
+    "report_failed", "send_failed", "snapshot_failed", "timeout", "unavailable",
+    "unexpected_error", "websocket_failed",
+  ]);
+  assert.equal(operations.has(reports[0].operation), true);
+  assert.equal(categories.has(reports[0].category), true);
+  assert.equal(errorTypes.has(reports[0].error_type), true);
+  assert.equal(errorCodes.has(reports[0].error_code), true);
+  const retained = JSON.stringify({ warnings, telemetry: panel._failureTelemetry, reports });
+  assert.equal(retained.includes("private message"), false);
+  assert.equal(retained.includes("ttyUSB0"), false);
+  assert.equal(retained.includes("44.1"), false);
+  assert.equal(retained.includes("12345678"), false);
+  console.warn = originalWarn;
+"""
+    )
+
+
+def test_hung_snapshot_times_out_and_render_failure_cannot_stop_polling() -> None:
+    """Timeout and render failures are independently captured before retry."""
+    _run_panel_script(
+        r"""
+  let nextTimer = 0;
+  const timers = new Map();
+  window.setTimeout = (callback, delay) => {
+    nextTimer += 1;
+    timers.set(nextTimer, { callback, delay });
+    return nextTimer;
+  };
+  window.clearTimeout = (timer) => timers.delete(timer);
+  const reports = [];
+  panel._render = () => {
+    const error = new TypeError("private render detail");
+    error.code = "private-render-code";
+    throw error;
+  };
+  panel.hass = {
+    callWS(payload) {
+      if (payload.type === "meshnet/panel_log") {
+        reports.push(payload);
+        return Promise.resolve({ accepted: true });
+      }
+      return new Promise(() => {});
+    },
+  };
+
+  panel.connectedCallback();
+  await Promise.resolve();
+  const timeoutEntry = [...timers.values()].find((timer) => timer.delay === 15000);
+  assert.ok(timeoutEntry);
+  timeoutEntry.callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const operations = panel._failureTelemetry.map((event) => event.operation);
+  assert.equal(operations.includes("snapshot_request"), true);
+  assert.equal(operations.includes("render"), true);
+  assert.equal(panel._snapshotConsecutiveFailures, 1);
+  assert.ok(panel._pollTimer != null);
+  assert.equal([...timers.values()].some((timer) => timer.delay === 5000), true);
+  assert.equal(reports.some((report) => report.operation === "snapshot_timeout"), true);
+  assert.equal(reports.some((report) => report.operation === "render"), true);
+"""
+    )
+
+
+def test_malformed_and_late_snapshots_never_replace_last_good_snapshot() -> None:
+    """Schema rejection is observable, while disconnected late data is ignored."""
+    _run_panel_script(
+        r"""
+  const oldSnapshot = { nodes: {}, gateways: {}, recent_messages: [], marker: "old" };
+  panel._snapshot = oldSnapshot;
+  panel._connected = true;
+  panel._pollEpoch = 7;
+  const reports = [];
+  panel._hass = {
+    async callWS(payload) {
+      if (payload.type === "meshnet/panel_log") {
+        reports.push(payload);
+        return { accepted: true };
+      }
+      return { nodes: [], gateways: {}, recent_messages: [] };
+    },
+  };
+  await assert.rejects(
+    panel._refreshSnapshot(7, "snapshot_request"),
+    (error) => error.code === "nodes_not_object",
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(panel._snapshot, oldSnapshot);
+  assert.equal(reports[0].operation, "snapshot_schema");
+  assert.equal(reports[0].category, "data");
+  assert.equal(reports[0].error_type, "SchemaError");
+  assert.equal(reports[0].error_code, "invalid_schema");
+
+  let resolveLate;
+  panel._hass = {
+    callWS() {
+      return new Promise((resolve) => { resolveLate = resolve; });
+    },
+  };
+  const lateRequest = panel._refreshSnapshot(7, "snapshot_request");
+  panel.disconnectedCallback();
+  resolveLate({ nodes: {}, gateways: {}, recent_messages: [], marker: "late" });
+  assert.equal(await lateRequest, null);
+  assert.equal(panel._snapshot, oldSnapshot);
+  assert.equal(panel._failureTelemetry.length, 1);
+"""
+    )
+
+
+def test_unexpected_poll_failure_is_recorded_and_retry_is_scheduled() -> None:
+    """Even an uninstrumented internal rejection cannot silently kill polling."""
+    _run_panel_script(
+        r"""
+  let nextTimer = 0;
+  const timers = new Map();
+  window.setTimeout = (callback, delay) => {
+    nextTimer += 1;
+    timers.set(nextTimer, { callback, delay });
+    return nextTimer;
+  };
+  window.clearTimeout = (timer) => timers.delete(timer);
+  panel._connected = true;
+  panel._loaded = true;
+  panel._pollEpoch = 4;
+  panel._render = () => {};
+  panel._refreshSnapshot = async () => {
+    throw new RangeError("private unexpected poll detail");
+  };
+
+  await panel._load(4);
+
+  assert.equal(panel._failureTelemetry[0].operation, "poll_unexpected");
+  assert.equal(panel._failureTelemetry[0].error_type, "RangeError");
+  assert.equal([...timers.values()].some((timer) => timer.delay === 5000), true);
+"""
+    )
+
+
+def test_failure_buffers_are_bounded_and_reporting_failure_does_not_recurse() -> None:
+    """Local queues cap at 100 and a failed report produces no report loop."""
+    _run_panel_script(
+        r"""
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  const privateError = new Error("private message and node identifier");
+  privateError.name = "PrivateErrorClass";
+  privateError.code = "private-node-code";
+  for (let index = 0; index < 130; index += 1) {
+    panel._recordFailure("private-operation", "private-category", privateError);
+  }
+  assert.equal(panel._failureCount, 130);
+  assert.equal(panel._failureTelemetry.length, 100);
+  assert.equal(panel._panelReportQueue.length, 100);
+  assert.equal(panel._failureTelemetry[0].occurrence, 31);
+  assert.deepEqual(Object.keys(panel._panelReportQueue[0]).sort(), [
+    "category", "consecutive", "error_code", "error_type", "occurrence", "operation",
+  ]);
+  const retained = JSON.stringify({
+    telemetry: panel._failureTelemetry,
+    queue: panel._panelReportQueue,
+  });
+  assert.equal(retained.includes("private message"), false);
+  assert.equal(retained.includes("identifier"), false);
+  assert.equal(retained.includes("private-operation"), false);
+  assert.equal(retained.includes("private-node-code"), false);
+
+  const reportPanel = new PanelClass();
+  reportPanel._connected = true;
+  let reportCalls = 0;
+  reportPanel._hass = {
+    async callWS(payload) {
+      assert.equal(payload.type, "meshnet/panel_log");
+      reportCalls += 1;
+      const error = new Error("private reporting failure");
+      error.code = "private-report-code";
+      throw error;
+    },
+  };
+  reportPanel._recordFailure("render", "render", new TypeError("private render"));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(reportCalls, 1);
+  assert.equal(reportPanel._panelReportFailureCount, 1);
+  assert.equal(reportPanel._failureTelemetry.length, 2);
+  assert.equal(reportPanel._failureTelemetry[1].operation, "reporting");
+  assert.equal(reportPanel._panelReportQueue.length, 1);
+  assert.equal(reportPanel._panelReportQueue[0].operation, "render");
+  console.warn = originalWarn;
+"""
+    )
+
+
+def test_post_send_refresh_failure_is_logged_without_changing_send_success() -> None:
+    """An accepted send remains queued/sent when only its status refresh fails."""
+    _run_panel_script(
+        r"""
+  const reports = [];
+  const requests = [];
+  panel._connected = true;
+  panel._render = () => {};
+  panel._snapshot = { nodes: {}, gateways: {}, recent_messages: [] };
+  panel._hass = {
+    async callWS(payload) {
+      if (payload.type === "meshnet/panel_log") {
+        reports.push(payload);
+        return { accepted: true };
+      }
+      requests.push(payload);
+      return { message_id: "accepted-message" };
+    },
+  };
+  panel._refreshSnapshot = async () => {
+    const error = new TypeError("private refresh /dev/serial coordinates 1,2");
+    error.code = "private-code";
+    throw error;
+  };
+  panel._draft.message = "private outgoing text";
+
+  await panel._sendMessage({ preventDefault() {} });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(requests.length, 1);
+  assert.deepEqual(panel._sendStatus, {
+    kind: "warn",
+    text: "Message queued for delivery.",
+  });
+  assert.equal(panel._draft.message, "");
+  const failure = panel._failureTelemetry.find(
+    (event) => event.operation === "post_send_refresh",
+  );
+  assert.ok(failure);
+  assert.equal(reports.some((report) => report.operation === "post_send_refresh"), true);
+  assert.equal(JSON.stringify(reports).includes("private outgoing text"), false);
+  assert.equal(JSON.stringify(reports).includes("serial"), false);
+"""
+    )
+
+
+def test_global_failure_handlers_are_safe_and_removed_on_disconnect() -> None:
+    """Window failures are classified without retaining event text or leaking listeners."""
+    _run_panel_script(
+        r"""
+  const listeners = new Map();
+  window.addEventListener = (name, callback) => listeners.set(name, callback);
+  window.removeEventListener = (name, callback) => {
+    if (listeners.get(name) === callback) listeners.delete(name);
+  };
+  const reports = [];
+  panel._loaded = true;
+  panel.hass = {
+    async callWS(payload) {
+      reports.push(payload);
+      return { accepted: true };
+    },
+  };
+  panel.connectedCallback();
+  assert.equal(listeners.size, 2);
+
+  const privateError = new Error("private URL and coordinates");
+  privateError.name = "PrivateNodeClass";
+  privateError.code = "private-node-code";
+  listeners.get("error")({
+    message: "unrelated Home Assistant error",
+    filename: "/frontend_latest/core.js",
+    error: new Error("unrelated"),
+  });
+  listeners.get("unhandledrejection")({ reason: new Error("unrelated rejection") });
+  assert.equal(panel._failureTelemetry.length, 0);
+
+  privateError.stack = "PrivateNodeClass at /meshnet_static/meshnet-panel.js:1:1";
+  listeners.get("error")({
+    message: "private browser message",
+    filename: "/meshnet_static/meshnet-panel.js",
+    error: privateError,
+  });
+  const privateRejection = new Error("private rejection text");
+  privateRejection.stack = "Error at /meshnet_static/meshnet-panel.js:2:2";
+  listeners.get("unhandledrejection")({ reason: privateRejection });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(reports.length, 2);
+  assert.deepEqual(reports.map((report) => report.operation), [
+    "global_error",
+    "unhandled_rejection",
+  ]);
+  const retained = JSON.stringify({ reports, telemetry: panel._failureTelemetry });
+  assert.equal(retained.includes("private"), false);
+  panel.disconnectedCallback();
+  assert.equal(listeners.size, 0);
+"""
+    )
+
+
+def test_panel_diagnostics_uses_only_fixed_counts_and_registration_is_idempotent() -> None:
+    """The compact status explains provenance without rendering arbitrary metadata."""
+    _run_panel_script(
+        r"""
+  const html = panel._panelDiagnostics({
+    total_node_count: 305,
+    analyzed_node_count: 305,
+    omitted_node_count: 0,
+    current_session_node_count: 191,
+    cached_only_node_count: 114,
+    online_node_count: 24,
+    located_node_count: 175,
+    located_offline_node_count: 163,
+    mqtt_node_count: 42,
+    mqtt_unknown_node_count: 114,
+    identity_collision_group_count: 2,
+    identity_collision_node_count: 4,
+    last_snapshot_generated_at: "2026-07-28T12:00:00Z",
+    private_metadata: "must-not-render",
+  }, Array.from({ length: 305 }, () => ({})));
+  assert.match(html, /305 total · 24 recent · 175 located/);
+  assert.match(html, /191 gateway-reported · 114 retained cache only/);
+  assert.match(html, /stored node database/);
+  assert.match(html, /does not mean they were directly heard this session/);
+  assert.match(html, /42 yes · 114 unknown/);
+  assert.match(html, /does not mean this MeshNet gateway currently uses MQTT/);
+  assert.match(html, /163 not recently seen/);
+  assert.match(html, /2 groups · 4 nodes/);
+  assert.equal(html.includes("must-not-render"), false);
+
+  const cappedHtml = panel._panelDiagnostics({
+    total_node_count: 1007,
+    analyzed_node_count: 1000,
+    omitted_node_count: 7,
+  }, []);
+  assert.match(cappedHtml, /Panel safety limit/);
+  assert.match(cappedHtml, /1000 analyzed · 7 omitted/);
+  assert.match(cappedHtml, /remain in Home Assistant/);
+  assert.match(cappedHtml, /protect the event loop/);
+
+  let duplicateDefineCount = 0;
+  vm.runInNewContext(fs.readFileSync(panelPath, "utf8"), {
+    HTMLElement,
+    TextEncoder,
+    console,
+    window,
+    customElements: {
+      get(name) { return name === "meshnet-panel" ? PanelClass : null; },
+      define() { duplicateDefineCount += 1; },
+    },
+  }, { filename: panelPath });
+  assert.equal(duplicateDefineCount, 0);
+"""
+    )

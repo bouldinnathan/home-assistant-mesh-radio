@@ -16,15 +16,15 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceEntry
 
-from .const import DIAGNOSTIC_REDACT, DOMAIN, VERSION
+from .const import DIAGNOSTIC_REDACT, DOMAIN, MAX_PANEL_NODES, VERSION
 from .coordinator import MeshNetCoordinator
 from .diagnostic_safety import safe_node_metadata
 from .models import NodeState, has_valid_location, timestamp_to_json
 
-_DIAGNOSTIC_SCHEMA_VERSION = 2
+_DIAGNOSTIC_SCHEMA_VERSION = 3
 _REDACTED = "**REDACTED**"
 _RUNTIME_TIMEOUT = 3.0
-_MAX_DIAGNOSTIC_NODES = 1000
+_MAX_DIAGNOSTIC_NODES = MAX_PANEL_NODES
 
 _SENSITIVE_KEYS = {
     *DIAGNOSTIC_REDACT,
@@ -556,6 +556,16 @@ def _privacy_metadata() -> dict[str, Any]:
             "may_include_device_name_and_registry_id": True,
             "may_include_system_versions_and_timezone": True,
             "inspect_and_rename_before_sharing": True,
+        },
+        "identity_collision_analysis": {
+            "performed_in_memory_only": True,
+            "raw_aliases_exported": False,
+            "aggregate_counts_only": True,
+        },
+        "node_observability_analysis": {
+            "maximum_analyzed_nodes": MAX_PANEL_NODES,
+            "truncation_reported": True,
+            "omitted_nodes_deleted": False,
         },
         "omitted": [
             "credentials and pairing PINs from the MeshNet data section",

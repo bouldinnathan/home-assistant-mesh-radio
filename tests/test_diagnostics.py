@@ -449,6 +449,11 @@ def test_config_entry_diagnostics_are_thorough_serializable_and_redacted(
         "may_include_system_versions_and_timezone": True,
         "inspect_and_rename_before_sharing": True,
     }
+    assert privacy["node_observability_analysis"] == {
+        "maximum_analyzed_nodes": 1000,
+        "truncation_reported": True,
+        "omitted_nodes_deleted": False,
+    }
 
     assert set(result["versions"]) >= {"meshnet", "meshtastic", "meshcore"}
 

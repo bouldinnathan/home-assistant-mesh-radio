@@ -1,5 +1,28 @@
 # Upgrade Guide
 
+## From 0.5.8
+
+0.5.9 adds bounded, privacy-safe observability for the admin-only MeshNet
+sidebar. Snapshot, render, polling, schema, message submission, and post-send
+refresh failures are counted and classified without recording message text,
+node or gateway identifiers, names, coordinates, endpoints, URLs, or browser
+identity. Repeated failures are retained in a bounded diagnostic ring and
+sampled in the Home Assistant log so a persistent five-second polling failure
+cannot flood the log. The recurring projection is capped at 1,000 nodes and 64
+gateways so an unexpectedly large historical radio database cannot monopolize
+Home Assistant's event loop; omitted nodes are reported without being deleted.
+
+The panel now distinguishes nodes reported by a gateway or its stored radio
+database from older nodes loaded only from MeshNet's durable cache. It also
+reports recently seen, located, explicitly MQTT-marked, and unknown-provenance
+counts. A gateway report is not proof of a fresh RF packet, and an MQTT mark
+does not mean this integration uses MQTT. These are observability labels only:
+this release does not delete cached nodes, remove Home Assistant devices, merge
+node identities, transmit traceroutes, or make any additional radio request.
+
+No configuration or database migration is required. Restart Home Assistant and
+hard-refresh the browser after installing so the versioned panel module loads.
+
 ## From 0.5.7
 
 0.5.8 makes direct messaging explicit in the MeshNet panel. Choose

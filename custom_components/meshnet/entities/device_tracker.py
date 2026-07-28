@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-from homeassistant.components.device_tracker.config_entry import TrackerEntity
+try:
+    from homeassistant.components.device_tracker import TrackerEntity
+except ImportError:  # Home Assistant versions before the public re-export.
+    from homeassistant.components.device_tracker.config_entry import TrackerEntity
 from homeassistant.components.device_tracker.const import SourceType
 
+from ..coordinator import node_age_bucket
 from ..entity import MeshNetNodeEntity
 from ..models import has_valid_location, location_accuracy_meters
 
@@ -59,12 +63,36 @@ class MeshNetDeviceTracker(MeshNetNodeEntity, TrackerEntity):
         node = self.node
         if node is None:
             return attrs
+        observed_lookup = getattr(
+            self.coordinator, "node_observed_this_session", None
+        )
+        observed_this_session = bool(
+            observed_lookup(node.node_key)
+            if callable(observed_lookup)
+            else node.node_key
+            in getattr(self.coordinator, "_session_observed_node_keys", set())
+        )
+        via_mqtt = node.connectivity.get("via_mqtt")
+        if via_mqtt is not True and via_mqtt is not False:
+            via_mqtt = None
+        hops = node.connectivity.get("hops")
+        if isinstance(hops, bool) or not isinstance(hops, int) or hops < 0:
+            hops = None
         attrs.update(
             {
                 "altitude": node.location.get("altitude"),
                 "speed": node.location.get("speed"),
                 "heading": node.location.get("heading"),
                 "last_heard": node.last_heard.isoformat() if node.last_heard else None,
+                "observed_this_session": observed_this_session,
+                "cached_only": not observed_this_session,
+                "via_mqtt": via_mqtt,
+                "hops": hops,
+                "location_freshness": node_age_bucket(node.last_heard),
+                "location_freshness_basis": "node_last_heard_proxy",
+                "location_timestamp_available": False,
+                "location_source_available": False,
+                "location_may_be_older_than_node_activity": True,
             }
         )
         return attrs

@@ -8,8 +8,9 @@ import random
 import re
 import time
 from collections import Counter
-from collections.abc import Coroutine, Iterable
+from collections.abc import Collection, Coroutine, Iterable
 from datetime import UTC, datetime, timedelta
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,7 @@ from .const import (
     EVENT_MESSAGE_RECEIVED,
     EVENT_MESSAGE_SENT,
     EVENT_PACKET,
+    MAX_PANEL_NODES,
     MESSAGE_TYPE_BROADCAST,
     PROTOCOL_MESHCORE,
     PROTOCOL_MESHTASTIC,
@@ -60,6 +62,7 @@ from .models import (
     timestamp_to_json,
     utcnow,
 )
+from .panel_telemetry import PanelTelemetry
 from .rate_limiter import TokenBucket
 from .store import MeshStore
 
@@ -79,6 +82,15 @@ _SAFE_GATEWAY_ISSUE_RE = re.compile(
     r"^(?:gateway_start|send_failed|unsupported_protocol)_gateway_"
     r"(?:[0-9]{3}|unknown)$"
 )
+
+LOCATION_PROVENANCE_WARNING = (
+    "MeshNet does not currently retain an independent location observation "
+    "timestamp or source; node last-heard age is only a freshness proxy and "
+    "a cached location may be older."
+)
+
+_AGE_BUCKETS = ("<15m", "15m-1h", "1-6h", "6-24h", ">=1d", "unknown")
+_HOP_BUCKETS = ("0", "1", "2", "3", "4-7", ">=8", "unknown")
 
 
 def _diagnostic_task_state(task: asyncio.Future[Any] | None) -> str:
@@ -113,6 +125,192 @@ def _diagnostic_error_category(error: str) -> str:
     return "other"
 
 
+def node_age_bucket(
+    last_heard: datetime | None,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Return a privacy-safe age bucket for one cached node timestamp."""
+    if not isinstance(last_heard, datetime):
+        return "unknown"
+    current = now or utcnow()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=UTC)
+    else:
+        current = current.astimezone(UTC)
+    heard = (
+        last_heard.replace(tzinfo=UTC)
+        if last_heard.tzinfo is None
+        else last_heard.astimezone(UTC)
+    )
+    age_seconds = max(0.0, (current - heard).total_seconds())
+    if age_seconds < 15 * 60:
+        return "<15m"
+    if age_seconds < 60 * 60:
+        return "15m-1h"
+    if age_seconds < 6 * 60 * 60:
+        return "1-6h"
+    if age_seconds < 24 * 60 * 60:
+        return "6-24h"
+    return ">=1d"
+
+
+def _hop_bucket(value: Any) -> str:
+    """Return a bounded hop-count bucket without coercing malformed values."""
+    if isinstance(value, bool):
+        return "unknown"
+    if isinstance(value, float):
+        if not value.is_integer():
+            return "unknown"
+        value = int(value)
+    if not isinstance(value, int) or value < 0:
+        return "unknown"
+    if value <= 3:
+        return str(value)
+    if value <= 7:
+        return "4-7"
+    return ">=8"
+
+
+def _normalized_identity_aliases(node: NodeState) -> set[tuple[str, str]]:
+    """Return typed aliases for in-memory collision counting only."""
+    aliases: set[tuple[str, str]] = set()
+
+    if node.node_id is not None:
+        node_id = str(node.node_id).strip()
+        if node_id:
+            normalized_node_id = node_id.casefold()
+            if node.protocol == PROTOCOL_MESHTASTIC:
+                numeric_text = normalized_node_id
+                base = 10
+                if numeric_text.startswith("!"):
+                    numeric_text = numeric_text[1:]
+                    base = 16
+                elif numeric_text.startswith("0x"):
+                    numeric_text = numeric_text[2:]
+                    base = 16
+                try:
+                    normalized_node_id = str(int(numeric_text, base))
+                except ValueError:
+                    pass
+            aliases.add(("node_id", normalized_node_id))
+
+    if node.mac is not None:
+        mac = re.sub(r"[^0-9a-z]", "", str(node.mac).casefold())
+        if mac:
+            aliases.add(("mac", mac))
+
+    if node.public_key is not None:
+        public_key = str(node.public_key).strip()
+        if public_key:
+            # Public keys may use a case-sensitive encoding.
+            aliases.add(("public_key", public_key))
+
+    return aliases
+
+
+def _identity_alias_collision_summary(nodes: list[NodeState]) -> dict[str, int]:
+    """Count shared identity aliases without returning alias or node values."""
+    aliases: dict[tuple[str, str], set[int]] = {}
+    for index, node in enumerate(nodes):
+        for alias in _normalized_identity_aliases(node):
+            aliases.setdefault(alias, set()).add(index)
+
+    shared_aliases = [indexes for indexes in aliases.values() if len(indexes) > 1]
+    parents = list(range(len(nodes)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    for indexes in shared_aliases:
+        first, *remaining = sorted(indexes)
+        for index in remaining:
+            union(first, index)
+
+    groups: Counter[int] = Counter()
+    collision_nodes = {index for indexes in shared_aliases for index in indexes}
+    for index in collision_nodes:
+        groups[find(index)] += 1
+    return {
+        "group_count": sum(size > 1 for size in groups.values()),
+        "node_count": sum(size for size in groups.values() if size > 1),
+        "shared_alias_count": len(shared_aliases),
+    }
+
+
+def node_observability_aggregate(
+    nodes: Iterable[NodeState],
+    observed_node_keys: Collection[str],
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Return identity-free, side-effect-free node provenance aggregates."""
+    node_list = list(nodes)
+    observed_keys = set(observed_node_keys)
+    current_session_count = sum(
+        node.node_key in observed_keys for node in node_list
+    )
+    online_count = sum(bool(node.online) for node in node_list)
+    located_flags = [
+        has_valid_location(
+            node.location,
+            zero_pair_is_missing=node.protocol == PROTOCOL_MESHTASTIC,
+        )
+        for node in node_list
+    ]
+    via_mqtt_counts = {"true": 0, "false": 0, "unknown": 0}
+    hop_counts = dict.fromkeys(_HOP_BUCKETS, 0)
+    age_counts = dict.fromkeys(_AGE_BUCKETS, 0)
+    for node in node_list:
+        via_mqtt = node.connectivity.get("via_mqtt")
+        if via_mqtt is True:
+            via_mqtt_counts["true"] += 1
+        elif via_mqtt is False:
+            via_mqtt_counts["false"] += 1
+        else:
+            via_mqtt_counts["unknown"] += 1
+        hop_counts[_hop_bucket(node.connectivity.get("hops"))] += 1
+        age_counts[node_age_bucket(node.last_heard, now=now)] += 1
+
+    located_count = sum(located_flags)
+    return {
+        "node_counts": {
+            "total": len(node_list),
+            "observed_this_session": current_session_count,
+            "cached_only": len(node_list) - current_session_count,
+            "online": online_count,
+            "offline": len(node_list) - online_count,
+            "located": located_count,
+            "located_offline": sum(
+                located and not node.online
+                for node, located in zip(node_list, located_flags, strict=True)
+            ),
+        },
+        "via_mqtt_counts": via_mqtt_counts,
+        "hop_counts": hop_counts,
+        "age_counts": age_counts,
+        "identity_alias_collisions": _identity_alias_collision_summary(
+            node_list
+        ),
+        "location_provenance": {
+            "independent_timestamp_available": False,
+            "source_available": False,
+            "freshness_basis": "node_last_heard_proxy",
+            "cached_location_may_be_older": True,
+            "warning": LOCATION_PROVENANCE_WARNING,
+        },
+    }
+
+
 class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
     """Single merged coordinator for a MeshNet config entry."""
 
@@ -140,6 +338,8 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         self._last_update_duration_seconds: float | None = None
         self._last_update_error_category: str | None = None
         self._legacy_issue_cleanup_count = 0
+        self._session_observed_node_keys: set[str] = set()
+        self.panel_telemetry = PanelTelemetry(_LOGGER)
         super().__init__(
             hass,
             _LOGGER,
@@ -686,8 +886,62 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                     max(last_heard_values) if last_heard_values else None
                 ),
             },
+            "node_observability": self.node_observability_diagnostics(),
+            "panel": self.panel_telemetry.snapshot(),
             "store": store_diagnostics,
             "repairs": self._repair_diagnostics(),
+        }
+
+    def node_observed_this_session(self, node_key: str) -> bool:
+        """Return whether a live gateway callback observed this node."""
+        return node_key in getattr(self, "_session_observed_node_keys", set())
+
+    def node_observability_diagnostics(
+        self, *, now: datetime | None = None
+    ) -> dict[str, Any]:
+        """Return passive node provenance diagnostics without identity values."""
+        stored_total = len(self.snapshot.nodes)
+        nodes = list(islice(self.snapshot.nodes.values(), MAX_PANEL_NODES))
+        result = node_observability_aggregate(
+            nodes,
+            getattr(self, "_session_observed_node_keys", set()),
+            now=now,
+        )
+        analyzed = len(nodes)
+        result["node_counts"].update(
+            {
+                "stored_total": stored_total,
+                "analyzed": analyzed,
+                "analysis_omitted": stored_total - analyzed,
+                "analysis_truncated": stored_total > analyzed,
+            }
+        )
+        return result
+
+    def panel_node_provenance(self) -> dict[str, int]:
+        """Return the panel's small, identity-free provenance projection."""
+        observability = self.node_observability_diagnostics()
+        node_counts = observability["node_counts"]
+        via_mqtt_counts = observability["via_mqtt_counts"]
+        return {
+            "total_node_count": node_counts["stored_total"],
+            "analyzed_node_count": node_counts["analyzed"],
+            "omitted_node_count": node_counts["analysis_omitted"],
+            "current_session_node_count": node_counts[
+                "observed_this_session"
+            ],
+            "cached_only_node_count": node_counts["cached_only"],
+            "online_node_count": node_counts["online"],
+            "located_node_count": node_counts["located"],
+            "located_offline_node_count": node_counts["located_offline"],
+            "mqtt_node_count": via_mqtt_counts["true"],
+            "mqtt_unknown_node_count": via_mqtt_counts["unknown"],
+            "identity_collision_group_count": observability[
+                "identity_alias_collisions"
+            ]["group_count"],
+            "identity_collision_node_count": observability[
+                "identity_alias_collisions"
+            ]["node_count"],
         }
 
     async def _handle_packet(
@@ -732,6 +986,10 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
     ) -> None:
         if not self._gateway_callback_is_current(gateway_generation):
             return
+        observed_node_keys = getattr(self, "_session_observed_node_keys", None)
+        if observed_node_keys is None:
+            observed_node_keys = self._session_observed_node_keys = set()
+        observed_node_keys.add(node.node_key)
         existing = self.snapshot.nodes.get(node.node_key)
         if existing:
             existing.merge(node)

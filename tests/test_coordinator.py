@@ -4,6 +4,7 @@ import asyncio
 import importlib
 import sys
 import types
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -16,6 +17,7 @@ from custom_components.meshnet.models import (
     MessageRecord,
     NodeState,
 )
+from custom_components.meshnet.panel_telemetry import PanelTelemetry
 
 
 def _load_coordinator_without_home_assistant(monkeypatch):
@@ -113,6 +115,235 @@ def test_coordinator_first_refresh_does_not_start_radio_transports(
         coordinator._start_gateways.assert_not_awaited()
 
     asyncio.run(run())
+
+
+def test_cached_nodes_remain_cached_only_until_live_callback(
+    monkeypatch,
+) -> None:
+    """Loading SQLite state must not masquerade as a current-session sighting."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+        cached_node = NodeState(
+            node_key="private-cached-key",
+            protocol=PROTOCOL_MESHTASTIC,
+        )
+
+        class Store:
+            async def async_open(self) -> None:
+                return None
+
+            async def async_load_snapshot(self, *, recent_limit: int):
+                assert recent_limit == 100
+                return MeshSnapshot(nodes={cached_node.node_key: cached_node})
+
+            async def async_upsert_node(self, node: NodeState) -> None:
+                assert node.node_key == "private-live-key"
+
+        coordinator = object.__new__(coordinator_class)
+        coordinator.store = Store()
+        coordinator.snapshot = MeshSnapshot()
+        coordinator._session_observed_node_keys = set()
+        coordinator._rebuild_gateways = AsyncMock()
+        coordinator._gateway_generation = 1
+        coordinator._shutting_down = False
+        coordinator._reconnect_suspended = False
+        coordinator.async_set_updated_data = lambda _snapshot: None
+
+        await coordinator._async_setup()
+
+        assert coordinator.node_observed_this_session(cached_node.node_key) is False
+        assert coordinator.node_observability_diagnostics()["node_counts"] == {
+            "total": 1,
+            "observed_this_session": 0,
+            "cached_only": 1,
+            "online": 0,
+            "offline": 1,
+            "located": 0,
+            "located_offline": 0,
+            "stored_total": 1,
+            "analyzed": 1,
+            "analysis_omitted": 0,
+            "analysis_truncated": False,
+        }
+
+        live_node = NodeState(
+            node_key="private-live-key",
+            protocol=PROTOCOL_MESHTASTIC,
+            online=True,
+        )
+        await coordinator._handle_node(live_node, gateway_generation=1)
+
+        assert coordinator.node_observed_this_session(cached_node.node_key) is False
+        assert coordinator.node_observed_this_session(live_node.node_key) is True
+        counts = coordinator.node_observability_diagnostics()["node_counts"]
+        assert counts["total"] == 2
+        assert counts["observed_this_session"] == 1
+        assert counts["cached_only"] == 1
+
+    asyncio.run(run())
+
+
+def test_node_observability_is_aggregate_only_and_privacy_safe(monkeypatch) -> None:
+    """Provenance diagnostics expose counts, never compared identity aliases."""
+    coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+    now = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
+    private_alias = "AA:BB:CC:DD:EE:FF"
+    nodes = {
+        f"private-node-key-{index}": NodeState(
+            node_key=f"private-node-key-{index}",
+            protocol=PROTOCOL_MESHTASTIC,
+            node_id=f"private-node-id-{index}",
+            mac=private_alias if index in {0, 1} else None,
+            public_key=f"private-public-key-{index}",
+            online=index in {0, 2},
+            last_heard=(
+                None
+                if index == 6
+                else now
+                - (
+                    timedelta(minutes=5),
+                    timedelta(minutes=30),
+                    timedelta(hours=2),
+                    timedelta(hours=12),
+                    timedelta(days=2),
+                    timedelta(minutes=10),
+                )[index]
+            ),
+            connectivity={
+                "via_mqtt": (True, False, None, True, False, None, None)[index],
+                "hops": (0, 1, 2, 3, 5, 8, None)[index],
+            },
+            location=(
+                {"latitude": 1.0, "longitude": 1.0}
+                if index in {0, 1, 4}
+                else {}
+            ),
+        )
+        for index in range(7)
+    }
+    coordinator = object.__new__(coordinator_class)
+    coordinator.snapshot = MeshSnapshot(nodes=nodes)
+    coordinator._session_observed_node_keys = {
+        "private-node-key-0",
+        "private-node-key-2",
+    }
+
+    result = coordinator.node_observability_diagnostics(now=now)
+
+    assert result["node_counts"] == {
+        "total": 7,
+        "observed_this_session": 2,
+        "cached_only": 5,
+        "online": 2,
+        "offline": 5,
+        "located": 3,
+        "located_offline": 2,
+        "stored_total": 7,
+        "analyzed": 7,
+        "analysis_omitted": 0,
+        "analysis_truncated": False,
+    }
+    assert result["via_mqtt_counts"] == {
+        "true": 2,
+        "false": 2,
+        "unknown": 3,
+    }
+    assert result["hop_counts"] == {
+        "0": 1,
+        "1": 1,
+        "2": 1,
+        "3": 1,
+        "4-7": 1,
+        ">=8": 1,
+        "unknown": 1,
+    }
+    assert result["age_counts"] == {
+        "<15m": 2,
+        "15m-1h": 1,
+        "1-6h": 1,
+        "6-24h": 1,
+        ">=1d": 1,
+        "unknown": 1,
+    }
+    assert result["identity_alias_collisions"] == {
+        "group_count": 1,
+        "node_count": 2,
+        "shared_alias_count": 1,
+    }
+    assert result["location_provenance"] == {
+        "independent_timestamp_available": False,
+        "source_available": False,
+        "freshness_basis": "node_last_heard_proxy",
+        "cached_location_may_be_older": True,
+        "warning": (
+            "MeshNet does not currently retain an independent location "
+            "observation timestamp or source; node last-heard age is only a "
+            "freshness proxy and a cached location may be older."
+        ),
+    }
+    assert coordinator.panel_node_provenance() == {
+        "total_node_count": 7,
+        "analyzed_node_count": 7,
+        "omitted_node_count": 0,
+        "current_session_node_count": 2,
+        "cached_only_node_count": 5,
+        "online_node_count": 2,
+        "located_node_count": 3,
+        "located_offline_node_count": 2,
+        "mqtt_node_count": 2,
+        "mqtt_unknown_node_count": 3,
+        "identity_collision_group_count": 1,
+        "identity_collision_node_count": 2,
+    }
+    serialized = repr(result)
+    assert private_alias not in serialized
+    for node in nodes.values():
+        assert node.node_key not in serialized
+        assert node.node_id not in serialized
+        assert node.public_key not in serialized
+
+
+def test_node_observability_caps_recurring_analysis_without_deleting_nodes(
+    monkeypatch,
+) -> None:
+    """An oversized retained database must not create unbounded panel work."""
+    coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+    monkeypatch.setitem(
+        coordinator_class.node_observability_diagnostics.__globals__,
+        "MAX_PANEL_NODES",
+        2,
+    )
+    nodes = {
+        f"private-node-{index}": NodeState(
+            node_key=f"private-node-{index}",
+            protocol=PROTOCOL_MESHTASTIC,
+            online=True,
+        )
+        for index in range(3)
+    }
+    coordinator = object.__new__(coordinator_class)
+    coordinator.snapshot = MeshSnapshot(nodes=nodes)
+    coordinator._session_observed_node_keys = set(nodes)
+
+    counts = coordinator.node_observability_diagnostics()["node_counts"]
+
+    assert counts == {
+        "total": 2,
+        "observed_this_session": 2,
+        "cached_only": 0,
+        "online": 2,
+        "offline": 0,
+        "located": 0,
+        "located_offline": 0,
+        "stored_total": 3,
+        "analyzed": 2,
+        "analysis_omitted": 1,
+        "analysis_truncated": True,
+    }
+    assert coordinator.panel_node_provenance()["total_node_count"] == 3
+    assert coordinator.panel_node_provenance()["omitted_node_count"] == 1
+    assert len(coordinator.snapshot.nodes) == 3
 
 
 def test_start_gateways_is_noop_after_shutdown_begins(monkeypatch) -> None:
@@ -1182,6 +1413,13 @@ def test_diagnostics_exclude_gateway_identity_errors_and_mesh_content(monkeypatc
         coordinator.tx_limiter = SimpleNamespace(
             snapshot=lambda: {"rate": 0.5, "capacity": 5.0, "tokens": 4.0}
         )
+        coordinator.panel_telemetry = PanelTelemetry()
+        coordinator.panel_telemetry.record_failure(
+            "private-node-id",
+            category="token=private",
+            error_type="PrivateOwnerError",
+            error_code="192.0.2.99",
+        )
         coordinator.snapshot = MeshSnapshot(
             nodes={
                 "private-node-id": NodeState(
@@ -1224,6 +1462,33 @@ def test_diagnostics_exclude_gateway_identity_errors_and_mesh_content(monkeypatc
 
         assert diagnostics["configuration"]["gateway_count"] == 1
         assert diagnostics["gateways"][0]["error_count"] == 1
+        assert diagnostics["panel"]["failure_event_count"] == 1
+        assert diagnostics["panel"]["failure_events"][0] == {
+            "sequence": 1,
+            "recorded_at": diagnostics["panel"]["failure_events"][0][
+                "recorded_at"
+            ],
+            "operation": "reporting",
+            "category": "unknown",
+            "error_type": "other_error",
+            "error_code": "unexpected_error",
+            "occurrence": 1,
+            "consecutive": 1,
+            "duration_bucket": "unknown",
+        }
+        assert diagnostics["node_observability"]["node_counts"] == {
+            "total": 1,
+            "observed_this_session": 0,
+            "cached_only": 1,
+            "online": 0,
+            "offline": 1,
+            "located": 0,
+            "located_offline": 0,
+            "stored_total": 1,
+            "analyzed": 1,
+            "analysis_omitted": 0,
+            "analysis_truncated": False,
+        }
         for private_value in (
             "private-node-id",
             "private-message-id",
