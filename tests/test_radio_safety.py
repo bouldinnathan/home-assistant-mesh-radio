@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
 RUNTIME_PATHS = tuple(
     path
     for path in sorted(Path("custom_components/meshnet").rglob("*"))
