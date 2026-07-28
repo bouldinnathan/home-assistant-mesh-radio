@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 
-
 PANEL = Path("custom_components/meshnet/frontend/meshnet-panel.js")
 
 
