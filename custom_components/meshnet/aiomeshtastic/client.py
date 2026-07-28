@@ -581,14 +581,21 @@ class MeshtasticBluetoothClient:
                     self._set_state("bluetooth_requesting_configuration")
                     self._config_complete_event.clear()
                     self._config_id = self._new_config_id()
+                    request = mesh_pb2.ToRadio()
+                    request.want_config_id = self._config_id
+                    await connection.async_send(request.SerializeToString(), force_read=True)
+
+                    # Meshtastic's GATT server handles ToRadio writes and
+                    # FromRadio reads on the same BLE callback task.  Its
+                    # initial FromRadio read may block while waiting for the
+                    # want_config request, so beginning that read first can
+                    # prevent the preceding write-with-response from ever
+                    # completing.  The device API requires write, then read.
                     reader = asyncio.create_task(
                         self._read_packets(connection),
                         name="meshnet-aiomeshtastic-reader",
                     )
                     self._reader_task = reader
-                    request = mesh_pb2.ToRadio()
-                    request.want_config_id = self._config_id
-                    await connection.async_send(request.SerializeToString(), force_read=True)
 
                     self._set_state("bluetooth_synchronizing_configuration")
                     await self._wait_for_configuration(reader)

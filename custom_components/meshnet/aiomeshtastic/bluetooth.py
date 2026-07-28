@@ -183,11 +183,11 @@ class BluetoothConnection:
                 raise MeshtasticNotConnectedError("Meshtastic Bluetooth is not connected")
             try:
                 async with asyncio.timeout(self._io_timeout):
-                    try:
-                        await client.write_gatt_char(characteristic, payload, response=True)
-                    except TypeError:
-                        # Test doubles and older backends may not expose the keyword.
-                        await client.write_gatt_char(characteristic, payload)
+                    # ToRadio is declared as NIMBLE_PROPERTY::WRITE by the
+                    # Meshtastic firmware, so it requires an ATT write request.
+                    # Never retry after an exception: the backend may have
+                    # delivered the protobuf before reporting its local error.
+                    await client.write_gatt_char(characteristic, payload, response=True)
             except BaseException as err:
                 if isinstance(err, asyncio.CancelledError):
                     raise

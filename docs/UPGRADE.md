@@ -1,5 +1,15 @@
 # Upgrade Guide
 
+## From 0.5.3
+
+0.5.4 fixes the direct-Bluetooth configuration handshake by sending the
+initial Meshtastic `want_config` request before starting the blocking
+`FromRadio` reader. This follows the firmware's required write-then-read GATT
+sequence and prevents a successful connection from stalling on its first
+write. The write remains the firmware-declared write-with-response path; there
+is no ambiguous retry, pairing bypass, or configuration migration. Restart
+Home Assistant after updating so the Bluetooth backend is reloaded.
+
 ## From 0.5.2
 
 0.5.3 retains a detached, strictly allowlisted snapshot of the most recent

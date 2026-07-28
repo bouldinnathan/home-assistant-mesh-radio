@@ -152,6 +152,42 @@ def test_read_timeout_retains_from_radio_failure_phase() -> None:
     asyncio.run(run())
 
 
+def test_write_backend_type_error_is_not_retried() -> None:
+    class TypeErrorGattClient(_GattClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.write_attempts = 0
+
+        async def write_gatt_char(
+            self,
+            _characteristic: object,
+            _payload: bytes,
+            *,
+            response: bool = True,
+        ) -> None:
+            assert response is True
+            self.write_attempts += 1
+            raise TypeError("backend failed after accepting the write")
+
+    async def run() -> None:
+        client = TypeErrorGattClient()
+        connection = _connection(client)
+        await connection.async_connect()
+
+        with pytest.raises(MeshtasticConnectionError, match="write failed"):
+            await connection.async_send(b"want-config", force_read=True)
+
+        diagnostics = connection.diagnostic_snapshot()
+        assert client.write_attempts == 1
+        assert diagnostics["write_count"] == 0
+        assert diagnostics["forced_read_count"] == 0
+        assert diagnostics["last_error_type"] == "TypeError"
+        assert diagnostics["last_failure_phase"] == "writing_to_radio"
+        await connection.async_disconnect()
+
+    asyncio.run(run())
+
+
 def test_failed_session_retains_identity_free_connection_diagnostics() -> None:
     pytest.importorskip("meshtastic")
     from custom_components.meshnet.aiomeshtastic.client import (
@@ -272,6 +308,7 @@ def test_high_level_handshake_callbacks_send_and_stop() -> None:
             self.is_connected = False
             self.queue: asyncio.Queue[bytes | None] = asyncio.Queue()
             self.sent: list[Any] = []
+            self.packet_stream_started = False
 
         @property
         def owns_endpoint(self) -> bool:
@@ -289,6 +326,11 @@ def test_high_level_handshake_callbacks_send_and_stop() -> None:
             message.ParseFromString(payload)
             self.sent.append((message, force_read))
             if message.want_config_id:
+                # A real GATT write suspends while it waits for the ATT write
+                # response. Give a prematurely-created reader a chance to run
+                # so this test catches a read-before-want_config regression.
+                await asyncio.sleep(0)
+                assert self.packet_stream_started is False
                 my_info = mesh_pb2.FromRadio()
                 my_info.my_info.my_node_num = 0x12345678
                 await self.queue.put(my_info.SerializeToString())
@@ -303,6 +345,7 @@ def test_high_level_handshake_callbacks_send_and_stop() -> None:
                 await self.queue.put(complete.SerializeToString())
 
         async def packet_stream(self):
+            self.packet_stream_started = True
             while self.is_connected:
                 payload = await self.queue.get()
                 if payload is None:
