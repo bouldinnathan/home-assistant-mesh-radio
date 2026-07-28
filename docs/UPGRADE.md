@@ -1,5 +1,13 @@
 # Upgrade Guide
 
+## From 0.5.2
+
+0.5.3 retains a detached, strictly allowlisted snapshot of the most recent
+Bluetooth startup failure after successful cleanup. It preserves the original
+protocol/GATT phase, error class, counters, local-resolution result, and cleanup
+outcome without retaining device objects, endpoints, addresses, messages, or
+exception text. No configuration or database migration is required.
+
 ## From 0.4.2
 
 0.4.3 hardens the first live diagnostics release. Meshtastic diagnostics now

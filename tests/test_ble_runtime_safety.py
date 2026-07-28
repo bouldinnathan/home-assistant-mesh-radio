@@ -670,26 +670,99 @@ def test_failed_ble_start_releases_transport_and_lock_before_retry() -> None:
     async def run() -> None:
         hass = _FakeHass()
         failed = _FakeBluetoothTransport(fail_start=RuntimeError("cannot connect"))
-        replacement = _FakeBluetoothTransport()
+        replacement = _FakeBluetoothTransport(block_start=True)
         client, adapters = _client(hass, [failed, replacement])
 
         with pytest.raises(RuntimeError, match="cannot connect"):
             await client.async_start()
         await asyncio.sleep(0)
 
+        diagnostics = client.diagnostic_snapshot()
+        assert diagnostics["last_start_failed_phase"] == "bluetooth_connecting"
+        assert diagnostics["last_start_error_subtype"] == "RuntimeError"
+        assert diagnostics["last_bluetooth_failure"] == {
+            "exception_type": "RuntimeError",
+            "error_subtype": "RuntimeError",
+            "phase": "bluetooth_connecting",
+            "cleanup_outcome": "confirmed",
+            "cleanup_exception_type": None,
+            "transport": {
+                "implementation": "_FakeBluetoothTransport",
+                "state": "failed",
+                "active": False,
+                "start_calls": 1,
+                "stop_calls": 0,
+                "send_active": False,
+                "refresh_active": False,
+            },
+        }
+        assert "AA:BB:CC:DD:EE:FF" not in repr(diagnostics)
+        assert ADAPTER_ADDRESS not in repr(diagnostics)
         assert failed.stop_calls == 1
         assert client._ble_transport is None
         assert client._native_lock is None
         assert client.diagnostic_snapshot()["native_subscription_count"] == 0
 
-        await client.async_start()
+        retry = asyncio.create_task(client.async_start())
+        await replacement.start_entered.wait()
+
+        # A pending retry must not erase the only evidence from the completed
+        # failure. It is cleared only after a confirmed successful start.
+        assert client.diagnostic_snapshot()["last_bluetooth_failure"] is not None
+        replacement.start_gate.set()
+        await retry
 
         assert adapters == ["hci0", "hci0"]
         assert replacement.start_calls == 1
         assert client._ble_transport is replacement
+        assert client.diagnostic_snapshot()["last_bluetooth_failure"] is None
         await client.async_stop()
 
     asyncio.run(run())
+
+
+def test_ble_failure_diagnostic_projection_rejects_identity_and_content() -> None:
+    source = {
+        "implementation": "SafeTransport",
+        "state": "bluetooth_failed",
+        "connect_attempts": 1,
+        "address": "AA:BB:CC:DD:EE:FF",
+        "message": "private mesh message",
+        "device": object(),
+        "last_transport_before_cleanup": {
+            "state": "failed",
+            "last_error_type": "BleakDBusError",
+            "address": "AA:BB:CC:DD:EE:FF",
+            "path": "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF",
+            "payload": b"private",
+        },
+    }
+
+    class PollutedTransport:
+        def diagnostic_snapshot(self) -> dict[str, Any]:
+            return source
+
+    projected = MeshtasticClient._safe_bluetooth_diagnostics(PollutedTransport())
+    serialized = repr(projected)
+
+    assert projected == {
+        "implementation": "SafeTransport",
+        "state": "bluetooth_failed",
+        "connect_attempts": 1,
+        "last_transport_before_cleanup": {
+            "state": "failed",
+            "last_error_type": "BleakDBusError",
+        },
+    }
+    assert "AA:BB:CC:DD:EE:FF" not in serialized
+    assert "private" not in serialized
+    assert "/org/bluez" not in serialized
+
+    # The retained projection is detached from the source mapping.
+    source["state"] = "changed"
+    source["last_transport_before_cleanup"]["state"] = "changed"
+    assert projected["state"] == "bluetooth_failed"
+    assert projected["last_transport_before_cleanup"]["state"] == "failed"
 
 
 def test_existing_disconnected_ble_transport_is_restarted_not_reported_ready() -> None:

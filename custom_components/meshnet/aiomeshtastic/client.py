@@ -20,6 +20,7 @@ import binascii
 import copy
 import inspect
 import logging
+import math
 import secrets
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -43,6 +44,44 @@ _BROADCAST_NUM = 0xFFFFFFFF
 _BROADCAST_ID = "^all"
 _NODELESS_WANT_CONFIG_ID = 69420
 _STREAM_END = object()
+
+_CONNECTION_DIAGNOSTIC_FIELDS = frozenset(
+    {
+        "state",
+        "connected",
+        "owns_endpoint",
+        "notifications_ready",
+        "closing",
+        "connect_count",
+        "disconnect_count",
+        "notification_count",
+        "read_count",
+        "write_count",
+        "forced_read_count",
+        "notify_restart_count",
+        "cleanup_task",
+        "last_error_type",
+        "last_failure_phase",
+    }
+)
+_CONNECTION_TIMEOUT_FIELDS = frozenset(
+    {"connect", "notify", "io", "disconnect", "idle_read"}
+)
+
+
+def _diagnostic_scalar(value: Any) -> str | bool | int | float | None:
+    """Return one bounded identity-free primitive or ``None`` when unsafe."""
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, str) and 0 < len(value) <= 128 and all(
+        character.isalnum() or character in "_.-" for character in value
+    ):
+        return value
+    return None
 
 type DeviceProvider = Callable[[], Any | Awaitable[Any]]
 type PacketCallback = Callable[[dict[str, Any]], Any | Awaitable[Any]]
@@ -129,10 +168,13 @@ class MeshtasticBluetoothClient:
         self._stopping = False
         self._ever_active = False
         self._initial_error: BaseException | None = None
+        self._last_connection_snapshot: dict[str, Any] | None = None
+        self._last_connection_cleanup_outcome = "not_started"
         self._config_id: int | None = None
         self._my_node_num: int | None = None
         self._packet_sequence = secrets.randbits(10)
         self._last_error_type: str | None = None
+        self._last_failure_phase: str | None = None
         self._connect_attempts = 0
         self._successful_connections = 0
         self._disconnect_count = 0
@@ -177,6 +219,7 @@ class MeshtasticBluetoothClient:
                 self._stopping = False
                 self._ever_active = False
                 self._initial_error = None
+                self._last_failure_phase = None
                 self._stop_event.clear()
                 self._active_event.clear()
                 self._start_result_event.clear()
@@ -476,6 +519,13 @@ class MeshtasticBluetoothClient:
             "dropped_stream_packet_count": self._dropped_stream_packet_count,
             "sent_text_count": self._sent_text_count,
             "last_error_type": self._last_error_type,
+            "last_failure_phase": self._last_failure_phase,
+            "last_transport_before_cleanup": copy.deepcopy(
+                self._last_connection_snapshot
+            ),
+            "last_transport_cleanup_outcome": (
+                self._last_connection_cleanup_outcome
+            ),
             "connected_elapsed_seconds": (
                 round(now - self._last_connected_monotonic, 3)
                 if self.connected and self._last_connected_monotonic is not None
@@ -490,7 +540,11 @@ class MeshtasticBluetoothClient:
                 "stop": self._stop_timeout,
                 "heartbeat_interval": self._heartbeat_interval,
             },
-            "transport": connection.diagnostic_snapshot() if connection is not None else None,
+            "transport": (
+                self._connection_diagnostics(connection)
+                if connection is not None
+                else None
+            ),
         }
 
     async def _run_supervisor(self) -> None:
@@ -520,6 +574,8 @@ class MeshtasticBluetoothClient:
                         logger=self._logger,
                     )
                     self._connection = connection
+                    self._last_connection_snapshot = None
+                    self._last_connection_cleanup_outcome = "not_started"
                     await connection.async_connect()
 
                     self._set_state("bluetooth_requesting_configuration")
@@ -556,6 +612,7 @@ class MeshtasticBluetoothClient:
                 except asyncio.CancelledError:
                     raise
                 except BaseException as err:
+                    self._last_failure_phase = self._state
                     self._remember_error(err)
                     if not self._ever_active:
                         self._initial_error = self._public_error(err)
@@ -579,6 +636,8 @@ class MeshtasticBluetoothClient:
         except asyncio.CancelledError:
             raise
         except BaseException as err:
+            if self._last_failure_phase is None:
+                self._last_failure_phase = self._state
             self._remember_error(err)
             if not self._ever_active:
                 self._initial_error = self._public_error(err)
@@ -859,6 +918,11 @@ class MeshtasticBluetoothClient:
         heartbeat: asyncio.Task[None] | None,
         connection: BluetoothConnection | None,
     ) -> None:
+        if connection is not None:
+            self._last_connection_snapshot = self._connection_diagnostics(
+                connection
+            )
+            self._last_connection_cleanup_outcome = "pending"
         session_tasks = tuple(
             task for task in (reader, heartbeat) if task is not None
         )
@@ -885,6 +949,7 @@ class MeshtasticBluetoothClient:
             # protocol disconnect write or physical notify/link teardown.  Keep
             # every reference reachable so a later stop can retry after the
             # cancellation-resistant platform call finally returns.
+            self._last_connection_cleanup_outcome = "session_tasks_pending"
             raise MeshtasticCleanupError(
                 "Meshtastic session tasks did not stop within their cleanup bound"
             )
@@ -909,13 +974,55 @@ class MeshtasticBluetoothClient:
                 if self._connection_owns_endpoint(connection):
                     # Propagate so the supervisor terminates instead of opening
                     # another link while this GATT owner remains live.
+                    self._last_connection_cleanup_outcome = "unconfirmed"
                     raise MeshtasticCleanupError(
                         "Meshtastic GATT teardown was not confirmed"
                     ) from err
+                self._last_connection_cleanup_outcome = "error_without_owner"
+            else:
+                self._last_connection_cleanup_outcome = "confirmed"
         if self._connection is connection and not self._connection_owns_endpoint(connection):
             self._connection = None
         self._config_complete_event.clear()
         self._config_id = None
+
+    @staticmethod
+    def _connection_diagnostics(
+        connection: BluetoothConnection,
+    ) -> dict[str, Any] | None:
+        """Capture identity-free connection state without risking cleanup."""
+        snapshot = getattr(connection, "diagnostic_snapshot", None)
+        if not callable(snapshot):
+            return None
+        try:
+            value = snapshot()
+        except Exception as err:
+            return {
+                "state": "snapshot_failed",
+                "snapshot_error_type": type(err).__name__,
+            }
+        if not isinstance(value, dict):
+            return None
+        projected: dict[str, Any] = {}
+        for key in _CONNECTION_DIAGNOSTIC_FIELDS:
+            if key not in value:
+                continue
+            scalar = _diagnostic_scalar(value[key])
+            if scalar is not None or value[key] is None:
+                projected[key] = scalar
+        raw_timeouts = value.get("timeouts")
+        if isinstance(raw_timeouts, dict):
+            timeouts: dict[str, int | float] = {}
+            for key in _CONNECTION_TIMEOUT_FIELDS:
+                raw_value = raw_timeouts.get(key)
+                scalar = _diagnostic_scalar(raw_value)
+                if isinstance(scalar, (int, float)) and not isinstance(
+                    scalar, bool
+                ):
+                    timeouts[key] = scalar
+            if timeouts:
+                projected["timeouts"] = timeouts
+        return projected
 
     def _resolve_destination(self, value: int | str | None) -> int:
         if value is None:

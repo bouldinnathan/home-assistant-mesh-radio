@@ -75,6 +75,7 @@ class BluetoothConnection:
         self._closing = False
         self._state = "idle"
         self._last_error_type: str | None = None
+        self._last_failure_phase: str | None = None
         self._connect_count = 0
         self._disconnect_count = 0
         self._notification_count = 0
@@ -104,6 +105,8 @@ class BluetoothConnection:
             if self.is_connected and self._notifications_ready:
                 return
             self._closing = False
+            self._last_error_type = None
+            self._last_failure_phase = None
             self._loop = asyncio.get_running_loop()
             self._read_wakeup.clear()
             self._disconnected.clear()
@@ -124,6 +127,7 @@ class BluetoothConnection:
             except BaseException as err:
                 if not isinstance(err, asyncio.CancelledError):
                     self._last_error_type = type(err).__name__
+                    self._last_failure_phase = self._state
                 self._state = "connect_cleanup"
                 cleanup_error = await self._cleanup_client(client)
                 still_connected = bool(
@@ -188,6 +192,7 @@ class BluetoothConnection:
                 if isinstance(err, asyncio.CancelledError):
                     raise
                 self._last_error_type = type(err).__name__
+                self._last_failure_phase = "writing_to_radio"
                 raise MeshtasticConnectionError(f"Meshtastic Bluetooth write failed: {type(err).__name__}") from err
             self._write_count += 1
             if force_read:
@@ -237,6 +242,7 @@ class BluetoothConnection:
             "notify_restart_count": self._notify_restart_count,
             "cleanup_task": self._task_state(self._cleanup_task),
             "last_error_type": self._last_error_type,
+            "last_failure_phase": self._last_failure_phase,
             "timeouts": {
                 "connect": self._connect_timeout,
                 "notify": self._notify_timeout,
@@ -258,6 +264,7 @@ class BluetoothConnection:
             if isinstance(err, asyncio.CancelledError):
                 raise
             self._last_error_type = type(err).__name__
+            self._last_failure_phase = "reading_from_radio"
             raise MeshtasticConnectionError(f"Meshtastic Bluetooth read failed: {type(err).__name__}") from err
         self._read_count += 1
         return bytes(payload)
@@ -298,6 +305,7 @@ class BluetoothConnection:
             if isinstance(err, asyncio.CancelledError):
                 raise
             self._last_error_type = type(err).__name__
+            self._last_failure_phase = "restarting_notifications"
             raise MeshtasticConnectionError(
                 f"Meshtastic Bluetooth notification restart failed: {type(err).__name__}"
             ) from err

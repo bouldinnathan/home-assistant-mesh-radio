@@ -125,7 +125,82 @@ def test_profile_failure_disconnects_and_drops_ownership() -> None:
 
         assert client.is_connected is False
         assert connection.owns_endpoint is False
-        assert connection.diagnostic_snapshot()["state"] == "failed"
+        diagnostics = connection.diagnostic_snapshot()
+        assert diagnostics["state"] == "failed"
+        assert diagnostics["last_failure_phase"] == "validating_profile"
+
+    asyncio.run(run())
+
+
+def test_read_timeout_retains_from_radio_failure_phase() -> None:
+    async def run() -> None:
+        client = _GattClient()
+        connection = _connection(client)
+        await connection.async_connect()
+        await connection.async_send(b"want-config", force_read=True)
+
+        stream = connection.packet_stream()
+        with pytest.raises(MeshtasticConnectionError, match="read failed"):
+            await anext(stream)
+
+        diagnostics = connection.diagnostic_snapshot()
+        assert diagnostics["last_error_type"] == "TimeoutError"
+        assert diagnostics["last_failure_phase"] == "reading_from_radio"
+        await stream.aclose()
+        await connection.async_disconnect()
+
+    asyncio.run(run())
+
+
+def test_failed_session_retains_identity_free_connection_diagnostics() -> None:
+    pytest.importorskip("meshtastic")
+    from custom_components.meshnet.aiomeshtastic.client import (
+        MeshtasticBluetoothClient,
+    )
+
+    class FailingConnection:
+        is_connected = False
+        owns_endpoint = False
+
+        async def async_connect(self) -> None:
+            raise MeshtasticConnectionError("test connection failure")
+
+        async def async_disconnect(self) -> None:
+            return None
+
+        def diagnostic_snapshot(self) -> dict[str, Any]:
+            return {
+                "state": "failed",
+                "last_error_type": "BleakDBusError",
+                "connected": False,
+            }
+
+    async def run() -> None:
+        client = MeshtasticBluetoothClient(
+            address="AA:BB:CC:DD:EE:FF",
+            device_provider=lambda: SimpleNamespace(),
+            connection_factory=lambda **_kwargs: FailingConnection(),
+            connect_timeout=0.2,
+            configuration_timeout=0.2,
+            io_timeout=0.2,
+            disconnect_timeout=0.2,
+            stop_timeout=0.5,
+            heartbeat_interval=60,
+        )
+
+        with pytest.raises(MeshtasticConnectionError, match="test connection failure"):
+            await client.async_start()
+
+        diagnostics = client.diagnostic_snapshot()
+        assert diagnostics["connect_attempts"] == 1
+        assert diagnostics["last_failure_phase"] == "bluetooth_connecting"
+        assert diagnostics["last_transport_before_cleanup"] == {
+            "state": "failed",
+            "last_error_type": "BleakDBusError",
+            "connected": False,
+        }
+        assert diagnostics["last_transport_cleanup_outcome"] == "confirmed"
+        assert "AA:BB:CC:DD:EE:FF" not in repr(diagnostics)
 
     asyncio.run(run())
 

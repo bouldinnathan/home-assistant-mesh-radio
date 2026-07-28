@@ -351,19 +351,24 @@ Download diagnostics before reloading. The identity-free fields show the exact
 bounded stage, for example:
 
 ```text
-runtime.gateways[0].client.startup_phase: bluetooth_synchronizing_configuration
+runtime.gateways[0].client.last_start_failed_phase: bluetooth_synchronizing_configuration
+runtime.gateways[0].client.last_start_error_subtype: TimeoutError
 runtime.gateways[0].client.bluetooth_adapter_validation.status: passed
-runtime.gateways[0].client.bluetooth_transport.notifications_ready: true
-runtime.gateways[0].client.bluetooth_transport.config_ready: false
+runtime.gateways[0].client.last_bluetooth_failure.cleanup_outcome: confirmed
+runtime.gateways[0].client.last_bluetooth_failure.transport.last_resolution_result: matched_verified_local_adapter
+runtime.gateways[0].client.last_bluetooth_failure.transport.last_transport_before_cleanup.last_failure_phase: reading_from_radio
 ```
 
 This example means adapter validation, GATT connection, and notification setup
-completed, but the radio did not finish its configuration exchange. Check for
+completed, but a FromRadio read timed out before the radio finished its
+configuration exchange; teardown was confirmed. Check for
 another connected phone or computer, wake or restart the radio's Bluetooth,
 and then reload the MeshNet entry. Other phase values distinguish local-device
 resolution, GATT connection, profile validation, notification setup, config
 request, active operation, teardown, and reconnect backoff. Diagnostic
-collection itself does not probe or reconnect the radio.
+collection itself does not probe or reconnect the radio. Failure snapshots are
+strictly allowlisted primitive states and counters; they never retain a BLE
+client, device object, endpoint, address, exception message, or packet content.
 
 Direct Bluetooth needs no MQTT, broker, Internet, Wi-Fi, or LAN. If Home
 Assistant shows a dependency-install error immediately after a new HACS

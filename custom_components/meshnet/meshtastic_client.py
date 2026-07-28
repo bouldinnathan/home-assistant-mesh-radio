@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import copy
 import hashlib
 import json
 import logging
+import math
 import re
 import time
 from collections.abc import Callable
@@ -43,9 +45,146 @@ _STOP_WAIT_TIMEOUT = 2.0
 _BLUEZ_ADAPTER_INTERFACE = "org.bluez.Adapter1"
 _LOCAL_ADAPTER_RE = re.compile(r"hci[0-9]+\Z")
 _BLUETOOTH_ADDRESS_RE = re.compile(r"[0-9A-F]{2}(?::[0-9A-F]{2}){5}\Z")
+_BLUETOOTH_FAILURE_DIAGNOSTIC_FIELDS = frozenset(
+    {
+        "implementation",
+        "upstream_commit",
+        "state",
+        "connected",
+        "stopping",
+        "ever_active",
+        "runner_task",
+        "reader_task",
+        "heartbeat_task",
+        "stop_cleanup_task",
+        "callback_task_count",
+        "packet_callback_count",
+        "connection_callback_count",
+        "packet_stream_count",
+        "node_count",
+        "connect_attempts",
+        "successful_connections",
+        "disconnect_count",
+        "reconnect_count",
+        "from_radio_count",
+        "packet_count",
+        "node_update_count",
+        "parse_error_count",
+        "callback_error_count",
+        "dropped_stream_packet_count",
+        "sent_text_count",
+        "last_error_type",
+        "last_failure_phase",
+        "last_transport_cleanup_outcome",
+        "connected_elapsed_seconds",
+        "adapter_scoped_resolution",
+        "resolution_attempts",
+        "resolution_successes",
+        "last_resolution_result",
+        "snapshot_error_type",
+        # Test transports use these same identity-free lifecycle counters.
+        "active",
+        "start_calls",
+        "stop_calls",
+        "send_active",
+        "refresh_active",
+    }
+)
+_BLUETOOTH_FAILURE_CONNECTION_FIELDS = frozenset(
+    {
+        "state",
+        "connected",
+        "owns_endpoint",
+        "notifications_ready",
+        "closing",
+        "connect_count",
+        "disconnect_count",
+        "notification_count",
+        "read_count",
+        "write_count",
+        "forced_read_count",
+        "notify_restart_count",
+        "cleanup_task",
+        "last_error_type",
+        "last_failure_phase",
+        "snapshot_error_type",
+    }
+)
+_BLUETOOTH_FAILURE_TIMEOUT_FIELDS = frozenset(
+    {
+        "connect",
+        "notify",
+        "io",
+        "disconnect",
+        "idle_read",
+        "configuration",
+        "start",
+        "stop",
+        "heartbeat_interval",
+    }
+)
 _NATIVE_ENDPOINT_LOCKS: WeakKeyDictionary[
     Any, dict[tuple[str, str], asyncio.Lock]
 ] = WeakKeyDictionary()
+
+
+def _safe_diagnostic_scalar(value: Any) -> str | bool | int | float | None:
+    """Return a bounded identity-free scalar or ``None`` when unsafe."""
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, str) and 0 < len(value) <= 128 and all(
+        character.isalnum() or character in "_.-" for character in value
+    ):
+        return value
+    return None
+
+
+def _project_diagnostic_mapping(
+    source: Any,
+    allowed_fields: frozenset[str],
+) -> dict[str, Any] | None:
+    """Copy only explicitly allowlisted primitive diagnostic values."""
+    if not isinstance(source, dict):
+        return None
+    projected: dict[str, Any] = {}
+    for key in allowed_fields:
+        if key not in source:
+            continue
+        scalar = _safe_diagnostic_scalar(source[key])
+        if scalar is not None or source[key] is None:
+            projected[key] = scalar
+    raw_timeouts = source.get("timeouts")
+    if isinstance(raw_timeouts, dict):
+        timeouts: dict[str, int | float] = {}
+        for key in _BLUETOOTH_FAILURE_TIMEOUT_FIELDS:
+            scalar = _safe_diagnostic_scalar(raw_timeouts.get(key))
+            if isinstance(scalar, (int, float)) and not isinstance(scalar, bool):
+                timeouts[key] = scalar
+        if timeouts:
+            projected["timeouts"] = timeouts
+    return projected
+
+
+def _project_bluetooth_failure_diagnostics(source: Any) -> dict[str, Any] | None:
+    """Project a transport snapshot onto the strict privacy-safe schema."""
+    projected = _project_diagnostic_mapping(
+        source,
+        _BLUETOOTH_FAILURE_DIAGNOSTIC_FIELDS,
+    )
+    if projected is None or not isinstance(source, dict):
+        return projected
+    for key in ("last_transport_before_cleanup", "transport"):
+        nested = _project_diagnostic_mapping(
+            source.get(key),
+            _BLUETOOTH_FAILURE_CONNECTION_FIELDS,
+        )
+        if nested is not None:
+            projected[key] = nested
+    return projected
 
 
 def _native_endpoint_lock(endpoint: tuple[str, str]) -> asyncio.Lock:
@@ -196,7 +335,10 @@ class MeshtasticClient(MeshGateway):
         self._last_start_duration_seconds: float | None = None
         self._last_start_outcome = "not_started"
         self._last_start_exception_type: str | None = None
+        self._last_start_error_subtype: str | None = None
         self._last_start_failed_phase: str | None = None
+        self._last_bluetooth_failure: dict[str, Any] | None = None
+        self._active_bluetooth_failure: dict[str, Any] | None = None
         self._bluetooth_adapter_validation: dict[str, Any] = {
             "status": (
                 "not_started"
@@ -289,12 +431,16 @@ class MeshtasticClient(MeshGateway):
                 "last_start_duration_seconds": self._last_start_duration_seconds,
                 "last_start_outcome": self._last_start_outcome,
                 "last_start_exception_type": self._last_start_exception_type,
+                "last_start_error_subtype": self._last_start_error_subtype,
                 "last_start_failed_phase": self._last_start_failed_phase,
+                "last_bluetooth_failure": copy.deepcopy(
+                    self._last_bluetooth_failure
+                ),
                 "bluetooth_adapter_validation": dict(
                     self._bluetooth_adapter_validation
                 ),
                 "bluetooth_transport": (
-                    self._ble_transport.diagnostic_snapshot()
+                    self._safe_bluetooth_diagnostics(self._ble_transport)
                     if self._ble_transport is not None
                     else {
                         "implementation": "not_created",
@@ -306,6 +452,37 @@ class MeshtasticClient(MeshGateway):
             }
         )
         return snapshot
+
+    @staticmethod
+    def _safe_bluetooth_diagnostics(transport: Any) -> dict[str, Any]:
+        """Return identity-free transport diagnostics without masking failures."""
+        snapshot = getattr(transport, "diagnostic_snapshot", None)
+        if not callable(snapshot):
+            return {
+                "implementation": type(transport).__name__,
+                "state": "snapshot_unavailable",
+            }
+        try:
+            value = snapshot()
+        except Exception as err:
+            return {
+                "implementation": type(transport).__name__,
+                "state": "snapshot_failed",
+                "snapshot_error_type": type(err).__name__,
+            }
+        if not isinstance(value, dict):
+            return {
+                "implementation": type(transport).__name__,
+                "state": "snapshot_invalid",
+            }
+        projected = _project_bluetooth_failure_diagnostics(value)
+        if projected is None:
+            return {
+                "implementation": type(transport).__name__,
+                "state": "snapshot_invalid",
+            }
+        projected.setdefault("implementation", type(transport).__name__)
+        return projected
 
     def _set_startup_phase(self, phase: str) -> None:
         """Set one identity-free startup phase for cached diagnostics."""
@@ -398,7 +575,9 @@ class MeshtasticClient(MeshGateway):
         self._last_start_duration_seconds = None
         self._last_start_outcome = "pending"
         self._last_start_exception_type = None
+        self._last_start_error_subtype = None
         self._last_start_failed_phase = None
+        self._active_bluetooth_failure = None
         self._set_startup_phase("starting")
         try:
             if self.config.transport == TRANSPORT_MQTT:
@@ -424,7 +603,20 @@ class MeshtasticClient(MeshGateway):
         except Exception as err:
             self._last_start_outcome = "failed"
             self._last_start_exception_type = type(err).__name__
-            self._last_start_failed_phase = self._startup_phase
+            active_bluetooth_failure = self._active_bluetooth_failure
+            if isinstance(active_bluetooth_failure, dict):
+                failure_phase = active_bluetooth_failure.get("phase")
+                error_subtype = active_bluetooth_failure.get("error_subtype")
+                self._last_start_failed_phase = (
+                    failure_phase
+                    if isinstance(failure_phase, str)
+                    else self._startup_phase
+                )
+                self._last_start_error_subtype = (
+                    error_subtype if isinstance(error_subtype, str) else None
+                )
+            else:
+                self._last_start_failed_phase = self._startup_phase
             self._set_startup_phase("failed")
             raise
         else:
@@ -433,6 +625,8 @@ class MeshtasticClient(MeshGateway):
                 self._set_startup_phase("stopped")
             else:
                 self._last_start_outcome = "succeeded"
+                if self.config.transport == TRANSPORT_BLUETOOTH:
+                    self._last_bluetooth_failure = None
                 self._set_startup_phase("ready")
         finally:
             if self._startup_started_monotonic is not None:
@@ -1115,20 +1309,58 @@ class MeshtasticClient(MeshGateway):
                 await self._set_connected(True)
             self._set_startup_phase("refreshing_nodes")
             await self.async_refresh()
-        except BaseException:
+        except BaseException as start_error:
+            failure_snapshot = self._safe_bluetooth_diagnostics(transport)
+            reported_failure_phase = failure_snapshot.get("last_failure_phase")
+            failed_phase = (
+                reported_failure_phase
+                if isinstance(reported_failure_phase, str)
+                else self._startup_phase
+            )
+            cleanup_outcome = "pending"
+            cleanup_exception_type: str | None = None
+            last_transport = failure_snapshot.get(
+                "last_transport_before_cleanup"
+            )
+            error_subtype = (
+                last_transport.get("last_error_type")
+                if isinstance(last_transport, dict)
+                else None
+            )
+            if not isinstance(error_subtype, str):
+                error_subtype = failure_snapshot.get("last_error_type")
+            if not isinstance(error_subtype, str):
+                error_subtype = type(start_error).__name__
             self._unsubscribe_bluetooth_events()
             try:
                 await transport.async_stop()
             except Exception as cleanup_error:
+                cleanup_outcome = "failed"
+                cleanup_exception_type = type(cleanup_error).__name__
                 self._ble_transport = transport
                 self._logger.debug(
                     "Failed to stop Meshtastic Bluetooth after startup failure: %s",
                     cleanup_error,
                 )
             else:
+                cleanup_outcome = "confirmed"
                 if self._ble_transport is transport:
                     self._ble_transport = None
                 self._release_native_lock()
+            retained_failure = {
+                "exception_type": type(start_error).__name__,
+                "error_subtype": error_subtype,
+                "phase": failed_phase,
+                "cleanup_outcome": cleanup_outcome,
+                "cleanup_exception_type": cleanup_exception_type,
+                "transport": failure_snapshot,
+            }
+            self._active_bluetooth_failure = retained_failure
+            self._last_bluetooth_failure = retained_failure
+            # Cleanup emits its own lifecycle phases. Restore the phase that
+            # actually failed so the outer single-flight owner records the
+            # useful origin instead of the final ``bluetooth_stopped`` state.
+            self._set_startup_phase(failed_phase)
             raise
 
     async def _resume_bluetooth_transport(self) -> None:
