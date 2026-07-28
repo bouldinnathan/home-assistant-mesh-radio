@@ -1,5 +1,24 @@
 # Upgrade Guide
 
+## From 0.5.6
+
+0.5.7 repairs Home Assistant's message-action boundary and adds a working
+message composer to the admin-only MeshNet sidebar panel. The panel provides
+cached node and gateway dropdowns, supports broadcast and direct sends, retains
+an in-progress draft across refreshes, and enforces Meshtastic's 237-byte UTF-8
+text limit before submitting.
+
+Action metadata no longer advertises unsupported Home Assistant entity/device/
+area targets. YAML node numbers are normalized safely instead of being rejected
+when unquoted, and the local Meshtastic Bluetooth backend accepts an exact,
+unique cached short or long node name. Full node IDs remain the safest portable
+choice; ambiguous, partial, and fuzzy name matches are rejected.
+
+Pending in-memory scheduled sends are now owned by the config entry and canceled
+on unload or restart. No configuration or database migration is required.
+Restart Home Assistant after installing the update so the backend and sidebar
+JavaScript are both reloaded.
+
 ## From 0.5.5
 
 0.5.6 clears nonpersistent `no_gateways` and per-gateway startup repairs after

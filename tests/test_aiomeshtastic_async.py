@@ -437,6 +437,65 @@ def test_high_level_handshake_callbacks_send_and_stop() -> None:
     asyncio.run(run())
 
 
+def test_destination_resolution_accepts_only_unique_exact_cached_names() -> None:
+    pytest.importorskip("meshtastic")
+
+    from custom_components.meshnet import _coerce_target_node
+    from custom_components.meshnet.aiomeshtastic.client import (
+        MeshtasticBluetoothClient,
+    )
+
+    client = MeshtasticBluetoothClient(
+        address="AA:BB:CC:DD:EE:FF",
+        device_provider=lambda: SimpleNamespace(),
+    )
+    client._nodes = {
+        0x11111111: {
+            "user": {
+                "id": "!11111111",
+                "shortName": "NODE",
+                "longName": "Exact Long Name",
+            }
+        },
+        0x22222222: {
+            "user": {
+                "id": "!22222222",
+                "short_name": "1234",
+                "long_name": "Variant Name",
+            }
+        },
+        0x33333333: {
+            "user": {
+                "id": "!33333333",
+                "shortname": "SAFE",
+                "longname": "Known Variant",
+            }
+        },
+    }
+
+    assert client._resolve_destination(" node ") == 0x11111111
+    assert client._resolve_destination("EXACT LONG NAME") == 0x11111111
+    assert client._resolve_destination("variant name") == 0x22222222
+    assert client._resolve_destination("known variant") == 0x33333333
+    assert client._resolve_destination("1234") == 0x22222222
+    assert client._resolve_destination(_coerce_target_node(1234)) == 0x22222222
+    assert client._resolve_destination("4321") == 4321
+    assert client._resolve_destination("!11111111") == 0x11111111
+    assert client._resolve_destination("meshtastic:!11111111") == 0x11111111
+    assert client._resolve_destination("0x22222222") == 0x22222222
+
+    with pytest.raises(ValueError, match="not a known Meshtastic node"):
+        client._resolve_destination("Exact Long")
+    with pytest.raises(ValueError, match="not a known Meshtastic node"):
+        client._resolve_destination("missing")
+
+    client._nodes[0x44444444] = {
+        "user": {"id": "!44444444", "shortName": "node"}
+    }
+    with pytest.raises(ValueError, match="node name is ambiguous"):
+        client._resolve_destination("NODE")
+
+
 def test_cleanup_never_disconnects_while_session_io_owners_resist_cancellation() -> None:
     pytest.importorskip("meshtastic")
 

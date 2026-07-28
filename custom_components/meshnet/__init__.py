@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import math
+from collections.abc import Callable
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +33,8 @@ SERVICE_SEND_MESSAGE = "send_message"
 SERVICE_BROADCAST_MESSAGE = "broadcast_message"
 SERVICE_SCHEDULE_MESSAGE = "schedule_message"
 SERVICE_REFRESH_GATEWAY = "refresh_gateway"
+_SCHEDULED_CANCELS_ATTR = "_meshnet_scheduled_message_cancels"
+_SCHEDULED_UNLOAD_REGISTERED_ATTR = "_meshnet_scheduled_unload_registered"
 
 
 async def async_setup(hass, config: dict[str, Any]) -> bool:
@@ -84,6 +88,7 @@ async def async_setup_entry(hass, entry) -> bool:
                     "Failed to roll back MeshNet platforms after setup error: %s",
                     err,
                 )
+        _cancel_scheduled_messages(coordinator)
         try:
             await coordinator.async_shutdown()
         except BaseException as err:
@@ -109,6 +114,7 @@ async def async_unload_entry(hass, entry) -> bool:
     domain_data = hass.data.get(DOMAIN, {})
     coordinator = domain_data.get(entry.entry_id)
     if coordinator is not None:
+        _cancel_scheduled_messages(coordinator)
         await coordinator.async_shutdown()
         if domain_data.get(entry.entry_id) is coordinator:
             domain_data.pop(entry.entry_id, None)
@@ -144,7 +150,7 @@ def _async_register_services(hass) -> None:
     service_message_schema = vol.Schema(
         {
             vol.Required(ATTR_MESSAGE): cv.string,
-            vol.Optional(ATTR_TARGET_NODE): cv.string,
+            vol.Optional(ATTR_TARGET_NODE): _coerce_target_node,
             vol.Optional(ATTR_GATEWAY_ID): cv.string,
             vol.Optional(ATTR_CHANNEL): cv.string,
             vol.Optional(ATTR_PRIORITY, default="normal"): cv.string,
@@ -155,7 +161,7 @@ def _async_register_services(hass) -> None:
         {
             vol.Required(ATTR_MESSAGE): cv.string,
             vol.Required(ATTR_WHEN): cv.string,
-            vol.Optional(ATTR_TARGET_NODE): cv.string,
+            vol.Optional(ATTR_TARGET_NODE): _coerce_target_node,
             vol.Optional(ATTR_GATEWAY_ID): cv.string,
             vol.Optional(ATTR_CHANNEL): cv.string,
             vol.Optional(ATTR_PRIORITY, default="normal"): cv.string,
@@ -177,25 +183,139 @@ def _async_register_services(hass) -> None:
 
     async def schedule_message(call) -> None:
         coordinator = _get_coordinator(hass)
-        data = dict(call.data)
-        when = _parse_when(data.pop(ATTR_WHEN))
-        delay = max(0.0, (when - datetime.now(when.tzinfo)).total_seconds())
-
-        def _send(_: Any) -> None:
-            hass.async_create_task(coordinator.async_send_message(**service_fields(data)))
-
-        from homeassistant.helpers.event import async_call_later
-
-        async_call_later(hass, delay, _send)
+        _schedule_message_call(
+            hass,
+            coordinator,
+            dict(call.data),
+            service_fields=service_fields,
+        )
 
     async def refresh_gateway(call) -> None:
         coordinator = _get_coordinator(hass)
         await coordinator.async_gateway_refresh(call.data.get(ATTR_GATEWAY_ID))
 
-    hass.services.async_register(DOMAIN, SERVICE_SEND_MESSAGE, send_message, schema=service_message_schema)
-    hass.services.async_register(DOMAIN, SERVICE_BROADCAST_MESSAGE, broadcast_message, schema=service_message_schema)
-    hass.services.async_register(DOMAIN, SERVICE_SCHEDULE_MESSAGE, schedule_message, schema=service_schedule_schema)
-    hass.services.async_register(DOMAIN, SERVICE_REFRESH_GATEWAY, refresh_gateway, schema=service_refresh_schema)
+    hass.services.async_register(
+        DOMAIN, SERVICE_SEND_MESSAGE, send_message, schema=service_message_schema
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_BROADCAST_MESSAGE,
+        broadcast_message,
+        schema=service_message_schema,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SCHEDULE_MESSAGE,
+        schedule_message,
+        schema=service_schedule_schema,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_REFRESH_GATEWAY,
+        refresh_gateway,
+        schema=service_refresh_schema,
+    )
+
+
+def _coerce_target_node(value: Any) -> str:
+    """Normalize YAML node numbers without accepting booleans or fractions."""
+    if isinstance(value, bool):
+        raise ValueError("target_node must be a node number or non-empty string")
+    if isinstance(value, str):
+        target = value.strip()
+        if not target:
+            raise ValueError("target_node must not be empty")
+        return target
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return str(int(value))
+    raise ValueError("target_node must be a node number or non-empty string")
+
+
+def _scheduled_message_cancels(coordinator: Any) -> set[Callable[[], None]]:
+    """Return the cancellation callbacks owned by one config entry."""
+    callbacks = getattr(coordinator, _SCHEDULED_CANCELS_ATTR, None)
+    if callbacks is None:
+        callbacks = set()
+        setattr(coordinator, _SCHEDULED_CANCELS_ATTR, callbacks)
+    return callbacks
+
+
+def _cancel_scheduled_messages(coordinator: Any) -> None:
+    """Synchronously prevent every pending timer from crossing entry unload."""
+    callbacks = _scheduled_message_cancels(coordinator)
+    failure_count = 0
+    for cancel in tuple(callbacks):
+        try:
+            cancel()
+        except Exception:
+            # Home Assistant does not isolate individual async_on_unload
+            # callbacks. Continue fencing the remaining timers so one broken
+            # cancellation cannot leave the entry partially unloaded.
+            failure_count += 1
+    callbacks.clear()
+    if failure_count:
+        _LOGGER.warning(
+            "%d scheduled MeshNet timer cancellation callback(s) failed",
+            failure_count,
+        )
+
+
+def _schedule_message_call(
+    hass: Any,
+    coordinator: Any,
+    data: dict[str, Any],
+    *,
+    service_fields: Callable[[dict[str, Any]], dict[str, Any]],
+) -> None:
+    """Schedule one entry-owned send and retain its timer cancellation."""
+    from homeassistant.helpers.event import async_call_later
+
+    when = _parse_when(data.pop(ATTR_WHEN))
+    delay = max(0.0, (when - datetime.now(when.tzinfo)).total_seconds())
+    callbacks = _scheduled_message_cancels(coordinator)
+    active = True
+
+    def _send(_: Any) -> None:
+        nonlocal active
+        if not active:
+            return
+        active = False
+        callbacks.discard(cancel)
+        coordinator.entry.async_create_background_task(
+            hass,
+            coordinator.async_send_message(**service_fields(data)),
+            "MeshNet scheduled message",
+        )
+
+    cancel_timer = async_call_later(hass, delay, _send)
+
+    def cancel() -> None:
+        nonlocal active
+        if not active:
+            return
+        active = False
+        cancel_timer()
+        callbacks.discard(cancel)
+
+    callbacks.add(cancel)
+    if not getattr(coordinator, _SCHEDULED_UNLOAD_REGISTERED_ATTR, False):
+        try:
+            coordinator.entry.async_on_unload(
+                lambda: _cancel_scheduled_messages(coordinator)
+            )
+        except Exception:
+            try:
+                cancel()
+            except Exception:
+                callbacks.discard(cancel)
+                _LOGGER.warning(
+                    "A scheduled MeshNet timer could not be canceled after "
+                    "unload registration failed"
+                )
+            raise
+        setattr(coordinator, _SCHEDULED_UNLOAD_REGISTERED_ATTR, True)
 
 
 def _get_coordinator(hass):

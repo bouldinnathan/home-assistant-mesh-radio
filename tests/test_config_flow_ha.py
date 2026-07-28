@@ -10,13 +10,14 @@ from unittest.mock import AsyncMock
 import pytest
 
 pytest.importorskip("homeassistant")
-pytest.importorskip("voluptuous")
+vol = pytest.importorskip("voluptuous")
 
 from homeassistant.helpers.selector import (  # noqa: E402
     SelectSelector,
     TextSelector,
 )
 
+from custom_components.meshnet import _async_register_services  # noqa: E402
 from custom_components.meshnet import config_flow as config_flow_module  # noqa: E402
 from custom_components.meshnet.bluetooth_devices import BluetoothDevice  # noqa: E402
 from custom_components.meshnet.bluetooth_pairing import (  # noqa: E402
@@ -80,6 +81,47 @@ from custom_components.meshnet.const import (  # noqa: E402
 from custom_components.meshnet.serial_devices import SerialDevice  # noqa: E402
 
 ADAPTER_ADDRESS = "00:11:22:33:44:55"
+
+
+def test_service_schema_normalizes_yaml_node_numbers_without_boolean_coercion() -> None:
+    """Exercise the real Home Assistant/voluptuous action boundary."""
+    registrations = {}
+    coordinator = SimpleNamespace(async_send_message=AsyncMock())
+
+    class Services:
+        @staticmethod
+        def has_service(_domain, _service) -> bool:
+            return False
+
+        @staticmethod
+        def async_register(domain, service, handler, *, schema) -> None:
+            registrations[(domain, service)] = (handler, schema)
+
+    hass = SimpleNamespace(
+        services=Services(), data={DOMAIN: {"entry-id": coordinator}}
+    )
+    _async_register_services(hass)
+    handler, schema = registrations[(DOMAIN, "send_message")]
+
+    validated = schema({"message": "test", "target_node": 123456789})
+    assert validated["target_node"] == "123456789"
+    assert schema({"message": "test", "target_node": 123456789.0})[
+        "target_node"
+    ] == "123456789"
+    with pytest.raises(vol.MultipleInvalid):
+        schema({"message": "test", "target_node": True})
+    with pytest.raises(vol.MultipleInvalid):
+        schema({"message": "test", "target_node": 1.5})
+
+    asyncio.run(handler(SimpleNamespace(data=validated)))
+    coordinator.async_send_message.assert_awaited_once_with(
+        target_node="123456789",
+        message="test",
+        channel=None,
+        priority="normal",
+        message_type="broadcast",
+        gateway_id=None,
+    )
 
 
 def test_supported_home_assistant_has_entry_owned_background_tasks() -> None:

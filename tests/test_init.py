@@ -3,16 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import types
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from custom_components.meshnet import (
     _async_register_panel,
+    _cancel_scheduled_messages,
+    _coerce_target_node,
+    _schedule_message_call,
+    _scheduled_message_cancels,
     async_migrate_entry,
     async_remove_entry,
     async_setup_entry,
@@ -30,6 +36,188 @@ from custom_components.meshnet.const import (
 )
 
 ADAPTER_ADDRESS = "00:11:22:33:44:55"
+REPOSITORY_ROOT = Path(__file__).parents[1]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (123456789, "123456789"),
+        (123456789.0, "123456789"),
+        ("!12345678", "!12345678"),
+        ("  meshcore-destination  ", "meshcore-destination"),
+    ],
+)
+def test_target_node_accepts_safe_integer_or_text_values(
+    value, expected: str
+) -> None:
+    assert _coerce_target_node(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [True, False, 1.5, float("inf"), float("nan"), "", "   ", None, []],
+)
+def test_target_node_rejects_boolean_fractional_or_empty_values(value) -> None:
+    with pytest.raises(ValueError, match="target_node"):
+        _coerce_target_node(value)
+
+
+def test_action_metadata_has_no_unsupported_target_and_is_translated() -> None:
+    services = (REPOSITORY_ROOT / "custom_components/meshnet/services.yaml").read_text()
+    assert "\n  target:" not in services
+
+    strings = json.loads(
+        (REPOSITORY_ROOT / "custom_components/meshnet/strings.json").read_text()
+    )
+    english = json.loads(
+        (
+            REPOSITORY_ROOT
+            / "custom_components/meshnet/translations/en.json"
+        ).read_text()
+    )
+    expected_fields = {
+        "send_message": {
+            "target_node",
+            "gateway_id",
+            "message",
+            "priority",
+            "channel",
+            "message_type",
+        },
+        "broadcast_message": {
+            "gateway_id",
+            "message",
+            "priority",
+            "channel",
+            "message_type",
+        },
+        "schedule_message": {
+            "when",
+            "target_node",
+            "gateway_id",
+            "message",
+            "priority",
+            "channel",
+            "message_type",
+        },
+        "refresh_gateway": {"gateway_id"},
+    }
+    assert strings["services"] == english["services"]
+    for service, fields in expected_fields.items():
+        translation = strings["services"][service]
+        assert translation["name"]
+        assert translation["description"]
+        assert set(translation["fields"]) == fields
+
+
+def test_documented_meshnet_calls_use_current_action_syntax() -> None:
+    paths = [
+        REPOSITORY_ROOT / "DIAGNOSTICS_CHECKLIST.md",
+        REPOSITORY_ROOT / "docs/CONFIGURATION.md",
+        REPOSITORY_ROOT / "docs/TROUBLESHOOTING.md",
+        REPOSITORY_ROOT / "docs/USAGE.md",
+        REPOSITORY_ROOT / "examples/automations.yaml",
+    ]
+    assert all("service: meshnet." not in path.read_text() for path in paths)
+
+
+def test_scheduled_message_is_cancelled_before_successful_entry_unload(
+    monkeypatch,
+) -> None:
+    """A pending timer must not retain or call a coordinator after unload."""
+
+    async def run() -> None:
+        timer_callback = None
+        cancel_timer = MagicMock()
+
+        def async_call_later(_hass, delay, callback):
+            nonlocal timer_callback
+            assert delay > 0
+            timer_callback = callback
+            return cancel_timer
+
+        homeassistant = types.ModuleType("homeassistant")
+        helpers = types.ModuleType("homeassistant.helpers")
+        event = types.ModuleType("homeassistant.helpers.event")
+        event.async_call_later = async_call_later
+        exceptions = types.ModuleType("homeassistant.exceptions")
+        exceptions.HomeAssistantError = RuntimeError
+        homeassistant.helpers = helpers
+        monkeypatch.setitem(sys.modules, "homeassistant", homeassistant)
+        monkeypatch.setitem(sys.modules, "homeassistant.helpers", helpers)
+        monkeypatch.setitem(sys.modules, "homeassistant.helpers.event", event)
+        monkeypatch.setitem(sys.modules, "homeassistant.exceptions", exceptions)
+
+        unload_callbacks = []
+
+        class Entry:
+            entry_id = "entry-id"
+
+            def async_on_unload(self, callback) -> None:
+                unload_callbacks.append(callback)
+
+            def async_create_background_task(self, hass, target, name):
+                del hass, name
+                target.close()
+                raise AssertionError("cancelled scheduled message started")
+
+        coordinator = SimpleNamespace(
+            entry=Entry(),
+            async_send_message=AsyncMock(),
+            async_shutdown=AsyncMock(),
+        )
+        hass = SimpleNamespace(
+            data={DOMAIN: {coordinator.entry.entry_id: coordinator}},
+            config_entries=SimpleNamespace(
+                async_unload_platforms=AsyncMock(return_value=True)
+            ),
+        )
+        _schedule_message_call(
+            hass,
+            coordinator,
+            {
+                "when": "2999-01-01T00:00:00+00:00",
+                "message": "test",
+            },
+            service_fields=lambda data: {
+                "target_node": None,
+                "message": data["message"],
+            },
+        )
+
+        assert len(unload_callbacks) == 1
+        assert await async_unload_entry(hass, coordinator.entry) is True
+        cancel_timer.assert_called_once_with()
+        assert timer_callback is not None
+        timer_callback(None)
+        unload_callbacks[0]()
+        cancel_timer.assert_called_once_with()
+        coordinator.async_send_message.assert_not_awaited()
+        coordinator.async_shutdown.assert_awaited_once_with()
+
+    asyncio.run(run())
+
+
+def test_one_broken_timer_cancel_does_not_block_remaining_cleanup() -> None:
+    coordinator = SimpleNamespace()
+    callbacks = _scheduled_message_cancels(coordinator)
+    calls = []
+
+    def broken_cancel() -> None:
+        calls.append("broken")
+        raise RuntimeError("timer cancellation failed")
+
+    def healthy_cancel() -> None:
+        calls.append("healthy")
+
+    callbacks.update({broken_cancel, healthy_cancel})
+
+    _cancel_scheduled_messages(coordinator)
+
+    assert set(calls) == {"broken", "healthy"}
+    assert callbacks == set()
+    _cancel_scheduled_messages(coordinator)
 
 
 def test_setup_entry_does_not_wait_for_radio_sdk_startup(monkeypatch) -> None:
@@ -193,6 +381,10 @@ def test_setup_entry_rolls_back_forwarded_platforms_on_failure(
 
         async def fail_forward(_entry, _platforms) -> None:
             events.append("forward")
+            coordinator = hass.data[DOMAIN][_entry.entry_id]
+            _scheduled_message_cancels(coordinator).add(
+                lambda: events.append("cancel_schedule")
+            )
             raise RuntimeError("platform failed")
 
         async def unload_platforms(_entry, _platforms) -> bool:
@@ -215,6 +407,7 @@ def test_setup_entry_rolls_back_forwarded_platforms_on_failure(
             "refresh",
             "forward",
             "unload_platforms",
+            "cancel_schedule",
             "shutdown",
         ]
         assert "failed-entry" not in hass.data[DOMAIN]

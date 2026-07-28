@@ -1,4 +1,17 @@
 class MeshNetPanel extends HTMLElement {
+  constructor() {
+    super();
+    this._draft = {
+      recipient: "",
+      gateway: "",
+      message: "",
+      channel: "0",
+      priority: "normal",
+    };
+    this._sending = false;
+    this._sendStatus = null;
+  }
+
   set hass(hass) {
     this._hass = hass;
     if (!this._loaded) {
@@ -9,9 +22,9 @@ class MeshNetPanel extends HTMLElement {
 
   async _load() {
     try {
-      this._snapshot = await this._hass.callWS({ type: "meshnet/snapshot" });
-    } catch (err) {
-      this._error = err.message || String(err);
+      await this._refreshSnapshot();
+    } catch (_err) {
+      this._error = "Snapshot unavailable";
     }
     this._render();
     window.setTimeout(() => {
@@ -21,6 +34,7 @@ class MeshNetPanel extends HTMLElement {
   }
 
   _render() {
+    const composerFocus = this._composerFocusState();
     const snapshot = this._snapshot || { nodes: {}, gateways: {}, recent_messages: [] };
     const nodes = Object.values(snapshot.nodes || {});
     const gateways = Object.values(snapshot.gateways || {});
@@ -116,6 +130,53 @@ class MeshNetPanel extends HTMLElement {
         }
         .msg:first-of-type { border-top: 0; }
         .msg .meta { color: var(--secondary-text-color); font-size: 12px; }
+        .composer {
+          display: grid;
+          gap: 10px;
+        }
+        .composer label {
+          display: grid;
+          gap: 5px;
+          color: var(--secondary-text-color);
+          font-size: 12px;
+        }
+        .composer select, .composer textarea {
+          width: 100%;
+          box-sizing: border-box;
+          border: 1px solid var(--divider-color);
+          border-radius: 6px;
+          padding: 8px;
+          color: var(--primary-text-color);
+          background: var(--card-background-color);
+          font: inherit;
+        }
+        .composer textarea {
+          min-height: 92px;
+          resize: vertical;
+        }
+        .composer-controls {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 8px;
+        }
+        .composer button {
+          justify-self: start;
+          border: 0;
+          border-radius: 6px;
+          padding: 9px 16px;
+          color: var(--text-primary-color, #fff);
+          background: var(--primary-color);
+          cursor: pointer;
+          font: inherit;
+        }
+        .composer button:disabled {
+          cursor: default;
+          opacity: 0.55;
+        }
+        .send-status {
+          min-height: 18px;
+          font-size: 12px;
+        }
         .heat {
           display: grid;
           grid-template-columns: repeat(auto-fill, minmax(74px, 1fr));
@@ -161,6 +222,45 @@ class MeshNetPanel extends HTMLElement {
         </main>
         <aside class="side">
           <section class="panel">
+            <h2>Send message</h2>
+            <form class="composer" id="meshnet-send-form">
+              <label>
+                Recipient
+                <select id="meshnet-recipient">
+                  ${this._recipientOptions(nodes)}
+                </select>
+              </label>
+              <label>
+                Gateway
+                <select id="meshnet-gateway">
+                  ${this._gatewayOptions(gateways)}
+                </select>
+              </label>
+              <label>
+                Message
+                <textarea id="meshnet-message" required placeholder="Type a local mesh message">${this._escape(this._draft.message)}</textarea>
+              </label>
+              <div class="composer-controls">
+                <label>
+                  Channel
+                  <select id="meshnet-channel">
+                    ${Array.from({ length: 8 }, (_item, channel) => `<option value="${channel}"${this._selected(this._draft.channel, channel)}>${channel}</option>`).join("")}
+                  </select>
+                </label>
+                <label>
+                  Priority
+                  <select id="meshnet-priority">
+                    <option value="normal"${this._selected(this._draft.priority, "normal")}>Normal</option>
+                    <option value="high"${this._selected(this._draft.priority, "high")}>High</option>
+                    <option value="emergency"${this._selected(this._draft.priority, "emergency")}>Emergency</option>
+                  </select>
+                </label>
+              </div>
+              <button type="submit"${this._sending ? " disabled" : ""}>${this._sending ? "Sending…" : "Send"}</button>
+              <div class="send-status ${this._statusClass()}" role="status" aria-live="polite">${this._escape(this._sendStatus ? this._sendStatus.text : "")}</div>
+            </form>
+          </section>
+          <section class="panel">
             <h2>Gateways</h2>
             ${gateways.map((gateway) => `
               <div class="row">
@@ -205,6 +305,184 @@ class MeshNetPanel extends HTMLElement {
         </aside>
       </div>
     `;
+    this._bindComposer();
+    this._restoreComposerFocus(composerFocus);
+  }
+
+  _composerFocusState() {
+    const active = this.ownerDocument && this.ownerDocument.activeElement;
+    const fieldIds = [
+      "meshnet-recipient",
+      "meshnet-gateway",
+      "meshnet-message",
+      "meshnet-channel",
+      "meshnet-priority",
+    ];
+    if (!active || !this.contains(active) || !fieldIds.includes(active.id)) return null;
+    return {
+      id: active.id,
+      start: typeof active.selectionStart === "number" ? active.selectionStart : null,
+      end: typeof active.selectionEnd === "number" ? active.selectionEnd : null,
+    };
+  }
+
+  _restoreComposerFocus(state) {
+    if (!state) return;
+    const field = this.querySelector(`#${state.id}`);
+    if (!field) return;
+    field.focus();
+    if (state.start != null && typeof field.setSelectionRange === "function") {
+      field.setSelectionRange(state.start, state.end);
+    }
+  }
+
+  _bindComposer() {
+    const form = this.querySelector("#meshnet-send-form");
+    if (!form) return;
+
+    const fields = {
+      recipient: this.querySelector("#meshnet-recipient"),
+      gateway: this.querySelector("#meshnet-gateway"),
+      message: this.querySelector("#meshnet-message"),
+      channel: this.querySelector("#meshnet-channel"),
+      priority: this.querySelector("#meshnet-priority"),
+    };
+    Object.entries(fields).forEach(([key, field]) => {
+      if (!field) return;
+      const eventName = key === "message" ? "input" : "change";
+      field.addEventListener(eventName, () => {
+        this._draft[key] = field.value;
+      });
+    });
+    form.addEventListener("submit", (event) => this._sendMessage(event));
+  }
+
+  async _sendMessage(event) {
+    event.preventDefault();
+    if (this._sending) return;
+
+    const draft = { ...this._draft };
+    if (!draft.message.trim()) {
+      this._sendStatus = { kind: "bad", text: "Enter a message first." };
+      this._render();
+      return;
+    }
+    if (this._messageByteLength(draft.message) > 237) {
+      this._sendStatus = { kind: "bad", text: "Message must be 237 UTF-8 bytes or fewer." };
+      this._render();
+      return;
+    }
+
+    const recipient = draft.recipient.trim();
+    const gateway = draft.gateway.trim();
+    const priority = ["normal", "high", "emergency"].includes(draft.priority)
+      ? draft.priority
+      : "normal";
+    const channel = /^[0-7]$/.test(draft.channel) ? draft.channel : "0";
+    const payload = {
+      type: "meshnet/send_message",
+      message: draft.message,
+      channel,
+      priority,
+      message_type: recipient ? "direct" : "broadcast",
+    };
+    if (recipient) payload.target_node = recipient;
+    if (gateway) payload.gateway_id = gateway;
+
+    this._sending = true;
+    this._sendStatus = { kind: "warn", text: "Sending…" };
+    this._render();
+
+    try {
+      const result = await this._hass.callWS(payload);
+      if (!result || !result.message_id) throw new Error("Missing message identifier");
+
+      if (this._draft.message === draft.message) this._draft.message = "";
+      let snapshot = null;
+      try {
+        snapshot = await this._refreshSnapshot();
+      } catch (_err) {
+        // The send was accepted; a failed status refresh must not report it as failed.
+      }
+      const sentMessage = snapshot && (snapshot.recent_messages || []).find(
+        (message) => message.message_id === result.message_id,
+      );
+      const status = sentMessage && sentMessage.raw && sentMessage.raw.status;
+      this._sendStatus = status === "sent"
+        ? { kind: "good", text: "Message sent." }
+        : { kind: "warn", text: "Message queued for delivery." };
+    } catch (_err) {
+      this._sendStatus = { kind: "bad", text: "Message could not be submitted." };
+    } finally {
+      this._sending = false;
+      this._render();
+    }
+  }
+
+  _messageByteLength(message) {
+    return new TextEncoder().encode(String(message)).length;
+  }
+
+  async _refreshSnapshot() {
+    const snapshot = await this._hass.callWS({ type: "meshnet/snapshot" });
+    this._snapshot = snapshot;
+    this._error = null;
+    return snapshot;
+  }
+
+  _recipientOptions(nodes) {
+    const selected = String(this._draft.recipient || "");
+    const choices = nodes
+      .filter((node) => node && node.node_key != null && String(node.node_key))
+      .map((node) => ({
+        value: String(node.node_key),
+        label: String(node.long_name || node.user_name || node.short_name || node.node_id || node.node_key),
+      }))
+      .filter((choice, index, all) => all.findIndex((item) => item.value === choice.value) === index)
+      .sort((left, right) => left.label.localeCompare(right.label));
+    if (selected && !choices.some((choice) => choice.value === selected)) {
+      choices.push({ value: selected, label: `${selected} (currently unavailable)` });
+    }
+    return [
+      `<option value=""${this._selected(selected, "")}>Broadcast</option>`,
+      ...choices.map((choice) => {
+        const suffix = choice.label === choice.value ? "" : ` (${choice.value})`;
+        return `<option value="${this._escape(choice.value)}"${this._selected(selected, choice.value)}>${this._escape(choice.label + suffix)}</option>`;
+      }),
+    ].join("");
+  }
+
+  _gatewayOptions(gateways) {
+    const selected = String(this._draft.gateway || "");
+    const choices = gateways
+      .filter((gateway) => gateway && gateway.gateway_id != null && String(gateway.gateway_id))
+      .map((gateway) => ({
+        value: String(gateway.gateway_id),
+        label: String(gateway.name || gateway.gateway_id),
+        connected: Boolean(gateway.connected),
+      }))
+      .filter((choice, index, all) => all.findIndex((item) => item.value === choice.value) === index)
+      .sort((left, right) => left.label.localeCompare(right.label));
+    if (selected && !choices.some((choice) => choice.value === selected)) {
+      choices.push({ value: selected, label: selected, connected: false, unavailable: true });
+    }
+    return [
+      `<option value=""${this._selected(selected, "")}>Automatic</option>`,
+      ...choices.map((choice) => {
+        const identifier = choice.label === choice.value ? "" : ` (${choice.value})`;
+        const state = choice.unavailable ? " — unavailable" : choice.connected ? " — online" : " — offline";
+        return `<option value="${this._escape(choice.value)}"${this._selected(selected, choice.value)}>${this._escape(choice.label + identifier + state)}</option>`;
+      }),
+    ].join("");
+  }
+
+  _selected(value, expected) {
+    return String(value) === String(expected) ? " selected" : "";
+  }
+
+  _statusClass() {
+    const kind = this._sendStatus && this._sendStatus.kind;
+    return ["good", "warn", "bad"].includes(kind) ? kind : "";
   }
 
   _graph(nodes, links) {

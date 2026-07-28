@@ -18,11 +18,18 @@ MeshNet
 
 The panel shows:
 
+- A message composer with cached recipient and gateway dropdowns
 - Gateway online state
 - Node online state
 - Recent messages
 - Basic topology view
 - RF heat based on RSSI or SNR
+
+For the simplest test, open the sidebar panel, leave **Recipient** on
+**Broadcast**, leave **Gateway** on **Automatic**, enter a short message, and
+press **Send**. For a direct message, choose a cached node from the recipient
+dropdown. The dropdown submits the node's canonical identifier, so you do not
+need to copy a node number or short name manually.
 
 ## Verify Gateway Status
 
@@ -53,7 +60,7 @@ If a gateway is offline, run:
 Use Developer Tools -> Actions:
 
 ```yaml
-service: meshnet.refresh_gateway
+action: meshnet.refresh_gateway
 data:
   gateway_id: meshtastic_wifi_1
 ```
@@ -61,16 +68,19 @@ data:
 Refresh all gateways:
 
 ```yaml
-service: meshnet.refresh_gateway
+action: meshnet.refresh_gateway
 data: {}
 ```
 
 ## Send A Message
 
+The sidebar composer is the recommended interactive interface. Developer Tools
+-> Actions and automations can use the same backend with YAML.
+
 Broadcast:
 
 ```yaml
-service: meshnet.broadcast_message
+action: meshnet.broadcast_message
 data:
   gateway_id: meshtastic_wifi_1
   message: "Test from Home Assistant"
@@ -81,7 +91,7 @@ data:
 Direct:
 
 ```yaml
-service: meshnet.send_message
+action: meshnet.send_message
 data:
   gateway_id: meshtastic_wifi_1
   target_node: "!12345678"
@@ -91,10 +101,18 @@ data:
   message_type: direct
 ```
 
+For Meshtastic, `target_node` may be a full node ID such as `!12345678`, an
+integer node number, or an exact unique short/long name already present in the
+local Bluetooth node cache. Quote a numeric short name in YAML. Name matching
+is case-insensitive but never fuzzy; an unknown or duplicated name is rejected.
+When more than one gateway is configured, supply the matching `gateway_id` for
+a manually entered name. The sidebar dropdown remains safer because it uses the
+cached canonical ID and can select the node's last connected gateway.
+
 Schedule:
 
 ```yaml
-service: meshnet.schedule_message
+action: meshnet.schedule_message
 data:
   gateway_id: meshtastic_wifi_1
   when: "2026-05-16T21:00:00-05:00"
@@ -104,13 +122,15 @@ data:
 ```
 
 Scheduled timestamps must include a timezone.
+Pending schedules are in memory and are canceled when the MeshNet entry unloads
+or Home Assistant restarts.
 
 ## Known Good Radio Test
 
 Use a harmless broadcast on a test channel:
 
 ```yaml
-service: meshnet.broadcast_message
+action: meshnet.broadcast_message
 data:
   gateway_id: meshtastic_wifi_1
   message: "MeshNet test"

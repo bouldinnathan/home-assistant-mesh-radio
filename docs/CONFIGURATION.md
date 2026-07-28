@@ -349,7 +349,7 @@ MeshNet registers these Home Assistant services:
 Example:
 
 ```yaml
-service: meshnet.send_message
+action: meshnet.send_message
 data:
   gateway_id: meshtastic_wifi_1
   target_node: "!12345678"
@@ -358,6 +358,13 @@ data:
   priority: high
   message_type: direct
 ```
+
+For Meshtastic direct Bluetooth, `target_node` accepts a full `!` node ID, an
+integer node number, or one exact unique cached short/long name. Numeric names
+must be quoted in YAML. Partial, fuzzy, unknown, and ambiguous name matches are
+rejected. Specify the matching `gateway_id` when manually using a name with a
+multi-gateway entry. The MeshNet sidebar composer avoids manual identifiers by
+listing cached nodes in a dropdown.
 
 ## Entity Model
 

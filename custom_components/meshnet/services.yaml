@@ -1,11 +1,10 @@
 send_message:
-  target:
   fields:
     target_node:
       required: false
       selector:
         text:
-      example: "meshtastic:123456789"
+      example: "!12345678"
     gateway_id:
       required: false
       selector:
@@ -42,7 +41,6 @@ send_message:
             - emergency
 
 broadcast_message:
-  target:
   fields:
     gateway_id:
       required: false
@@ -76,7 +74,6 @@ broadcast_message:
             - emergency
 
 schedule_message:
-  target:
   fields:
     when:
       required: true
@@ -121,7 +118,6 @@ schedule_message:
             - emergency
 
 refresh_gateway:
-  target:
   fields:
     gateway_id:
       required: false

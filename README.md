@@ -1,6 +1,6 @@
 # MeshNet for Home Assistant
 
-MeshNet turns Home Assistant into one operating surface for Meshtastic and MeshCore radios. It creates gateway and node entities, records telemetry and messages, tracks GPS positions, exposes actions and events, and provides an admin-only mesh panel.
+MeshNet turns Home Assistant into one operating surface for Meshtastic and MeshCore radios. It creates gateway and node entities, records telemetry and messages, tracks GPS positions, exposes actions and events, and provides an admin-only mesh panel with cached recipient/gateway dropdowns for local message sending.
 
 > [!IMPORTANT]
 > The current package is an in-process Home Assistant custom integration. Use it

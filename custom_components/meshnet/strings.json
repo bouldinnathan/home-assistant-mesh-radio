@@ -257,6 +257,108 @@
       "pairing_timeout": "The pairing request expired. Start again promptly; if asked for a PIN, enter the displayed code within about 50 seconds."
     }
   },
+  "services": {
+    "send_message": {
+      "name": "Send mesh message",
+      "description": "Sends a text message through a connected MeshNet gateway.",
+      "fields": {
+        "target_node": {
+          "name": "Target node",
+          "description": "Optional full Meshtastic node ID, node number, or exact unique cached short/long name; MeshCore destinations are also accepted. Choose a node in the MeshNet panel when possible."
+        },
+        "gateway_id": {
+          "name": "Gateway ID",
+          "description": "Optional advanced gateway override. Leave empty to use a connected gateway automatically."
+        },
+        "message": {
+          "name": "Message",
+          "description": "Text to send over the mesh radio."
+        },
+        "priority": {
+          "name": "Priority",
+          "description": "Delivery priority for the outgoing message."
+        },
+        "channel": {
+          "name": "Channel",
+          "description": "Optional radio channel. Leave empty to use the gateway default."
+        },
+        "message_type": {
+          "name": "Message type",
+          "description": "How MeshNet should address the outgoing message."
+        }
+      }
+    },
+    "broadcast_message": {
+      "name": "Broadcast mesh message",
+      "description": "Broadcasts a text message through a connected MeshNet gateway.",
+      "fields": {
+        "gateway_id": {
+          "name": "Gateway ID",
+          "description": "Optional advanced gateway override. Leave empty to use a connected gateway automatically."
+        },
+        "message": {
+          "name": "Message",
+          "description": "Text to broadcast over the mesh radio."
+        },
+        "priority": {
+          "name": "Priority",
+          "description": "Delivery priority for the outgoing message."
+        },
+        "channel": {
+          "name": "Channel",
+          "description": "Optional radio channel. Leave empty to use the gateway default."
+        },
+        "message_type": {
+          "name": "Message type",
+          "description": "Broadcast or emergency delivery."
+        }
+      }
+    },
+    "schedule_message": {
+      "name": "Schedule mesh message",
+      "description": "Schedules a mesh message while this MeshNet entry remains loaded.",
+      "fields": {
+        "when": {
+          "name": "Send at",
+          "description": "ISO date and time with a timezone. The pending send is canceled if MeshNet unloads or Home Assistant restarts."
+        },
+        "target_node": {
+          "name": "Target node",
+          "description": "Optional full Meshtastic node ID, node number, or exact unique cached short/long name; MeshCore destinations are also accepted. Choose a node in the MeshNet panel when possible."
+        },
+        "gateway_id": {
+          "name": "Gateway ID",
+          "description": "Optional advanced gateway override. Leave empty to use a connected gateway automatically."
+        },
+        "message": {
+          "name": "Message",
+          "description": "Text to send over the mesh radio."
+        },
+        "priority": {
+          "name": "Priority",
+          "description": "Delivery priority for the outgoing message."
+        },
+        "channel": {
+          "name": "Channel",
+          "description": "Optional radio channel. Leave empty to use the gateway default."
+        },
+        "message_type": {
+          "name": "Message type",
+          "description": "How MeshNet should address the outgoing message."
+        }
+      }
+    },
+    "refresh_gateway": {
+      "name": "Refresh mesh gateway",
+      "description": "Refreshes one MeshNet gateway, or every gateway when no ID is supplied.",
+      "fields": {
+        "gateway_id": {
+          "name": "Gateway ID",
+          "description": "Optional advanced gateway override. Leave empty to refresh all configured gateways."
+        }
+      }
+    }
+  },
   "issues": {
     "gateway_issue": {
       "title": "MeshNet gateway issue",

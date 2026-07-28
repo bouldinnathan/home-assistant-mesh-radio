@@ -23,6 +23,7 @@ import logging
 import math
 import secrets
 import time
+import unicodedata
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import suppress
 from typing import Any
@@ -44,6 +45,14 @@ _BROADCAST_NUM = 0xFFFFFFFF
 _BROADCAST_ID = "^all"
 _NODELESS_WANT_CONFIG_ID = 69420
 _STREAM_END = object()
+_NODE_NAME_FIELDS = (
+    "shortName",
+    "longName",
+    "short_name",
+    "long_name",
+    "shortname",
+    "longname",
+)
 
 _CONNECTION_DIAGNOSTIC_FIELDS = frozenset(
     {
@@ -82,6 +91,15 @@ def _diagnostic_scalar(value: Any) -> str | bool | int | float | None:
     ):
         return value
     return None
+
+
+def _normalized_node_name(value: Any) -> str | None:
+    """Return one conservative key for exact case-insensitive name matching."""
+    if not isinstance(value, str):
+        return None
+    normalized = unicodedata.normalize("NFKC", value).strip().casefold()
+    return normalized or None
+
 
 type DeviceProvider = Callable[[], Any | Awaitable[Any]]
 type PacketCallback = Callable[[dict[str, Any]], Any | Awaitable[Any]]
@@ -1084,6 +1102,23 @@ class MeshtasticBluetoothClient:
                 )
                 if match is not None:
                     return match
+                normalized_name = _normalized_node_name(text)
+                name_matches = {
+                    num
+                    for num, node in self._nodes.items()
+                    if isinstance(node.get("user"), Mapping)
+                    and any(
+                        _normalized_node_name(node["user"].get(field))
+                        == normalized_name
+                        for field in _NODE_NAME_FIELDS
+                    )
+                }
+                if len(name_matches) > 1:
+                    raise ValueError(
+                        "destination_id Meshtastic node name is ambiguous"
+                    )
+                if name_matches:
+                    return next(iter(name_matches))
                 try:
                     destination = int(text, 10)
                 except ValueError as err:

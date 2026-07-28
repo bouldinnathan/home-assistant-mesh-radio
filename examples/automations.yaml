@@ -10,7 +10,7 @@
       to: "off"
       for: "00:02:00"
   action:
-    - service: meshnet.broadcast_message
+    - action: meshnet.broadcast_message
       data:
         message: "Internet outage detected by Home Assistant."
         priority: emergency
@@ -32,7 +32,7 @@
     - service: notify.notify
       data:
         message: "{{ trigger.to_state.name }} is below 15%."
-    - service: meshnet.broadcast_message
+    - action: meshnet.broadcast_message
       data:
         message: "{{ trigger.to_state.name }} battery below 15%."
         priority: high
@@ -49,7 +49,7 @@
     - service: notify.notify
       data:
         message: "Mesh repeater has not been heard for 30 minutes."
-    - service: meshnet.broadcast_message
+    - action: meshnet.broadcast_message
       data:
         message: "Mesh repeater has not been heard for 30 minutes."
         priority: high
@@ -62,7 +62,7 @@
       entity_id: binary_sensor.gate_door
       to: "on"
   action:
-    - service: meshnet.send_message
+    - action: meshnet.send_message
       data:
         target_node: "meshtastic:security"
         message: "Gate door opened."
@@ -121,7 +121,7 @@
       entity_id: sensor.proxmox_cpu_temperature
       above: 85
   action:
-    - service: meshnet.broadcast_message
+    - action: meshnet.broadcast_message
       data:
         message: "Proxmox CPU temperature above 85 C."
         priority: emergency
@@ -135,7 +135,7 @@
       entity_id: sensor.ups_battery_charge
       below: 25
   action:
-    - service: meshnet.broadcast_message
+    - action: meshnet.broadcast_message
       data:
         message: "UPS battery below 25%."
         priority: emergency

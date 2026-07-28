@@ -160,7 +160,7 @@ Settings -> Devices & Services -> Entities -> search "meshnet"
 Developer Tools service call:
 
 ```yaml
-service: meshnet.broadcast_message
+action: meshnet.broadcast_message
 data:
   message: "MeshNet test from Home Assistant"
   priority: normal

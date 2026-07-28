@@ -78,7 +78,7 @@ Check the transport:
 Wait for packets or force refresh:
 
 ```yaml
-service: meshnet.refresh_gateway
+action: meshnet.refresh_gateway
 data: {}
 ```
 
@@ -502,7 +502,7 @@ If unauthorized, configure `api_key`.
 Checks:
 
 ```yaml
-service: meshnet.refresh_gateway
+action: meshnet.refresh_gateway
 data: {}
 ```
 
@@ -560,23 +560,40 @@ Fix:
 
 ### Send Message Does Nothing
 
+If Home Assistant says a **device ID could not be found** after you enter a
+Meshtastic short name or node number, it is interpreting that value as a Home
+Assistant device-registry target. MeshNet versions before 0.5.7 incorrectly
+advertised that unsupported target type, so the request was rejected before
+MeshNet or the radio could see it. Upgrade, restart Home Assistant, and use the
+MeshNet sidebar recipient dropdown or the action's `target_node` data field.
+
 Checks:
 
-1. Is the gateway online?
-2. Did you pass `gateway_id`?
-3. For direct messages, has the node been heard recently?
-4. For MQTT, does `options.publish_topic` match the command topic consumed by your bridge?
-5. For MeshCore direct messages, is the destination contact known to the MeshCore SDK?
+1. Install MeshNet 0.5.7 or newer and restart Home Assistant.
+2. In the MeshNet sidebar, try **Broadcast** with **Automatic** gateway first.
+3. Is the gateway online?
+4. If you supplied `gateway_id`, is it the exact configured gateway ID?
+5. For direct messages, choose the node from the sidebar dropdown. In YAML, use
+   a full Meshtastic `!` node ID, integer node number, or exact unique cached
+   short/long name. Quote numeric short names.
+6. For MQTT, does `options.publish_topic` match the command topic consumed by your bridge?
+7. For MeshCore direct messages, is the destination contact known to the MeshCore SDK?
 
 Try broadcast first:
 
 ```yaml
-service: meshnet.broadcast_message
+action: meshnet.broadcast_message
 data:
-  gateway_id: meshtastic_wifi_1
   message: "MeshNet test"
   channel: "0"
 ```
+
+Then download diagnostics. If the MeshNet store and coordinator still report
+zero sent, queued, and received message records, Home Assistant did not submit
+the action to MeshNet. Check the action YAML for an unsupported `target:` block
+and use `action: meshnet.broadcast_message` with only the documented `data`
+fields. If a queued record appears, the action reached MeshNet and the gateway
+or destination error is the next item to inspect.
 
 ### Sidebar Panel Forbidden
 
