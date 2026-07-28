@@ -1,5 +1,14 @@
 # Upgrade Guide
 
+## From 0.5.5
+
+0.5.6 clears nonpersistent `no_gateways` and per-gateway startup repairs after
+the corresponding condition is demonstrably resolved. A healthy gateway no
+longer leaves an older startup warning active, while a currently empty setup or
+failed/cancelled gateway start retains its repair. Repair-registry failures are
+diagnostic-only and cannot block gateway startup. No configuration or database
+migration is required.
+
 ## From 0.5.4
 
 0.5.5 fixes the explicitly confirmed stale-bond recovery path for direct

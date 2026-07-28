@@ -814,19 +814,23 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                 severity=ir.IssueSeverity.ERROR,
             )
             return
+        self._delete_resolved_issue("no_gateways")
         results = await asyncio.gather(
             *(gateway.async_start() for gateway in self.gateways.values()),
             return_exceptions=True,
         )
         for gateway, result in zip(self.gateways.values(), results, strict=False):
-            if isinstance(result, Exception):
+            issue_id = self._gateway_issue_id(
+                "gateway_start", gateway.config.gateway_id
+            )
+            if isinstance(result, BaseException):
                 self._create_issue(
-                    issue_id=self._gateway_issue_id(
-                        "gateway_start", gateway.config.gateway_id
-                    ),
+                    issue_id=issue_id,
                     message=f"{gateway.config.name} failed to start: {result}",
                     severity=ir.IssueSeverity.WARNING,
                 )
+            else:
+                self._delete_resolved_issue(issue_id)
 
     async def _flush_outbox(
         self,
@@ -1151,6 +1155,26 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             else:
                 deleted += 1
         return deleted
+
+    def _delete_resolved_issue(self, issue_id: str) -> bool:
+        """Delete one identity-free resolved repair without affecting startup."""
+        if issue_id != "no_gateways" and _SAFE_GATEWAY_ISSUE_RE.fullmatch(
+            issue_id
+        ) is None:
+            return False
+        issue_deleter = getattr(ir, "async_delete_issue", None)
+        hass = getattr(self, "hass", None)
+        if not callable(issue_deleter) or hass is None:
+            return False
+        try:
+            issue_deleter(hass, DOMAIN, issue_id)
+        except Exception as err:
+            _LOGGER.debug(
+                "Could not remove one resolved MeshNet repair: %s",
+                type(err).__name__,
+            )
+            return False
+        return True
 
     def _repair_diagnostics(self) -> dict[str, Any]:
         """Return cached repair aggregates without issue identifiers or text."""

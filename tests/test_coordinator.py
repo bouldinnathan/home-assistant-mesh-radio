@@ -1266,6 +1266,146 @@ def test_gateway_issue_ids_do_not_expose_gateway_identity(monkeypatch) -> None:
     assert "private-gateway-id" not in issue_id
 
 
+def test_gateway_start_repairs_follow_current_outcomes(monkeypatch) -> None:
+    """Clear resolved indexed repairs while preserving the failed gateway."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+        coordinator = object.__new__(coordinator_class)
+        coordinator.hass = object()
+        first_config = GatewayConfig(
+            gateway_id="private-first-gateway",
+            name="Private First Gateway",
+            protocol=PROTOCOL_MESHTASTIC,
+            transport=TRANSPORT_TCP,
+        )
+        second_config = GatewayConfig(
+            gateway_id="private-second-gateway",
+            name="Private Second Gateway",
+            protocol=PROTOCOL_MESHTASTIC,
+            transport=TRANSPORT_TCP,
+        )
+        first = SimpleNamespace(
+            config=first_config,
+            async_start=AsyncMock(),
+        )
+        second = SimpleNamespace(
+            config=second_config,
+            async_start=AsyncMock(side_effect=RuntimeError("start failed")),
+        )
+        coordinator._gateway_configs = [first_config, second_config]
+        coordinator.gateways = {
+            first_config.gateway_id: first,
+            second_config.gateway_id: second,
+        }
+        issue_registry_module = coordinator_class._start_gateways.__globals__["ir"]
+        deleted: list[tuple[str, str]] = []
+        created: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            issue_registry_module,
+            "async_delete_issue",
+            lambda _hass, domain, issue_id: deleted.append((domain, issue_id)),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            issue_registry_module,
+            "async_create_issue",
+            lambda _hass, domain, issue_id, **_kwargs: created.append(
+                (domain, issue_id)
+            ),
+            raising=False,
+        )
+
+        await coordinator._start_gateways()
+
+        assert deleted == [
+            ("meshnet", "no_gateways"),
+            ("meshnet", "gateway_start_gateway_001"),
+        ]
+        assert created == [("meshnet", "gateway_start_gateway_002")]
+        assert all("private" not in issue_id for _domain, issue_id in deleted)
+        assert all("private" not in issue_id for _domain, issue_id in created)
+
+    asyncio.run(run())
+
+
+def test_resolved_issue_delete_failure_cannot_break_gateway_start(
+    monkeypatch,
+) -> None:
+    """A read-only repair registry cannot turn a healthy transport into failure."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+        coordinator = object.__new__(coordinator_class)
+        coordinator.hass = object()
+        config = GatewayConfig(
+            gateway_id="private-gateway",
+            name="Private Gateway",
+            protocol=PROTOCOL_MESHTASTIC,
+            transport=TRANSPORT_TCP,
+        )
+        start = AsyncMock()
+        coordinator._gateway_configs = [config]
+        coordinator.gateways = {
+            config.gateway_id: SimpleNamespace(config=config, async_start=start)
+        }
+        issue_registry_module = coordinator_class._start_gateways.__globals__["ir"]
+        attempted: list[str] = []
+
+        def fail_delete(_hass, _domain: str, issue_id: str) -> None:
+            attempted.append(issue_id)
+            raise RuntimeError("registry is temporarily read-only")
+
+        monkeypatch.setattr(
+            issue_registry_module,
+            "async_delete_issue",
+            fail_delete,
+            raising=False,
+        )
+
+        await coordinator._start_gateways()
+
+        start.assert_awaited_once_with()
+        assert attempted == ["no_gateways", "gateway_start_gateway_001"]
+
+    asyncio.run(run())
+
+
+def test_no_gateway_repair_is_preserved_until_a_gateway_exists(
+    monkeypatch,
+) -> None:
+    """An empty configuration still creates its repair and clears nothing."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+        coordinator = object.__new__(coordinator_class)
+        coordinator.hass = object()
+        coordinator._gateway_configs = []
+        coordinator.gateways = {}
+        issue_registry_module = coordinator_class._start_gateways.__globals__["ir"]
+        deleted: list[str] = []
+        created: list[str] = []
+        monkeypatch.setattr(
+            issue_registry_module,
+            "async_delete_issue",
+            lambda _hass, _domain, issue_id: deleted.append(issue_id),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            issue_registry_module,
+            "async_create_issue",
+            lambda _hass, _domain, issue_id, **_kwargs: created.append(issue_id),
+            raising=False,
+        )
+
+        await coordinator._start_gateways()
+
+        assert created == ["no_gateways"]
+        assert deleted == []
+
+    asyncio.run(run())
+
+
 def test_legacy_gateway_issues_are_deleted_without_touching_safe_keys(
     monkeypatch,
 ) -> None:
