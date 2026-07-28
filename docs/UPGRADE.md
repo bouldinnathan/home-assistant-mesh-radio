@@ -1,5 +1,25 @@
 # Upgrade Guide
 
+## From 0.4.2
+
+0.4.3 hardens the first live diagnostics release. Meshtastic diagnostics now
+show an identity-free startup phase, elapsed time, tracked native constructor,
+cached local-adapter validation summary, and last-start outcome. If Home
+Assistant cancels an internally owned startup while the synchronous SDK
+constructor is still running, MeshNet retains the late result, closes it, and
+keeps replacement clients serialized behind the endpoint lock until cleanup is
+confirmed.
+
+Coordinator diagnostics now use explicitly tracked update timestamps and add
+safe repair and entity-state aggregates. Setup removes legacy pre-0.4.2 repair
+IDs that could contain a configured gateway slug. No config-entry or database
+migration is required. Restart Home Assistant after updating so the component
+reloads and performs the legacy repair cleanup.
+
+Home Assistant's outer diagnostics wrapper and filename still include the
+config-entry ID and standard system metadata; inspect and rename the complete
+download before sharing it.
+
 ## From 0.4.1
 
 0.4.2 restores Home Assistant's native **Download diagnostics** action in the
@@ -7,19 +27,15 @@ MeshNet three-dot menu and greatly expands its cached health report. The
 diagnostics platform now uses the supported Home Assistant import path and
 reports integration/library versions, coordinator and transport task state,
 gateway counters, safe node radio and power telemetry, deduplication/rate-limit
-state, and detailed SQLite/outbox aggregates. Meshtastic diagnostics also expose
-an identity-free startup phase, elapsed time, tracked native constructor, and
-cached local-adapter validation summary so a blocked Bluetooth SDK constructor
-is distinguishable from pairing or adapter validation.
+state, and detailed SQLite/outbox aggregates.
 
 Diagnostics never connect, pair, scan, refresh, or transmit. Identifiers,
 addresses, names, credentials, message content, raw provider data, precise
 locations, and occupancy-related values remain omitted or redacted from
-MeshNet's `data` section. Setup removes legacy pre-0.4.2 repair IDs that could
-contain a gateway slug. Restart Home Assistant after updating so it reloads the
-diagnostics platform and performs that cleanup. Home Assistant's outer wrapper
-and filename still include the config-entry ID and standard system metadata;
-inspect and rename the complete download before sharing it.
+MeshNet's `data` section. Restart Home Assistant after updating so it reloads
+the diagnostics platform. Home Assistant's outer wrapper and filename still
+include the config-entry ID and standard system metadata; inspect and rename
+the complete download before sharing it.
 
 ## From 0.4.0
 
