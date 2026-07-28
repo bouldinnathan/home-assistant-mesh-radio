@@ -7,12 +7,19 @@ MeshNet three-dot menu and greatly expands its cached health report. The
 diagnostics platform now uses the supported Home Assistant import path and
 reports integration/library versions, coordinator and transport task state,
 gateway counters, safe node radio and power telemetry, deduplication/rate-limit
-state, and detailed SQLite/outbox aggregates.
+state, and detailed SQLite/outbox aggregates. Meshtastic diagnostics also expose
+an identity-free startup phase, elapsed time, tracked native constructor, and
+cached local-adapter validation summary so a blocked Bluetooth SDK constructor
+is distinguishable from pairing or adapter validation.
 
 Diagnostics never connect, pair, scan, refresh, or transmit. Identifiers,
 addresses, names, credentials, message content, raw provider data, precise
-locations, and occupancy-related values remain omitted or redacted. Restart
-Home Assistant after updating so it reloads the diagnostics platform.
+locations, and occupancy-related values remain omitted or redacted from
+MeshNet's `data` section. Setup removes legacy pre-0.4.2 repair IDs that could
+contain a gateway slug. Restart Home Assistant after updating so it reloads the
+diagnostics platform and performs that cleanup. Home Assistant's outer wrapper
+and filename still include the config-entry ID and standard system metadata;
+inspect and rename the complete download before sharing it.
 
 ## From 0.4.0
 

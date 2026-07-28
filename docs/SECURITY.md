@@ -190,7 +190,7 @@ current bond is the historical one MeshNet created.
 
 ## Diagnostics
 
-Diagnostics contain detailed cached health, lifecycle, version, telemetry, and
+MeshNet's `data` section contains detailed cached health, lifecycle, version, telemetry, and
 aggregate database information. Collection performs no radio connection,
 pairing, scan, refresh, or transmit operation. Reports exclude raw packets,
 message text, gateway and node identities/names, network addresses, serial
@@ -208,9 +208,11 @@ named like:
 - `secret`
 
 It also removes common credentials, URLs, IP/MAC addresses, serial paths, and
-long identifiers embedded inside diagnostic strings. Repair issue IDs use
+long identifiers embedded inside diagnostic strings. New repair issue IDs use
 non-identifying gateway ordinals because Home Assistant appends repair metadata
-outside the integration's own diagnostic payload.
+outside the integration's own diagnostic payload. During setup MeshNet also
+deletes pre-0.4.2 repair IDs that embedded a configured gateway slug; only
+aggregate issue categories and counts are exported by MeshNet.
 
 Home Assistant wraps MeshNet's payload with system information, installed
 custom-component metadata, setup timing, manifest data, and repair issues. It
@@ -218,6 +220,13 @@ also builds the downloaded filename from registry metadata: config-entry files
 contain the entry ID, while device files can contain the device name and
 registry ID even though MeshNet's JSON section is redacted. Inspect the entire
 Home Assistant wrapper and rename the file before sharing it publicly.
+
+Browser downloads commonly inherit a permissive host umask. Restrict a saved
+report before retaining it on a multi-user system:
+
+```bash
+chmod 600 config_entry-meshnet-*.json
+```
 
 Before sharing diagnostics publicly, still inspect the file manually.
 

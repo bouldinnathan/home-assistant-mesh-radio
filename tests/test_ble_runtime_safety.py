@@ -215,6 +215,111 @@ def test_meshtastic_ble_start_is_single_flight(monkeypatch) -> None:
     asyncio.run(run())
 
 
+def test_meshtastic_ble_diagnostics_track_pending_constructor(monkeypatch) -> None:
+    """A blocked SDK constructor must be visible without exposing its endpoint."""
+
+    async def run() -> None:
+        _install_fake_pubsub(monkeypatch)
+        hass = _ControlledExecutorHass()
+        interface = _FakeInterface()
+        client = _client(hass, interface, [])
+
+        start_waiter = asyncio.create_task(client.async_start())
+        await hass.constructor_started.wait()
+
+        diagnostics = client.diagnostic_snapshot()
+
+        assert diagnostics["startup_phase"] == "constructing_interface"
+        assert diagnostics["startup_elapsed_seconds"] is not None
+        assert diagnostics["startup_phase_elapsed_seconds"] is not None
+        assert diagnostics["native_constructor_state"] == "pending"
+        assert diagnostics["native_constructor_pending"] is True
+        assert diagnostics["native_executor_operation_count"] == 1
+        assert diagnostics["last_start_outcome"] == "pending"
+        assert diagnostics["bluetooth_adapter_validation"] == {
+            "status": "passed",
+            "adapter_count": 2,
+            "powered_adapter_count": 1,
+            "saved_adapter_is_powered": True,
+            "only_powered_adapter_matches": True,
+        }
+        serialized = repr(diagnostics)
+        assert "AA:BB:CC:DD:EE:FF" not in serialized
+        assert ADAPTER_ADDRESS not in serialized
+
+        hass.release_constructor.set()
+        await start_waiter
+        await asyncio.sleep(0)
+
+        completed = client.diagnostic_snapshot()
+        assert completed["startup_phase"] == "ready"
+        assert completed["native_constructor_pending"] is False
+        assert completed["native_executor_operation_count"] == 0
+        assert completed["last_start_outcome"] == "succeeded"
+        assert completed["last_start_duration_seconds"] is not None
+
+        await client.async_stop()
+
+    asyncio.run(run())
+
+
+def test_cancelled_internal_start_closes_late_constructor_before_replacement(
+    monkeypatch,
+) -> None:
+    """HA owner cancellation cannot orphan an interface or overlap replacement."""
+
+    async def run() -> None:
+        _install_fake_pubsub(monkeypatch)
+        hass = _ControlledExecutorHass()
+        old_interface = _FakeInterface()
+        new_interface = _FakeInterface()
+        old_client = _client(hass, old_interface, [])
+        new_client = _client(hass, new_interface, [])
+
+        old_waiter = asyncio.create_task(old_client.async_start())
+        await hass.constructor_started.wait()
+        old_owner = old_client._start_task
+        assert old_owner is not None
+
+        old_owner.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await old_waiter
+        await asyncio.sleep(0)
+
+        abandoned = old_client.diagnostic_snapshot()
+        assert abandoned["native_constructor_abandoned"] is True
+        assert abandoned["native_constructor_abandonment_count"] == 1
+        assert abandoned["native_constructor_pending"] is True
+        assert abandoned["native_endpoint_lock_held"] is True
+
+        replacement_waiter = asyncio.create_task(new_client.async_start())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert hass.executor_calls == 1
+        assert new_client._native_lock is None
+
+        hass.release_constructor.set()
+        await asyncio.wait_for(replacement_waiter, timeout=0.2)
+        await asyncio.sleep(0)
+
+        assert old_interface.close_calls == 1
+        assert old_client._native_constructor_future is None
+        assert old_client._native_constructor_cleanup_task is None
+        assert old_client._native_lock is None
+        assert old_client._native_constructor_abandoned is False
+        assert new_client._interface is new_interface
+        # Old constructor + old close + replacement constructor + replacement
+        # node refresh. The replacement cannot reach either of its calls until
+        # the old close releases the endpoint lock.
+        assert hass.executor_calls == 4
+
+        await new_client.async_stop()
+        assert new_interface.close_calls == 1
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize(
     ("saved_adapter", "details"),
     [

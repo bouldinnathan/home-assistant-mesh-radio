@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import re
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
@@ -81,7 +82,9 @@ async def _async_get_local_bluetooth_adapter_details() -> dict[str, Any]:
     return details
 
 
-async def _async_validate_ble_adapter(config: GatewayConfig) -> None:
+async def _async_validate_ble_adapter(
+    config: GatewayConfig,
+) -> dict[str, int | bool]:
     """Fail closed unless the paired adapter is the only powered local one.
 
     Meshtastic 2.7.11 does not expose an adapter argument for ``BLEInterface``.
@@ -129,10 +132,33 @@ async def _async_validate_ble_adapter(config: GatewayConfig) -> None:
         if powered:
             powered_adapters.add((adapter, adapter_address.upper()))
 
-    if len(powered_adapters) != 1 or next(iter(powered_adapters))[1] != saved_adapter_address:
+    saved_adapter_is_powered = any(
+        address == saved_adapter_address for _adapter, address in powered_adapters
+    )
+    if len(powered_adapters) != 1 or not saved_adapter_is_powered:
         raise RuntimeError(
             "The paired Bluetooth adapter must be the only powered local adapter"
         )
+    return {
+        "adapter_count": len(details),
+        "powered_adapter_count": len(powered_adapters),
+        "saved_adapter_is_powered": saved_adapter_is_powered,
+        "only_powered_adapter_matches": True,
+    }
+
+
+def _bluetooth_adapter_failure_category(error: Exception) -> str:
+    """Classify adapter validation without exposing adapter identity."""
+    message = str(error).casefold()
+    if "no verified local adapter" in message:
+        return "missing_verified_adapter_metadata"
+    if "only powered local adapter" in message:
+        return "powered_adapter_mismatch"
+    if "unavailable" in message or "could not verify" in message:
+        return "adapter_service_unavailable"
+    if "incomplete or invalid" in message:
+        return "invalid_adapter_data"
+    return "adapter_validation_failed"
 
 
 class MeshtasticClient(MeshGateway):
@@ -146,7 +172,25 @@ class MeshtasticClient(MeshGateway):
         self._start_task: asyncio.Task[None] | None = None
         self._stop_task: asyncio.Task[None] | None = None
         self._native_lock: asyncio.Lock | None = None
+        self._native_constructor_future: asyncio.Future[Any] | None = None
+        self._native_constructor_abandoned = False
+        self._native_constructor_abandonment_count = 0
+        self._native_constructor_cleanup_task: asyncio.Task[Any] | None = None
         self._native_executor_tasks: dict[int, set[asyncio.Future[Any]]] = {}
+        self._startup_phase = "idle"
+        self._startup_phase_started_monotonic: float | None = None
+        self._startup_started_monotonic: float | None = None
+        self._last_start_duration_seconds: float | None = None
+        self._last_start_outcome = "not_started"
+        self._last_start_exception_type: str | None = None
+        self._last_start_failed_phase: str | None = None
+        self._bluetooth_adapter_validation: dict[str, Any] = {
+            "status": (
+                "not_started"
+                if self.config.transport == TRANSPORT_BLUETOOTH
+                else "not_applicable"
+            )
+        }
         self._pub = None
         self._receive_handler = None
         self._connect_handler = None
@@ -164,6 +208,10 @@ class MeshtasticClient(MeshGateway):
     def diagnostic_snapshot(self) -> dict[str, Any]:
         """Return cached Meshtastic lifecycle state without SDK or endpoint data."""
         snapshot = super().diagnostic_snapshot()
+        constructor = self._native_constructor_future
+        constructor_pending = constructor is not None and not constructor.done()
+        startup_pending = self.start_pending
+        now = time.monotonic()
         snapshot.update(
             {
                 "interface_active": self._interface is not None,
@@ -174,8 +222,23 @@ class MeshtasticClient(MeshGateway):
                 "native_endpoint_lock_held": (
                     self._native_lock is not None and self._native_lock.locked()
                 ),
-                "native_executor_operation_count": sum(
-                    len(tasks) for tasks in self._native_executor_tasks.values()
+                "native_constructor_state": self._diagnostic_task_state(
+                    constructor
+                ),
+                "native_constructor_pending": constructor_pending,
+                "native_constructor_abandoned": self._native_constructor_abandoned,
+                "native_constructor_abandonment_count": (
+                    self._native_constructor_abandonment_count
+                ),
+                "native_constructor_cleanup": self._diagnostic_task_state(
+                    self._native_constructor_cleanup_task
+                ),
+                "native_executor_operation_count": (
+                    int(constructor_pending)
+                    + sum(
+                        len(tasks)
+                        for tasks in self._native_executor_tasks.values()
+                    )
                 ),
                 "native_interface_executor_count": len(self._native_executor_tasks),
                 "native_subscription_count": sum(
@@ -186,9 +249,81 @@ class MeshtasticClient(MeshGateway):
                         self._disconnect_handler,
                     )
                 ),
+                "startup_phase": self._startup_phase,
+                "startup_elapsed_seconds": (
+                    round(now - self._startup_started_monotonic, 3)
+                    if startup_pending
+                    and self._startup_started_monotonic is not None
+                    else None
+                ),
+                "startup_phase_elapsed_seconds": (
+                    round(now - self._startup_phase_started_monotonic, 3)
+                    if startup_pending
+                    and self._startup_phase_started_monotonic is not None
+                    else None
+                ),
+                "last_start_duration_seconds": self._last_start_duration_seconds,
+                "last_start_outcome": self._last_start_outcome,
+                "last_start_exception_type": self._last_start_exception_type,
+                "last_start_failed_phase": self._last_start_failed_phase,
+                "bluetooth_adapter_validation": dict(
+                    self._bluetooth_adapter_validation
+                ),
             }
         )
         return snapshot
+
+    def _set_startup_phase(self, phase: str) -> None:
+        """Set one identity-free startup phase for cached diagnostics."""
+        self._startup_phase = phase
+        self._startup_phase_started_monotonic = time.monotonic()
+
+    def _schedule_abandoned_constructor_cleanup(
+        self,
+        constructor: asyncio.Future[Any],
+    ) -> None:
+        """Close a constructor result whose startup owner was cancelled."""
+        if not self._native_constructor_abandoned or not constructor.done():
+            return
+        cleanup_task = self._native_constructor_cleanup_task
+        if cleanup_task is not None and not cleanup_task.done():
+            return
+        try:
+            interface = constructor.result()
+        except asyncio.CancelledError:
+            if self._native_constructor_future is constructor:
+                self._native_constructor_future = None
+            self._release_native_lock()
+            return
+        except Exception:
+            if self._native_constructor_future is constructor:
+                self._native_constructor_future = None
+            self._release_native_lock()
+            return
+
+        async def cleanup_late_interface() -> None:
+            try:
+                await self._async_close_interface(
+                    interface,
+                    release_native_lock=True,
+                )
+            finally:
+                if self._native_constructor_future is constructor:
+                    self._native_constructor_future = None
+
+        cleanup_task = self._async_create_background_task(
+            cleanup_late_interface(),
+            "MeshNet abandoned Meshtastic constructor cleanup",
+        )
+        self._native_constructor_cleanup_task = cleanup_task
+
+        def cleanup_done(done_task: asyncio.Task[Any]) -> None:
+            if self._native_constructor_cleanup_task is done_task:
+                self._native_constructor_cleanup_task = None
+            if not done_task.cancelled():
+                done_task.exception()
+
+        cleanup_task.add_done_callback(cleanup_done)
 
     async def async_start(self) -> None:
         """Start the Meshtastic transport."""
@@ -215,14 +350,43 @@ class MeshtasticClient(MeshGateway):
 
     async def _async_start_once(self) -> None:
         """Start one transport instance."""
-        if self.config.transport == TRANSPORT_MQTT:
-            if self._unsub_mqtt is not None:
-                return
-            await self._start_mqtt()
-            return
-        if self._interface is not None:
-            return
-        await self._start_native()
+        self._startup_started_monotonic = time.monotonic()
+        self._last_start_duration_seconds = None
+        self._last_start_outcome = "pending"
+        self._last_start_exception_type = None
+        self._last_start_failed_phase = None
+        self._set_startup_phase("starting")
+        try:
+            if self.config.transport == TRANSPORT_MQTT:
+                if self._unsub_mqtt is None:
+                    self._set_startup_phase("subscribing_mqtt")
+                    await self._start_mqtt()
+            elif self._interface is None:
+                await self._start_native()
+        except asyncio.CancelledError:
+            self._last_start_outcome = "cancelled"
+            self._last_start_failed_phase = self._startup_phase
+            self._set_startup_phase("cancelled")
+            raise
+        except Exception as err:
+            self._last_start_outcome = "failed"
+            self._last_start_exception_type = type(err).__name__
+            self._last_start_failed_phase = self._startup_phase
+            self._set_startup_phase("failed")
+            raise
+        else:
+            if self._stopping:
+                self._last_start_outcome = "stopped_during_start"
+                self._set_startup_phase("stopped")
+            else:
+                self._last_start_outcome = "succeeded"
+                self._set_startup_phase("ready")
+        finally:
+            if self._startup_started_monotonic is not None:
+                self._last_start_duration_seconds = round(
+                    time.monotonic() - self._startup_started_monotonic,
+                    3,
+                )
 
     def _start_done(self, task: asyncio.Task[None]) -> None:
         """Clear the single-flight start task without disturbing a newer one."""
@@ -255,6 +419,7 @@ class MeshtasticClient(MeshGateway):
             # Set this before scheduling cleanup so an executor constructor that
             # finishes concurrently cannot publish its interface as connected.
             self._stopping = True
+            self._set_startup_phase("stopping")
             stop_task = self.hass.async_create_task(self._async_stop_once())
             self._stop_task = stop_task
             stop_task.add_done_callback(self._stop_done)
@@ -285,6 +450,11 @@ class MeshtasticClient(MeshGateway):
                     pass
         finally:
             await self._async_cleanup_transport(emit_status=True)
+            self._set_startup_phase(
+                "stopping_waiting_for_start"
+                if self.start_pending
+                else "stopped"
+            )
 
     async def _async_cleanup_transport(self, *, emit_status: bool) -> None:
         """Detach transport state and close its interface idempotently."""
@@ -416,6 +586,7 @@ class MeshtasticClient(MeshGateway):
         if lock is None:
             return
         self._native_lock = None
+        self._native_constructor_abandoned = False
         if lock.locked():
             lock.release()
 
@@ -502,12 +673,23 @@ class MeshtasticClient(MeshGateway):
 
     async def _start_native(self) -> None:
         if self.config.transport == TRANSPORT_BLUETOOTH:
+            self._set_startup_phase("validating_bluetooth_adapter")
+            self._bluetooth_adapter_validation = {"status": "pending"}
             try:
-                await _async_validate_ble_adapter(self.config)
+                adapter_summary = await _async_validate_ble_adapter(self.config)
             except Exception as err:
+                self._bluetooth_adapter_validation = {
+                    "status": "failed",
+                    "failure_category": _bluetooth_adapter_failure_category(err),
+                    "exception_type": type(err).__name__,
+                }
                 if not self._stopping:
                     await self._emit_error(err)
                 raise
+            self._bluetooth_adapter_validation = {
+                "status": "passed",
+                **adapter_summary,
+            }
             if self._stopping:
                 return
 
@@ -540,6 +722,7 @@ class MeshtasticClient(MeshGateway):
                 lambda: self.hass.async_create_task(self._set_connected(False))
             )
 
+        self._set_startup_phase("waiting_for_endpoint_lock")
         native_lock = _native_endpoint_lock(self._native_endpoint())
         await native_lock.acquire()
         self._native_lock = native_lock
@@ -547,13 +730,38 @@ class MeshtasticClient(MeshGateway):
             self._release_native_lock()
             return
 
+        self._set_startup_phase("constructing_interface")
+        self._native_constructor_abandoned = False
+        constructor = asyncio.ensure_future(
+            self.hass.async_add_executor_job(self._make_native_interface)
+        )
+        if isinstance(constructor, asyncio.Task):
+            constructor.set_name("MeshNet Meshtastic native interface constructor")
+        self._native_constructor_future = constructor
+
+        def constructor_done(done_future: asyncio.Future[Any]) -> None:
+            if not done_future.cancelled():
+                done_future.exception()
+            self._schedule_abandoned_constructor_cleanup(done_future)
+
+        constructor.add_done_callback(constructor_done)
         try:
-            interface = await self.hass.async_add_executor_job(self._make_native_interface)
+            interface = await asyncio.shield(constructor)
+        except asyncio.CancelledError:
+            if not self._native_constructor_abandoned:
+                self._native_constructor_abandonment_count += 1
+            self._native_constructor_abandoned = True
+            self._schedule_abandoned_constructor_cleanup(constructor)
+            raise
         except Exception as err:
+            if self._native_constructor_future is constructor:
+                self._native_constructor_future = None
             self._release_native_lock()
             if not self._stopping:
                 await self._emit_error(err)
             raise
+        if self._native_constructor_future is constructor:
+            self._native_constructor_future = None
 
         if self._stopping:
             await self._async_close_interface(
@@ -567,6 +775,7 @@ class MeshtasticClient(MeshGateway):
         self._receive_handler = receive_handler
         self._connect_handler = connect_handler
         self._disconnect_handler = disconnect_handler
+        self._set_startup_phase("subscribing_native_events")
         try:
             pub.subscribe(receive_handler, "meshtastic.receive")
             pub.subscribe(connect_handler, "meshtastic.connection.established")
@@ -582,9 +791,11 @@ class MeshtasticClient(MeshGateway):
                 await self._emit_error(err)
             raise
         try:
+            self._set_startup_phase("marking_connected")
             await self._set_connected(True)
             if self._stopping:
                 return
+            self._set_startup_phase("refreshing_nodes")
             await self.async_refresh()
         except BaseException:
             if self._interface is interface:

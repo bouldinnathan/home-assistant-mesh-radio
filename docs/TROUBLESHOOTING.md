@@ -339,6 +339,22 @@ Remove gateway** and enable **Remove this radio's current Bluetooth bond (may
 disconnect other apps)**. The option is off by default because BlueZ cannot
 distinguish a bond another app recreated at the same address.
 
+Download diagnostics before reloading. For a stalled SDK constructor, the
+identity-free fields normally show:
+
+```text
+runtime.gateways[0].client.startup_phase: constructing_interface
+runtime.gateways[0].client.native_constructor_pending: true
+runtime.gateways[0].client.native_executor_operation_count: 1
+runtime.gateways[0].client.bluetooth_adapter_validation.status: passed
+```
+
+This means adapter validation and endpoint locking completed, but the
+Meshtastic BLE constructor has not returned. Check for another connected phone
+or computer, wake/restart the radio's Bluetooth, and then reload the MeshNet
+entry. The elapsed fields show how long the current phase has been pending;
+diagnostic collection itself does not probe or reconnect the radio.
+
 On Home Assistant OS, do not use root-shell or `bluetoothctl` steps for the
 normal version 0.4 path. The wizard creates a temporary agent scoped to the
 selected radio and cleans it up after success, error, cancellation, or timeout.

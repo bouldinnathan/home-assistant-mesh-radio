@@ -351,6 +351,33 @@ def _safe_gateway_configuration(data: Mapping[str, Any]) -> dict[str, Any]:
         )
         if isinstance(options.get(key), (bool, int, float))
     }
+    represented_gateway_keys = {
+        "api_key",
+        "api_url",
+        "ble_address",
+        "gateway_id",
+        "host",
+        "mqtt_topic",
+        "name",
+        "options",
+        "port",
+        "protocol",
+        "serial_path",
+        "transport",
+    }
+    represented_option_keys = {
+        "baudrate",
+        "bluetooth_adapter",
+        "bluetooth_adapter_address",
+        "bluetooth_bond_managed",
+        "debug",
+        "message_poll_interval",
+        "mqtt_node_id",
+        "pin",
+        "publish_topic",
+        "scan_interval",
+        "send_url",
+    }
     return {
         "protocol": data.get("protocol"),
         "transport": data.get("transport"),
@@ -375,6 +402,15 @@ def _safe_gateway_configuration(data: Mapping[str, Any]) -> dict[str, Any]:
             "pin_configured": bool(options.get("pin")),
         },
         "safe_options": safe_options,
+        "omitted_identity_field_count": sum(
+            key in data for key in ("gateway_id", "name")
+        ),
+        "omitted_unknown_field_count": len(
+            set(map(str, data)) - represented_gateway_keys
+        ),
+        "omitted_unknown_option_count": len(
+            set(map(str, options)) - represented_option_keys
+        ),
     }
 
 
@@ -397,7 +433,10 @@ def _safe_entry_values(data: Mapping[str, Any]) -> dict[str, Any]:
             for gateway in gateways
             if isinstance(gateway, Mapping)
         ]
-    safe["omitted_value_count"] = max(0, len(data) - len(safe))
+    represented_top_level_keys = set(safe)
+    safe["omitted_top_level_value_count"] = len(
+        set(map(str, data)) - represented_top_level_keys
+    )
     return safe
 
 
@@ -503,12 +542,20 @@ def _safe_gateway_device(
 def _privacy_metadata() -> dict[str, Any]:
     """Describe intentionally omitted data so a diagnostic is self-explanatory."""
     return {
-        "policy_version": 2,
+        "policy_version": 3,
         "cached_state_only": True,
         "radio_operations_performed": False,
+        "scope": "MeshNet-owned data section",
+        "native_home_assistant_wrapper": {
+            "controlled_by_meshnet": False,
+            "may_include_config_entry_id": True,
+            "may_include_device_name_and_registry_id": True,
+            "may_include_system_versions_and_timezone": True,
+            "inspect_and_rename_before_sharing": True,
+        },
         "omitted": [
-            "credentials and pairing PINs",
-            "entry, gateway, node, packet, message, and provider identifiers",
+            "credentials and pairing PINs from the MeshNet data section",
+            "entry, gateway, node, packet, message, and provider identifiers from the MeshNet data section",
             "gateway and node names",
             "network addresses, serial paths, URLs, and MQTT topics",
             "raw packets, payloads, message text, send targets, and channels",
@@ -557,16 +604,22 @@ def _registry_diagnostics(
         for device in devices
     )
     state_health: Counter[str] = Counter()
+    domain_state_health: dict[str, Counter[str]] = {}
     states = getattr(hass, "states", None)
     if states is not None:
         for entity in entities:
+            domain = entity.entity_id.partition(".")[0]
+            domain_health = domain_state_health.setdefault(domain, Counter())
             state = states.get(entity.entity_id)
             if state is None:
                 state_health["not_registered_in_state_machine"] += 1
+                domain_health["not_registered_in_state_machine"] += 1
             elif state.state in {"unknown", "unavailable"}:
                 state_health[state.state] += 1
+                domain_health[state.state] += 1
             else:
                 state_health["available"] += 1
+                domain_health["available"] += 1
 
     return {
         "available": True,
@@ -577,6 +630,10 @@ def _registry_diagnostics(
         "entity_category_counts": dict(sorted(entity_categories.items())),
         "device_enabled_counts": dict(sorted(device_disabled.items())),
         "entity_state_health": dict(sorted(state_health.items())),
+        "entity_domain_state_health": {
+            domain: dict(sorted(counts.items()))
+            for domain, counts in sorted(domain_state_health.items())
+        },
     }
 
 

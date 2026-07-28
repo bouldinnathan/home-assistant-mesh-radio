@@ -65,5 +65,8 @@ jobs:
           pytest -q
           tests/test_config_flow_ha.py
           tests/test_bluetooth_pairing.py
+          tests/test_ble_runtime_safety.py
+          tests/test_clients.py
+          tests/test_coordinator.py
           tests/test_diagnostics.py
       - run: python -m pip check

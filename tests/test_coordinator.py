@@ -1266,6 +1266,134 @@ def test_gateway_issue_ids_do_not_expose_gateway_identity(monkeypatch) -> None:
     assert "private-gateway-id" not in issue_id
 
 
+def test_legacy_gateway_issues_are_deleted_without_touching_safe_keys(
+    monkeypatch,
+) -> None:
+    """Upgrade cleanup removes old name-derived IDs from HA diagnostics."""
+    coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+    coordinator = object.__new__(coordinator_class)
+    coordinator.hass = object()
+    issue_registry_module = (
+        coordinator_class._delete_legacy_gateway_issues.__globals__["ir"]
+    )
+    legacy_ids = {
+        "gateway_start_private-home-radio_12345678",
+        "send_failed_private-home-radio_12345678",
+        "unsupported_protocol_private-home-radio_12345678",
+    }
+    safe_id = "gateway_start_gateway_001"
+    unrelated_id = "no_gateways"
+    registry = SimpleNamespace(
+        issues={
+            **{
+                ("meshnet", issue_id): SimpleNamespace(active=False)
+                for issue_id in legacy_ids
+            },
+            ("meshnet", safe_id): SimpleNamespace(active=True),
+            ("meshnet", unrelated_id): SimpleNamespace(active=True),
+            ("other_domain", "gateway_start_private"): SimpleNamespace(
+                active=True
+            ),
+        }
+    )
+    deleted: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        issue_registry_module,
+        "async_get",
+        lambda _hass: registry,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        issue_registry_module,
+        "async_delete_issue",
+        lambda _hass, domain, issue_id: deleted.append((domain, issue_id)),
+        raising=False,
+    )
+
+    count = coordinator._delete_legacy_gateway_issues()
+
+    assert count == len(legacy_ids)
+    assert set(deleted) == {("meshnet", issue_id) for issue_id in legacy_ids}
+    assert ("meshnet", safe_id) not in deleted
+    assert ("meshnet", unrelated_id) not in deleted
+
+
+def test_legacy_issue_cleanup_failure_cannot_block_setup(monkeypatch) -> None:
+    """A registry anomaly is diagnostic-only and never a setup dependency."""
+    coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+    coordinator = object.__new__(coordinator_class)
+    coordinator.hass = object()
+    issue_registry_module = (
+        coordinator_class._delete_legacy_gateway_issues.__globals__["ir"]
+    )
+    registry = SimpleNamespace(
+        issues={
+            (
+                "meshnet",
+                "gateway_start_private-home-radio_12345678",
+            ): SimpleNamespace(active=False)
+        }
+    )
+    monkeypatch.setattr(
+        issue_registry_module,
+        "async_get",
+        lambda _hass: registry,
+        raising=False,
+    )
+
+    def fail_delete(*_args) -> None:
+        raise RuntimeError("registry is temporarily read-only")
+
+    monkeypatch.setattr(
+        issue_registry_module,
+        "async_delete_issue",
+        fail_delete,
+        raising=False,
+    )
+
+    assert coordinator._delete_legacy_gateway_issues() == 0
+
+
+def test_update_cycle_tracks_real_success_timestamp_and_duration(monkeypatch) -> None:
+    """Diagnostics must not depend on a coordinator attribute HA never sets."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+        coordinator = object.__new__(coordinator_class)
+        coordinator.history_days = 30
+        coordinator.snapshot = MeshSnapshot()
+        coordinator._last_update_attempt_at = None
+        coordinator._last_update_success_at = None
+        coordinator._last_update_duration_seconds = None
+        coordinator._last_update_error_category = None
+
+        class Store:
+            async def async_prune(self, history_days: int) -> None:
+                assert history_days == 30
+
+            async def async_recent_messages(self, limit: int):
+                assert limit == 100
+                return []
+
+            async def async_messages_since(self, _timestamp) -> int:
+                return 0
+
+        coordinator.store = Store()
+        coordinator._mark_stale_nodes = lambda: None
+        coordinator._mesh_health_score = lambda: 100.0
+
+        result = await coordinator._async_update_data()
+
+        assert result is coordinator.snapshot
+        assert coordinator._last_update_attempt_at is not None
+        assert coordinator._last_update_success_at is not None
+        assert coordinator._last_update_duration_seconds is not None
+        assert coordinator._last_update_duration_seconds >= 0
+        assert coordinator._last_update_error_category is None
+
+    asyncio.run(run())
+
+
 def test_reconnect_loop_retries_with_increasing_backoff(monkeypatch) -> None:
     """A failed reconnect remains single-flight and retries until connected."""
 

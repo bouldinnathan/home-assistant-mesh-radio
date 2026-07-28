@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
+import time
 from collections import Counter
 from collections.abc import Coroutine, Iterable
 from datetime import UTC, datetime, timedelta
@@ -67,6 +69,15 @@ _RECONNECT_MAX_DELAY = 300.0
 _RECONNECT_JITTER_RATIO = 0.2
 _GATEWAY_TASK_CANCEL_TIMEOUT = 2.0
 _DIAGNOSTIC_STORE_TIMEOUT = 2.0
+_GATEWAY_ISSUE_CATEGORIES = (
+    "gateway_start",
+    "send_failed",
+    "unsupported_protocol",
+)
+_SAFE_GATEWAY_ISSUE_RE = re.compile(
+    r"^(?:gateway_start|send_failed|unsupported_protocol)_gateway_"
+    r"(?:[0-9]{3}|unknown)$"
+)
 
 
 def _diagnostic_task_state(task: asyncio.Future[Any] | None) -> str:
@@ -123,6 +134,11 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         self._gateway_generation = 0
         self._shutting_down = False
         self._reconnect_suspended = False
+        self._last_update_attempt_at: datetime | None = None
+        self._last_update_success_at: datetime | None = None
+        self._last_update_duration_seconds: float | None = None
+        self._last_update_error_category: str | None = None
+        self._legacy_issue_cleanup_count = 0
         super().__init__(
             hass,
             _LOGGER,
@@ -133,6 +149,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         )
 
     async def _async_setup(self) -> None:
+        self._legacy_issue_cleanup_count = self._delete_legacy_gateway_issues()
         await self.store.async_open()
         cached = await self.store.async_load_snapshot(recent_limit=100)
         self.snapshot.nodes.update(cached.nodes)
@@ -189,6 +206,8 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         return self.hass.async_create_task(target)
 
     async def _async_update_data(self) -> MeshSnapshot:
+        started = time.monotonic()
+        self._last_update_attempt_at = utcnow()
         try:
             await self.store.async_prune(self.history_days)
             self._mark_stale_nodes()
@@ -196,9 +215,20 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             midnight = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
             self.snapshot.messages_today = await self.store.async_messages_since(midnight)
             self.snapshot.mesh_health_score = self._mesh_health_score()
-            return self.snapshot
         except Exception as err:
+            self._last_update_duration_seconds = round(
+                time.monotonic() - started, 3
+            )
+            self._last_update_error_category = _diagnostic_error_category(
+                str(err)
+            )
             raise UpdateFailed(str(err)) from err
+        self._last_update_success_at = utcnow()
+        self._last_update_duration_seconds = round(
+            time.monotonic() - started, 3
+        )
+        self._last_update_error_category = None
+        return self.snapshot
 
     async def async_shutdown(self) -> None:
         """Stop gateways and close durable storage."""
@@ -475,16 +505,18 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                     "configured": {
                         "host_configured": bool(getattr(config, "host", None)),
                         "port": getattr(config, "port", None),
-                        "serial_endpoint": bool(
+                        "serial_endpoint_configured": bool(
                             getattr(config, "serial_path", None)
                         ),
-                        "bluetooth_endpoint": bool(
+                        "bluetooth_endpoint_configured": bool(
                             getattr(config, "ble_address", None)
                         ),
-                        "mqtt_subscription": bool(
+                        "mqtt_subscription_configured": bool(
                             getattr(config, "mqtt_topic", None)
                         ),
-                        "rest_endpoint": bool(getattr(config, "api_url", None)),
+                        "rest_endpoint_configured": bool(
+                            getattr(config, "api_url", None)
+                        ),
                         "api_key_configured": bool(
                             getattr(config, "api_key", None)
                         ),
@@ -494,7 +526,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                         "custom_send_endpoint_configured": bool(
                             options.get("send_url")
                         ),
-                        "bluetooth_adapter_metadata": bool(
+                        "bluetooth_adapter_metadata_configured": bool(
                             options.get("bluetooth_adapter")
                             and options.get("bluetooth_adapter_address")
                         ),
@@ -517,7 +549,8 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             _diagnostic_task_state(task) for task in send_tasks
         )
         update_interval = getattr(self, "update_interval", None)
-        last_update_success_time = getattr(self, "last_update_success_time", None)
+        last_update_attempt_time = getattr(self, "_last_update_attempt_at", None)
+        last_update_success_time = getattr(self, "_last_update_success_at", None)
 
         try:
             async with asyncio.timeout(_DIAGNOSTIC_STORE_TIMEOUT):
@@ -582,7 +615,16 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                 ),
                 "gateway_generation": getattr(self, "_gateway_generation", 0),
                 "last_update_success": getattr(self, "last_update_success", None),
+                "last_update_attempt_time": timestamp_to_json(
+                    last_update_attempt_time
+                ),
                 "last_update_success_time": timestamp_to_json(last_update_success_time),
+                "last_update_duration_seconds": getattr(
+                    self, "_last_update_duration_seconds", None
+                ),
+                "last_update_error_category": getattr(
+                    self, "_last_update_error_category", None
+                ),
                 "update_interval_seconds": (
                     update_interval.total_seconds() if update_interval else None
                 ),
@@ -638,6 +680,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                 ),
             },
             "store": store_diagnostics,
+            "repairs": self._repair_diagnostics(),
         }
 
     async def _handle_packet(
@@ -1060,6 +1103,98 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         gateway_score = 1.0 if connected_gateways else 0.0
         score = (online_score * 0.45) + (battery_score * 0.2) + (gateway_score * 0.25) + ((1 - duplicate_penalty) * 0.1)
         return round(max(0.0, min(score * 100, 100.0)), 1)
+
+    @staticmethod
+    def _issue_category(issue_id: str) -> str:
+        """Return a fixed repair category without returning its identifier."""
+        for category in _GATEWAY_ISSUE_CATEGORIES:
+            if issue_id.startswith(f"{category}_"):
+                return category
+        if issue_id == "no_gateways":
+            return "no_gateways"
+        return "other"
+
+    def _delete_legacy_gateway_issues(self) -> int:
+        """Delete pre-v0.4.2 issue keys that embedded configured identities."""
+        registry_getter = getattr(ir, "async_get", None)
+        issue_deleter = getattr(ir, "async_delete_issue", None)
+        hass = getattr(self, "hass", None)
+        if not callable(registry_getter) or not callable(issue_deleter) or hass is None:
+            return 0
+        try:
+            registry = registry_getter(hass)
+            issues = getattr(registry, "issues", {})
+            issue_keys = list(issues)
+        except Exception:
+            return 0
+
+        deleted = 0
+        for issue_key in issue_keys:
+            if not isinstance(issue_key, tuple) or len(issue_key) != 2:
+                continue
+            domain, issue_id = issue_key
+            if domain != DOMAIN or not isinstance(issue_id, str):
+                continue
+            category = self._issue_category(issue_id)
+            if (
+                category not in _GATEWAY_ISSUE_CATEGORIES
+                or _SAFE_GATEWAY_ISSUE_RE.fullmatch(issue_id)
+            ):
+                continue
+            try:
+                issue_deleter(hass, DOMAIN, issue_id)
+            except Exception as err:
+                _LOGGER.debug(
+                    "Could not remove one legacy MeshNet repair key: %s",
+                    type(err).__name__,
+                )
+            else:
+                deleted += 1
+        return deleted
+
+    def _repair_diagnostics(self) -> dict[str, Any]:
+        """Return cached repair aggregates without issue identifiers or text."""
+        registry_getter = getattr(ir, "async_get", None)
+        hass = getattr(self, "hass", None)
+        if not callable(registry_getter) or hass is None:
+            return {"available": False}
+        try:
+            issues = getattr(registry_getter(hass), "issues", {})
+            entries = [
+                (issue_id, issue)
+                for (domain, issue_id), issue in issues.items()
+                if domain == DOMAIN and isinstance(issue_id, str)
+            ]
+        except Exception as err:
+            return {
+                "available": False,
+                "collection_error": type(err).__name__,
+            }
+
+        categories = Counter(
+            self._issue_category(issue_id) for issue_id, _issue in entries
+        )
+        return {
+            "available": True,
+            "issue_count": len(entries),
+            "active_issue_count": sum(
+                bool(getattr(issue, "active", False))
+                for _issue_id, issue in entries
+            ),
+            "persistent_issue_count": sum(
+                bool(getattr(issue, "is_persistent", False))
+                for _issue_id, issue in entries
+            ),
+            "legacy_identity_issue_count": sum(
+                self._issue_category(issue_id) in _GATEWAY_ISSUE_CATEGORIES
+                and _SAFE_GATEWAY_ISSUE_RE.fullmatch(issue_id) is None
+                for issue_id, _issue in entries
+            ),
+            "legacy_issues_removed_during_setup": getattr(
+                self, "_legacy_issue_cleanup_count", 0
+            ),
+            "category_counts": dict(sorted(categories.items())),
+        }
 
     def _create_issue(
         self,

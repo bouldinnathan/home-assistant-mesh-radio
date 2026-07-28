@@ -196,7 +196,9 @@ Diagnostics include:
 - Redacted config-entry structure and safe gateway capability flags
 - Coordinator update health and background startup/reconnect/send/outbox state
 - Per-gateway protocol, transport, connection timestamps, packet counters,
-  categorized errors, and provider-client lifecycle state
+  categorized errors, repair aggregates, and provider-client lifecycle state
+- Meshtastic startup phase and elapsed time, native constructor ownership,
+  last-start outcome, and identity-free local Bluetooth adapter validation
 - Per-node hardware, firmware, role, online state, last-heard time, and safe
   cached connectivity, power, radio, routing-hop, and environmental telemetry
 - Mesh-wide online/offline, protocol, role, hardware, firmware, location-
@@ -204,6 +206,8 @@ Diagnostics include:
 - Deduplication and transmit-rate limiter state
 - SQLite schema/runtime versions, journal mode, table/protocol/direction/outbox
   counts, age ranges, executor/close state, and database/WAL size totals
+- Entity/device registry totals and per-domain available/unknown/unavailable
+  state-health counts
 
 The download is built exclusively from cached state. It never connects, pairs,
 scans, refreshes, or transmits through a radio. Identifiers, names, network
@@ -211,7 +215,10 @@ addresses, serial paths, URLs, MQTT topics, credentials, message content, raw
 packets/provider data, precise locations, and occupancy-related values are
 omitted or redacted. Home Assistant also supplies its normal system,
 integration-manifest, setup-time, and custom-component metadata around the
-MeshNet report.
+MeshNet report. That Home Assistant-controlled wrapper and downloaded filename
+contain the config-entry ID; device filenames may additionally contain the
+device name and registry ID. Inspect and rename the complete file before
+sharing it.
 
 The same action is available from MeshNet hub, gateway, and node device pages;
 device downloads select the relevant cached detail automatically. An

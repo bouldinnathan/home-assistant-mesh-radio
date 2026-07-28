@@ -428,6 +428,27 @@ def test_config_entry_diagnostics_are_thorough_serializable_and_redacted(
     assert result["config_entry"]["data"]["gateways"][0]["protocol"] == "meshtastic"
     assert result["config_entry"]["data"]["gateways"][0]["transport"] == "tcp"
     assert result["config_entry"]["data"]["gateways"][0]["port"] == 4403
+    safe_gateway = result["config_entry"]["data"]["gateways"][0]
+    assert safe_gateway["omitted_identity_field_count"] == 2
+    assert safe_gateway["omitted_unknown_field_count"] == 0
+    assert safe_gateway["omitted_unknown_option_count"] == 0
+    assert result["config_entry"]["data"][
+        "omitted_top_level_value_count"
+    ] == 1
+    assert result["config_entry"]["options"][
+        "omitted_top_level_value_count"
+    ] == 2
+
+    privacy = result["privacy"]
+    assert privacy["policy_version"] == 3
+    assert privacy["radio_operations_performed"] is False
+    assert privacy["native_home_assistant_wrapper"] == {
+        "controlled_by_meshnet": False,
+        "may_include_config_entry_id": True,
+        "may_include_device_name_and_registry_id": True,
+        "may_include_system_versions_and_timezone": True,
+        "inspect_and_rename_before_sharing": True,
+    }
 
     assert set(result["versions"]) >= {"meshnet", "meshtastic", "meshcore"}
 
