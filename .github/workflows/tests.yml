@@ -71,4 +71,5 @@ jobs:
           tests/test_clients.py
           tests/test_coordinator.py
           tests/test_diagnostics.py
+          tests/test_websocket_api.py
       - run: python -m pip check

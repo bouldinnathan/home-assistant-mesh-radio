@@ -55,6 +55,7 @@ from .models import (
     MeshSnapshot,
     MessageRecord,
     NodeState,
+    has_valid_location,
     stable_json,
     timestamp_to_json,
     utcnow,
@@ -659,7 +660,13 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                 "message_count": len(self.snapshot.recent_messages),
                 "messages_today": self.snapshot.messages_today,
                 "mesh_health_score": self.snapshot.mesh_health_score,
-                "nodes_with_location": sum(bool(node.location) for node in nodes),
+                "nodes_with_location": sum(
+                    has_valid_location(
+                        node.location,
+                        zero_pair_is_missing=node.protocol == PROTOCOL_MESHTASTIC,
+                    )
+                    for node in nodes
+                ),
                 "nodes_with_power": sum(bool(node.power) for node in nodes),
                 "nodes_with_radio": sum(bool(node.radio) for node in nodes),
                 "nodes_with_routing": sum(bool(node.routing) for node in nodes),

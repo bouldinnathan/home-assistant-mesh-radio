@@ -235,7 +235,8 @@ Entity groups:
 - Mesh summary sensors
 - Gateway online and packet sensors
 - Node online, battery, RF, telemetry, and routing sensors
-- GPS `device_tracker` entities when latitude and longitude are present
+- GPS `device_tracker` entities only when latitude and longitude are finite and
+  inside valid geographic ranges
 
 Gateway entities are created immediately from configuration. Node entities are created after node data arrives.
 
@@ -301,6 +302,11 @@ Purpose:
 - Restrict Bluetooth pairing to a verified local BlueZ device and a temporary,
   non-default agent.
 - Never persist or log a Bluetooth pairing PIN.
+- Treat topology as cached passive evidence: never infer node-to-node links
+  from a shared gateway observation.
+- Do not expose automatic traceroute. A future manual testing action would need
+  a backend-persisted cooldown of at least 3,600 seconds per gateway and
+  destination, with no startup, polling, refresh, or graph-fill trigger.
 
 ## Isolation Boundary
 

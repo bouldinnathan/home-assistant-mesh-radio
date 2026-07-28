@@ -19,7 +19,7 @@ from homeassistant.helpers.device_registry import DeviceEntry
 from .const import DIAGNOSTIC_REDACT, DOMAIN, VERSION
 from .coordinator import MeshNetCoordinator
 from .diagnostic_safety import safe_node_metadata
-from .models import NodeState, timestamp_to_json
+from .models import NodeState, has_valid_location, timestamp_to_json
 
 _DIAGNOSTIC_SCHEMA_VERSION = 2
 _REDACTED = "**REDACTED**"
@@ -92,6 +92,7 @@ _SAFE_CONNECTIVITY_KEYS = frozenset(
         "packet_tx",
         "rssi",
         "snr",
+        "via_mqtt",
     }
 )
 _SAFE_POWER_KEYS = frozenset(
@@ -313,7 +314,10 @@ def _safe_node_diagnostics(
         "online": node.online,
         "last_heard": timestamp_to_json(node.last_heard),
         "gateway_count": len(node.gateway_ids),
-        "has_location": bool(node.location),
+        "has_location": has_valid_location(
+            node.location,
+            zero_pair_is_missing=node.protocol == "meshtastic",
+        ),
         "field_counts": {
             "connectivity": len(node.connectivity),
             "power": len(node.power),

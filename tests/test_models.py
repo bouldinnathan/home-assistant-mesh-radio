@@ -3,6 +3,8 @@ from __future__ import annotations
 from custom_components.meshnet.models import (
     NodeState,
     canonical_node_key,
+    has_valid_location,
+    location_accuracy_meters,
     merge_dict,
     parse_timestamp,
 )
@@ -39,8 +41,77 @@ def test_node_merge_preserves_existing_values() -> None:
     assert base.sensors == {"temperature": 20, "humidity": 40}
 
 
+def test_meshtastic_hop_evidence_merges_atomically() -> None:
+    node = NodeState(
+        node_key="meshtastic:1",
+        protocol="meshtastic",
+        connectivity={
+            "hops": 2,
+            "hops_gateway_id": "gateway-a",
+            "via_mqtt": False,
+        },
+    )
+    node.merge(
+        NodeState(
+            node_key=node.node_key,
+            protocol=node.protocol,
+            connectivity={
+                "hops": 0,
+                "hops_gateway_id": None,
+                "via_mqtt": True,
+            },
+        )
+    )
+
+    assert node.connectivity["hops"] == 0
+    assert node.connectivity["via_mqtt"] is True
+    assert "hops_gateway_id" not in node.connectivity
+
+    node.merge(
+        NodeState(
+            node_key=node.node_key,
+            protocol=node.protocol,
+            connectivity={
+                "hops": None,
+                "hops_gateway_id": None,
+                "via_mqtt": False,
+            },
+        )
+    )
+
+    assert node.connectivity["hops"] == 0
+    assert node.connectivity["via_mqtt"] is True
+    assert "hops_gateway_id" not in node.connectivity
+
+
 def test_merge_dict_skips_none() -> None:
     assert merge_dict({"a": 1, "b": {"x": 1}}, {"a": None, "b": {"y": 2}}) == {
         "a": 1,
         "b": {"x": 1, "y": 2},
     }
+
+
+def test_location_requires_finite_in_range_coordinates() -> None:
+    assert has_valid_location({"latitude": 41.1, "longitude": -87.6}) is True
+    assert has_valid_location({"latitude": "41.1", "longitude": "-87.6"}) is True
+    assert has_valid_location({"latitude": 0, "longitude": 0}) is True
+    assert (
+        has_valid_location(
+            {"latitude": 0, "longitude": 0},
+            zero_pair_is_missing=True,
+        )
+        is False
+    )
+    assert has_valid_location({"latitude": None, "longitude": None}) is False
+    assert has_valid_location({"latitude": True, "longitude": 0}) is False
+    assert has_valid_location({"latitude": float("nan"), "longitude": 0}) is False
+    assert has_valid_location({"latitude": 91, "longitude": 0}) is False
+    assert has_valid_location({"latitude": 0, "longitude": 181}) is False
+
+
+def test_location_accuracy_requires_explicit_finite_meters() -> None:
+    assert location_accuracy_meters({"accuracy": 12.5}) == 12.5
+    assert location_accuracy_meters({"precision_bits": 14}) == 0.0
+    assert location_accuracy_meters({"accuracy": True}) == 0.0
+    assert location_accuracy_meters({"accuracy": -1}) == 0.0
+    assert location_accuracy_meters({"accuracy": float("inf")}) == 0.0

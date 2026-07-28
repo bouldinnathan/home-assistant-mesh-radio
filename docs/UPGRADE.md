@@ -1,5 +1,32 @@
 # Upgrade Guide
 
+## From 0.5.7
+
+0.5.8 makes direct messaging explicit in the MeshNet panel. Choose
+**Delivery → Direct**, then select a cached node, or use the **Message** button
+beside that node. Broadcast remains the default and cannot accidentally inherit
+an old direct recipient. The node list can be sorted by favorites and last
+seen, last seen alone, or name.
+
+Favorites are read from an optional Home Assistant device label named exactly
+`MeshNet Favorite`. MeshNet does not create, edit, or delete the label, and it
+does not add new favorite state to its database. The panel also links to Home
+Assistant's native Map; only nodes with finite, geographically valid cached
+coordinates receive location trackers. Meshtastic's unset `(0, 0)` protobuf
+position is ignored, and its coordinate precision bits are not mislabeled as
+meters of GPS accuracy.
+
+The topology is now passive and evidence-only. It no longer draws inferred
+node-to-node links merely because nodes were heard by the same gateway. It may
+show a gateway-to-node edge for cached, gateway-provenanced, non-MQTT zero-hop
+evidence and exact received route/path edges when their identifiers resolve
+unambiguously. If no such
+evidence exists, it says so. MeshNet has no traceroute action and the panel does
+not transmit to populate the graph.
+
+No configuration or database migration is required. Restart Home Assistant and
+hard-refresh the browser after installing so the versioned panel module loads.
+
 ## From 0.5.6
 
 0.5.7 repairs Home Assistant's message-action boundary and adds a working

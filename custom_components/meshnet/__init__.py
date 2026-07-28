@@ -25,6 +25,7 @@ from .const import (
     DOMAIN,
     MESSAGE_TYPE_BROADCAST,
     PLATFORMS,
+    VERSION,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -357,7 +358,7 @@ async def _async_register_panel(hass) -> None:
         hass,
         webcomponent_name="meshnet-panel",
         frontend_url_path="meshnet",
-        module_url="/meshnet_static/meshnet-panel.js",
+        module_url=f"/meshnet_static/meshnet-panel.js?v={VERSION}",
         sidebar_title="MeshNet",
         sidebar_icon="mdi:radio-tower",
         require_admin=True,

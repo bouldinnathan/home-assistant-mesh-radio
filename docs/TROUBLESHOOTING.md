@@ -570,11 +570,13 @@ MeshNet sidebar recipient dropdown or the action's `target_node` data field.
 Checks:
 
 1. Install MeshNet 0.5.7 or newer and restart Home Assistant.
-2. In the MeshNet sidebar, try **Broadcast** with **Automatic** gateway first.
+2. In the MeshNet sidebar, leave **Delivery** on **Broadcast** and try the
+   **Automatic** gateway first.
 3. Is the gateway online?
 4. If you supplied `gateway_id`, is it the exact configured gateway ID?
-5. For direct messages, choose the node from the sidebar dropdown. In YAML, use
-   a full Meshtastic `!` node ID, integer node number, or exact unique cached
+5. For direct messages, choose **Delivery → Direct**, then choose the node from
+   the sidebar dropdown or press **Message** on its node row. In YAML, use a
+   full Meshtastic `!` node ID, integer node number, or exact unique cached
    short/long name. Quote numeric short names.
 6. For MQTT, does `options.publish_topic` match the command topic consumed by your bridge?
 7. For MeshCore direct messages, is the destination contact known to the MeshCore SDK?
@@ -598,6 +600,13 @@ or destination error is the next item to inspect.
 ### Sidebar Panel Forbidden
 
 The MeshNet sidebar panel is admin-only by design. Use an admin Home Assistant account.
+
+### Updated Sidebar Still Looks Old
+
+MeshNet 0.5.8 version-stamps the sidebar JavaScript URL. Restart Home Assistant
+after updating, then hard-refresh the browser once. The current panel has a
+separate **Delivery** selector, node sort selector, **Message** buttons, a Map
+link, and the heading **Cached passive topology — no traceroutes sent**.
 
 ## Health Checks
 

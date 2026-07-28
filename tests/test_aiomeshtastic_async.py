@@ -409,22 +409,31 @@ def test_high_level_handshake_callbacks_send_and_stop() -> None:
         setattr(packet.packet, "from", 0x12345678)
         packet.packet.to = 0xFFFFFFFF
         packet.packet.id = 7
+        packet.packet.hop_start = 3
+        packet.packet.hop_limit = 3
         packet.packet.decoded.portnum = portnums_pb2.TEXT_MESSAGE_APP
         packet.packet.decoded.payload = b"hello"
         await protocol_connection.queue.put(packet.SerializeToString())
         await asyncio.wait_for(packet_ready.wait(), timeout=0.2)
         assert packets[0]["decoded"]["text"] == "hello"
+        assert packets[0]["hopStart"] == 3
+        assert packets[0]["hopLimit"] == 3
+        assert packets[0]["hopsAway"] == 0
+        assert client.node_snapshot()[0x12345678]["hopsAway"] == 0
 
         packet_ready.clear()
         unknown = mesh_pb2.FromRadio()
         setattr(unknown.packet, "from", 0x12345678)
         unknown.packet.to = 0xFFFFFFFF
         unknown.packet.id = 8
+        unknown.packet.hop_start = 5
+        unknown.packet.hop_limit = 2
         unknown.packet.decoded.portnum = 65534
         unknown.packet.decoded.payload = b"future-app"
         await protocol_connection.queue.put(unknown.SerializeToString())
         await asyncio.wait_for(packet_ready.wait(), timeout=0.2)
         assert packets[1]["decoded"]["portnum"] == "UNKNOWN_APP_65534"
+        assert packets[1]["hopsAway"] == 3
 
         packet_id = await client.async_send_text("reply", destination_id="!12345678")
         assert packet_id > 0

@@ -782,6 +782,8 @@ class MeshtasticBluetoothClient:
         result = MessageToDict(packet)
         source = int(getattr(packet, "from"))
         destination = int(packet.to)
+        hop_start = int(packet.hop_start)
+        hop_limit = int(packet.hop_limit)
         result.update(
             {
                 "from": source,
@@ -793,9 +795,16 @@ class MeshtasticBluetoothClient:
                 "rxTime": int(packet.rx_time),
                 "rxSnr": float(packet.rx_snr),
                 "rxRssi": int(packet.rx_rssi),
-                "hopLimit": int(packet.hop_limit),
+                "hopStart": hop_start,
+                "hopLimit": hop_limit,
             }
         )
+        # hop_start is a non-optional protobuf scalar, so zero cannot be
+        # distinguished from an older sender that omitted it. Only a positive
+        # start value is sufficient evidence; an equal remaining limit still
+        # correctly records a direct (zero-hop) reception.
+        if hop_start > 0 and 0 <= hop_limit <= hop_start:
+            result["hopsAway"] = hop_start - hop_limit
         if packet.HasField("decoded"):
             decoded = MessageToDict(packet.decoded)
             decoded["payload"] = bytes(packet.decoded.payload)
@@ -839,6 +848,8 @@ class MeshtasticBluetoothClient:
             "snr": float(packet.rx_snr),
             "lastHeard": int(packet.rx_time),
         }
+        if "hopsAway" in packet_dict:
+            update["hopsAway"] = packet_dict["hopsAway"]
         decoded = packet_dict.get("decoded")
         if isinstance(decoded, Mapping):
             for key in ("position", "user"):

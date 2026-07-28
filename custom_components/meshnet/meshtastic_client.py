@@ -1516,6 +1516,97 @@ class MeshtasticClient(MeshGateway):
             await self._emit_node(node)
 
 
+def _first_nonnegative_int(raw: dict[str, Any], *keys: str) -> int | None:
+    """Return the first present, valid non-negative integer without losing zero."""
+    for key in keys:
+        if key not in raw:
+            continue
+        value = raw[key]
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, float) and (
+            not math.isfinite(value) or not value.is_integer()
+        ):
+            continue
+        parsed = coerce_int(value)
+        if parsed is not None and parsed >= 0:
+            return parsed
+    return None
+
+
+def _meshtastic_packet_hops(raw: dict[str, Any]) -> int | None:
+    """Return passive hops-traveled evidence from one received packet."""
+    hops = _first_nonnegative_int(raw, "hopsAway", "hops_away", "hops")
+    if hops is not None:
+        return hops
+
+    hop_start = _first_nonnegative_int(raw, "hopStart", "hop_start")
+    hop_limit = _first_nonnegative_int(raw, "hopLimit", "hop_limit")
+    # hop_start is not optional on the wire. A zero value is therefore
+    # indistinguishable from an older packet that did not provide the field.
+    if hop_start is None or hop_start == 0 or hop_limit is None:
+        return None
+    if hop_limit > hop_start:
+        return None
+    return hop_start - hop_limit
+
+
+def _meshtastic_via_mqtt(raw: dict[str, Any]) -> bool:
+    """Return whether Meshtastic marked an observation as MQTT-originated."""
+    for key in ("viaMqtt", "via_mqtt"):
+        value = raw.get(key)
+        if value is True:
+            return True
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value == 1:
+            return True
+        if isinstance(value, str) and value.strip().casefold() in {
+            "1",
+            "true",
+            "yes",
+        }:
+            return True
+    return False
+
+
+def _meshtastic_float(value: Any) -> float | None:
+    """Return a finite non-boolean float from provider position data."""
+    if isinstance(value, bool):
+        return None
+    parsed = coerce_float(value)
+    return parsed if parsed is not None and math.isfinite(parsed) else None
+
+
+def _meshtastic_location(position: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a position without treating protobuf defaults as a GPS fix."""
+    latitude = _meshtastic_float(position.get("latitude"))
+    longitude = _meshtastic_float(position.get("longitude"))
+    if latitude == 0.0 and longitude == 0.0:
+        latitude = None
+        longitude = None
+
+    speed = _meshtastic_float(position.get("groundSpeed"))
+    if speed is None:
+        speed = _meshtastic_float(position.get("speed"))
+    heading = _meshtastic_float(position.get("groundTrack"))
+    if heading is None:
+        heading = _meshtastic_float(position.get("heading"))
+
+    accuracy = _meshtastic_float(position.get("accuracy"))
+    if accuracy is not None and accuracy < 0:
+        accuracy = None
+    return {
+        "latitude": latitude,
+        "longitude": longitude,
+        "altitude": _meshtastic_float(position.get("altitude")),
+        "speed": speed,
+        "heading": heading,
+        "accuracy": accuracy,
+        "precision_bits": _first_nonnegative_int(
+            position, "precisionBits", "precision_bits"
+        ),
+    }
+
+
 def meshtastic_packet_to_state_packet(
     raw: dict[str, Any],
     *,
@@ -1541,6 +1632,7 @@ def meshtastic_packet_to_state_packet(
     channel_value = raw.get("channel")
     if channel_value is None:
         channel_value = decoded.get("channel")
+    packet_raw = {**raw, **({"topic": topic, "via_mqtt": True} if topic else {})}
     return MeshPacket(
         protocol=PROTOCOL_MESHTASTIC,
         gateway_id=gateway_id,
@@ -1561,10 +1653,10 @@ def meshtastic_packet_to_state_packet(
         encrypted=bool(raw.get("encrypted")) if "encrypted" in raw else None,
         rssi=coerce_float(raw.get("rxRssi") or raw.get("rssi")),
         snr=coerce_float(raw.get("rxSnr") or raw.get("snr")),
-        hops=coerce_int(raw.get("hopsAway") or raw.get("hops")),
-        hop_limit=coerce_int(raw.get("hopLimit") or raw.get("hop_limit")),
+        hops=_meshtastic_packet_hops(raw),
+        hop_limit=_first_nonnegative_int(raw, "hopLimit", "hop_limit"),
         timestamp=packet_time,
-        raw={**raw, **({"topic": topic} if topic else {})},
+        raw=packet_raw,
     )
 
 
@@ -1589,6 +1681,8 @@ def meshtastic_node_to_state(
         source = raw.get(source_key)
         if isinstance(source, dict):
             sensors.update(_flatten_metrics(source))
+    hops = _first_nonnegative_int(raw, "hopsAway", "hops_away", "hops")
+    via_mqtt = _meshtastic_via_mqtt(raw)
     return NodeState(
         node_key=node_key,
         protocol=PROTOCOL_MESHTASTIC,
@@ -1607,6 +1701,11 @@ def meshtastic_node_to_state(
         connectivity={
             "snr": coerce_float(raw.get("snr")),
             "rssi": coerce_float(raw.get("rssi")),
+            "hops": hops,
+            "hops_gateway_id": (
+                gateway_id if hops is not None and not via_mqtt else None
+            ),
+            "via_mqtt": via_mqtt,
             "channel_utilization": coerce_float(device_metrics.get("channelUtilization")),
             "air_utilization": coerce_float(device_metrics.get("airUtilTx")),
         },
@@ -1614,14 +1713,7 @@ def meshtastic_node_to_state(
             "battery_level": coerce_float(device_metrics.get("batteryLevel")),
             "voltage": coerce_float(device_metrics.get("voltage")),
         },
-        location={
-            "latitude": coerce_float(position.get("latitude")),
-            "longitude": coerce_float(position.get("longitude")),
-            "altitude": coerce_float(position.get("altitude")),
-            "speed": coerce_float(position.get("groundSpeed")),
-            "heading": coerce_float(position.get("groundTrack")),
-            "precision": coerce_float(position.get("precisionBits")),
-        },
+        location=_meshtastic_location(position),
         sensors=sensors,
         raw=raw,
     )
@@ -1650,10 +1742,17 @@ def meshtastic_packet_to_node(packet: MeshPacket) -> NodeState | None:
     node_key = canonical_node_key(PROTOCOL_MESHTASTIC, node_id=node_id, mac=mac)
     sensors: dict[str, Any] = {}
     power: dict[str, Any] = {}
+    via_mqtt = _meshtastic_via_mqtt(raw)
     connectivity = {
         "snr": packet.snr,
         "rssi": packet.rssi,
         "hops": packet.hops,
+        "hops_gateway_id": (
+            packet.gateway_id
+            if packet.hops is not None and not via_mqtt
+            else None
+        ),
+        "via_mqtt": via_mqtt,
         "hop_limit": packet.hop_limit,
     }
     for key in ("deviceMetrics", "environmentMetrics", "airQualityMetrics", "powerMetrics"):
@@ -1689,14 +1788,7 @@ def meshtastic_packet_to_node(packet: MeshPacket) -> NodeState | None:
         gateway_ids={packet.gateway_id},
         connectivity=connectivity,
         power=power,
-        location={
-            "latitude": coerce_float(position.get("latitude")),
-            "longitude": coerce_float(position.get("longitude")),
-            "altitude": coerce_float(position.get("altitude")),
-            "speed": coerce_float(position.get("groundSpeed") or position.get("speed")),
-            "heading": coerce_float(position.get("groundTrack") or position.get("heading")),
-            "precision": coerce_float(position.get("precisionBits") or position.get("precision")),
-        },
+        location=_meshtastic_location(position),
         sensors=sensors,
         raw=raw,
     )

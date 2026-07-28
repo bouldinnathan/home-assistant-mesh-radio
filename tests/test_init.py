@@ -33,6 +33,7 @@ from custom_components.meshnet.const import (
     DOMAIN,
     PROTOCOL_MESHTASTIC,
     TRANSPORT_BLUETOOTH,
+    VERSION,
 )
 
 ADAPTER_ADDRESS = "00:11:22:33:44:55"
@@ -523,7 +524,7 @@ def test_panel_registration_is_awaited(monkeypatch) -> None:
         hass,
         webcomponent_name="meshnet-panel",
         frontend_url_path="meshnet",
-        module_url="/meshnet_static/meshnet-panel.js",
+        module_url=f"/meshnet_static/meshnet-panel.js?v={VERSION}",
         sidebar_title="MeshNet",
         sidebar_icon="mdi:radio-tower",
         require_admin=True,

@@ -18,18 +18,59 @@ MeshNet
 
 The panel shows:
 
-- A message composer with cached recipient and gateway dropdowns
+- An explicit broadcast/direct message composer with cached node and gateway
+  dropdowns
 - Gateway online state
-- Node online state
+- Node online/last-seen state with favorites-aware sorting
 - Recent messages
-- Basic topology view
+- Passive, evidence-only topology
+- A link to Home Assistant's native Map
 - RF heat based on RSSI or SNR
 
-For the simplest test, open the sidebar panel, leave **Recipient** on
-**Broadcast**, leave **Gateway** on **Automatic**, enter a short message, and
-press **Send**. For a direct message, choose a cached node from the recipient
-dropdown. The dropdown submits the node's canonical identifier, so you do not
-need to copy a node number or short name manually.
+For the simplest test, open the sidebar panel, leave **Delivery** on
+**Broadcast** and **Gateway** on **Automatic**, enter a short message, and press
+**Send**. For a direct message, choose **Delivery → Direct** and select a cached
+node, or press **Message** beside a node. The dropdown submits the node's
+canonical identifier, so you do not need to copy a node number or short name
+manually.
+
+## Nodes, Favorites, Map, And Topology
+
+The default node order is **Favorites + last seen**. You can instead choose
+**Last seen** or **Name**. Missing or malformed timestamps sort after valid
+timestamps and node identifiers provide a stable final tie-breaker.
+
+To mark nodes as favorites without creating MeshNet-owned residue:
+
+1. In Home Assistant, open **Settings → Areas, labels & zones → Labels**.
+2. Create a label named exactly `MeshNet Favorite`.
+3. Add that label to any MeshNet node device you want pinned first.
+
+MeshNet only reads that one label from the Home Assistant device registry. It
+never creates, changes, or removes labels, and uninstalling MeshNet leaves the
+user-owned label under Home Assistant's normal control.
+
+The panel's **Map** link opens Home Assistant's native Map. A MeshNet node is
+eligible only when it has both finite latitude and longitude inside valid
+geographic ranges. Nodes without valid cached coordinates remain in the node
+list but do not get a location tracker. For Meshtastic, the protocol's unset
+`(0, 0)` position is treated as missing. Precision bits remain separate from an
+explicit meter accuracy and are never presented to Home Assistant as meters.
+
+The topology deliberately uses passive evidence only. A solid gateway edge
+means locally received, non-MQTT packet/node data explicitly reported zero hops
+and retained the gateway that observed it. A received, explicit MeshCore
+route/path may be shown only when every endpoint resolves to an exact cached
+identifier. Nodes sharing a gateway are not assumed to be connected. When no
+defensible evidence exists the panel displays **No passive connection evidence
+yet**. Edges are explicitly labeled as last received, cached evidence rather
+than a live route; MeshNet does not currently expire a received MeshCore
+route/path on a guessed schedule.
+
+MeshNet does not run traceroute automatically, on refresh, on startup, or to
+fill the graph. This release exposes no traceroute action at all. Any future
+manual testing implementation must enforce a backend-persisted cooldown of at
+least one hour per gateway and destination.
 
 ## Verify Gateway Status
 

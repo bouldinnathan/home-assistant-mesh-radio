@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -91,6 +93,45 @@ def coerce_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def has_valid_location(
+    location: Mapping[str, Any], *, zero_pair_is_missing: bool = False
+) -> bool:
+    """Return whether cached coordinates are finite and geographically valid."""
+    latitude_raw = location.get("latitude")
+    longitude_raw = location.get("longitude")
+    if isinstance(latitude_raw, bool) or isinstance(longitude_raw, bool):
+        return False
+    latitude = coerce_float(latitude_raw)
+    longitude = coerce_float(longitude_raw)
+    valid = bool(
+        latitude is not None
+        and longitude is not None
+        and math.isfinite(latitude)
+        and math.isfinite(longitude)
+        and -90.0 <= latitude <= 90.0
+        and -180.0 <= longitude <= 180.0
+    )
+    return bool(
+        valid
+        and not (
+            zero_pair_is_missing
+            and latitude == 0.0
+            and longitude == 0.0
+        )
+    )
+
+
+def location_accuracy_meters(location: Mapping[str, Any]) -> float:
+    """Return an explicit finite meter accuracy, or zero when unavailable."""
+    raw_accuracy = location.get("accuracy")
+    if isinstance(raw_accuracy, bool):
+        return 0.0
+    accuracy = coerce_float(raw_accuracy)
+    if accuracy is None or not math.isfinite(accuracy) or accuracy < 0:
+        return 0.0
+    return accuracy
 
 
 def merge_dict(base: JsonDict, update: JsonDict) -> JsonDict:
@@ -369,7 +410,22 @@ class NodeState:
         self.gateway_ids.update(other.gateway_ids)
         if other.last_gateway_id:
             self.gateway_ids.add(other.last_gateway_id)
-        self.connectivity = merge_dict(self.connectivity, other.connectivity)
+        connectivity_update = dict(other.connectivity)
+        if self.protocol == "meshtastic" and "hops" in connectivity_update:
+            hops = connectivity_update.pop("hops")
+            hops_gateway_id = connectivity_update.pop("hops_gateway_id", None)
+            via_mqtt = connectivity_update.pop("via_mqtt", None)
+            # Hop count, transport origin, and observing gateway describe one
+            # measurement. Never merge those fields independently: doing so
+            # could combine an MQTT zero-hop packet with stale RF provenance.
+            if hops is not None:
+                for key in ("hops", "hops_gateway_id", "via_mqtt"):
+                    self.connectivity.pop(key, None)
+                self.connectivity["hops"] = hops
+                if hops_gateway_id is not None:
+                    self.connectivity["hops_gateway_id"] = hops_gateway_id
+                self.connectivity["via_mqtt"] = via_mqtt is True
+        self.connectivity = merge_dict(self.connectivity, connectivity_update)
         self.power = merge_dict(self.power, other.power)
         self.radio = merge_dict(self.radio, other.radio)
         self.location = merge_dict(self.location, other.location)
