@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from custom_components.meshnet.meshcore_client import meshcore_payload_to_node, meshcore_payload_to_packet
 from custom_components.meshnet.meshtastic_client import (
+    meshtastic_node_to_state,
     meshtastic_packet_to_node,
     meshtastic_packet_to_state_packet,
 )
@@ -83,6 +84,23 @@ def test_meshtastic_official_mqtt_nodeinfo_normalization() -> None:
     assert node.node_id == "!12345678"
     assert node.long_name == "base0"
     assert node.short_name == "BA0"
+
+
+def test_meshtastic_protobuf_base64_mac_normalizes_to_hex_node_key() -> None:
+    node = meshtastic_node_to_state(
+        {
+            "num": 0x12345678,
+            "user": {
+                "id": "!12345678",
+                # Protobuf MessageToDict representation of aa:bb:cc:dd:ee:ff.
+                "macaddr": "qrvM3e7/",
+            },
+        },
+        gateway_id="g1",
+    )
+
+    assert node.mac == "aabbccddeeff"
+    assert node.node_key == "mac:aabbccddeeff"
 
 
 def test_meshcore_packet_normalization() -> None:

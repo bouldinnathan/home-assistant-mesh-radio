@@ -340,16 +340,21 @@ Required transport fields:
 | MQTT | Home Assistant MQTT configured and a decoded JSON subscribe topic |
 | REST | `api_url` |
 
-### Meshtastic Bluetooth first pairing (version 0.4)
+### Meshtastic Bluetooth first pairing (version 0.5)
 
-Version 0.4 performs Meshtastic pairing in the Home Assistant form. It requires
+MeshNet performs Meshtastic pairing in the Home Assistant form. It requires
 a local BlueZ adapter; a Home Assistant Bluetooth proxy is not a supported
 pairing or connection path. Select a discovered radio, or use the advanced
 field with a canonical MAC address such as `AA:BB:CC:DD:EE:FF`.
 
-The verified adapter must be the only powered local Bluetooth adapter because
-Meshtastic 2.7.11 cannot select between Linux controllers. Additional adapters
-can remain installed while powered off.
+The verified controller is stored by its stable Bluetooth address. MeshNet's
+async runtime selects that exact controller, so other valid local adapters may
+remain powered when the radio has one unambiguous local controller path.
+`hciN` renumbering does not redirect the connection.
+
+The resulting connection is direct and local. MQTT, a broker, Internet, Wi-Fi,
+and LAN access are not used by the radio transport. Only installation or future
+updates need access to retrieve HACS files and Python dependencies.
 
 Close the Meshtastic phone app and any other Bluetooth client first. Select
 **Start pairing**, then enter the six-digit `RANDOM_PIN` displayed by a screened
@@ -360,7 +365,7 @@ after about 50 seconds, and the entire pairing transaction has a 75-second
 limit.
 
 Home Assistant OS users do not need a root shell or `bluetoothctl` for this
-normal version 0.4 pairing path. Home Assistant Container still needs host
+normal pairing path. Home Assistant Container still needs host
 BlueZ, the system D-Bus mount, and the Bluetooth capabilities described in the
 [README](../README.md#container-hardware-access).
 

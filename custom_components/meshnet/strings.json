@@ -43,7 +43,7 @@
         "data_description": {
           "host": "This address is reached from Home Assistant, which may be inside a container.",
           "serial_path": "Choose a detected USB device. For an advanced mapping, type the exact Home Assistant-visible path, such as /dev/serial/by-id/usb-YOUR_RADIO.",
-          "ble_address": "Direct SDK Bluetooth requires a local adapter; remote Bluetooth proxies are not supported.",
+          "ble_address": "Direct local Bluetooth needs no MQTT, Internet, or Wi-Fi. A host adapter is required; remote Bluetooth proxies are not supported.",
           "mqtt_topic": "Meshtastic must point to its /json/ topic. MeshCore requires a compatible decoded-JSON bridge.",
           "publish_topic": "For Meshtastic, use the exact .../2/json/mqtt/ downlink topic. Leave blank for receive-only.",
           "mqtt_node_id": "Decimal node ID of the Meshtastic gateway that transmits MQTT downlinks.",

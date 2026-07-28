@@ -704,47 +704,28 @@ def test_cancelled_begin_delivers_attempt_when_rollback_cannot_be_verified(
 
 
 @pytest.mark.parametrize(
-    ("adapter_properties", "additional_adapters"),
+    "adapter_properties",
     [
-        ({}, {}),
-        (
-            {
-                "Address": _Variant(ADAPTER_ADDRESS),
-                "Powered": _Variant("yes"),
-            },
-            {},
-        ),
-        (
-            {
-                "Address": _Variant(ADAPTER_ADDRESS),
-                "Powered": _Variant(False),
-            },
-            {},
-        ),
-        (
-            {
-                "Address": _Variant(ADAPTER_ADDRESS),
-                "Powered": _Variant(True),
-            },
-            {
-                "/org/bluez/hci1": {
-                    BLUEZ_ADAPTER: {
-                        "Address": _Variant("00:11:22:33:44:66"),
-                        "Powered": _Variant(True),
-                    }
-                }
-            },
-        ),
+        {},
+        {
+            "Address": _Variant(ADAPTER_ADDRESS),
+            "Powered": _Variant("yes"),
+        },
+        {
+            "Address": _Variant(ADAPTER_ADDRESS),
+            "Powered": _Variant(False),
+        },
+        {
+            "Address": _Variant("not-a-controller-address"),
+            "Powered": _Variant(True),
+        },
     ],
 )
-def test_pairing_fails_closed_before_agent_when_adapter_state_is_unsafe(
-    adapter_properties, additional_adapters
+def test_pairing_fails_closed_before_agent_when_selected_adapter_is_unsafe(
+    adapter_properties,
 ) -> None:
     async def scenario() -> None:
-        bus = _FakeBlueZBus(
-            adapter_properties=adapter_properties,
-            additional_adapters=additional_adapters,
-        )
+        bus = _FakeBlueZBus(adapter_properties=adapter_properties)
 
         with pytest.raises(BluetoothUnavailableError, match="adapter"):
             await _manager_for_bus(bus).async_begin(ADDRESS)
@@ -758,14 +739,36 @@ def test_pairing_fails_closed_before_agent_when_adapter_state_is_unsafe(
     asyncio.run(scenario())
 
 
-def test_pairing_allows_only_selected_adapter_powered() -> None:
+def test_pairing_rejects_missing_selected_adapter_before_agent() -> None:
+    class MissingSelectedAdapterBus(_FakeBlueZBus):
+        def _objects(self) -> dict[str, Any]:
+            objects = super()._objects()
+            objects.pop(ADAPTER_PATH)
+            return objects
+
+    async def scenario() -> None:
+        bus = MissingSelectedAdapterBus()
+
+        with pytest.raises(BluetoothUnavailableError, match="adapter"):
+            await _manager_for_bus(bus).async_begin(ADDRESS)
+
+        assert "add_handler" not in bus.actions
+        assert "export" not in bus.actions
+        assert "call:RegisterAgent" not in bus.actions
+        assert "call:Pair" not in bus.actions
+        assert bus.actions[-1] == "disconnect"
+
+    asyncio.run(scenario())
+
+
+def test_pairing_allows_another_valid_powered_adapter() -> None:
     async def scenario() -> None:
         bus = _FakeBlueZBus(
             additional_adapters={
                 "/org/bluez/hci1": {
                     BLUEZ_ADAPTER: {
                         "Address": _Variant("00:11:22:33:44:66"),
-                        "Powered": _Variant(False),
+                        "Powered": _Variant(True),
                     }
                 }
             }

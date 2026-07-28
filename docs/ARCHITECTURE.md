@@ -43,7 +43,7 @@ Responsibilities:
 
 Supported transports are validated before runtime setup.
 
-## Meshtastic Bluetooth Pairing Boundary (version 0.4)
+## Meshtastic Bluetooth Boundary (version 0.5)
 
 Bluetooth discovery and pairing are separate trust decisions:
 
@@ -60,7 +60,7 @@ Local BlueZ device verification
 Temporary app-scoped Agent1 -> exact Device1.Pair
         |
         v
-Re-read bonded state -> begin Meshtastic SDK connection
+Re-read bonded state -> begin bounded async Meshtastic connection
 ```
 
 `custom_components/meshnet/bluetooth_devices.py` filters cached advertisements
@@ -70,10 +70,12 @@ local adapter because Home Assistant Bluetooth proxies also populate discovery.
 The pairing backend therefore requires the exact device on a local BlueZ
 adapter before changing bond state. Proxies are rejected.
 
-Meshtastic 2.7.11 does not expose controller selection. Pairing and runtime
-therefore require the verified physical controller to be the sole powered local
-adapter. MeshNet stores both its current `hciN` name and stable Adapter1 address,
-then checks the stable identity before constructing the SDK interface.
+MeshNet stores both the selected controller's current `hciN` name and stable
+Adapter1 address. Pairing and runtime resolve the current identity from that
+stable address and use the exact local Device1/scanner path. Other valid local
+controllers may remain powered when the radio has one unambiguous ownership
+path; a proxy, wrong controller, missing controller, or ambiguous identity
+fails closed.
 
 For each request, MeshNet opens a bounded pairing session, registers a temporary
 application-scoped BlueZ agent, and invokes pairing for only the selected device
@@ -107,6 +109,22 @@ immediately roll back its uncommitted bond using the exact Device1 and stable
 controller guards. The Configure removal form can perform a warned, explicitly
 confirmed deletion of the current same-address bond; the option defaults off
 because other clients may share or have recreated it.
+
+The runtime is a Bluetooth-only adaptation of the official asynchronous
+Meshtastic Home Assistant transport. It reuses the installed Meshtastic
+protobuf definitions but does not instantiate the synchronous SDK
+`BLEInterface`, its private event-loop thread, or its global pubsub lifecycle.
+For every attempt, MeshNet obtains a fresh Home Assistant `BLEDevice` from the
+selected local scanner, connects with `bleak-retry-connector`, validates the
+three Meshtastic GATT characteristics, subscribes to FromNum, sends
+`want_config`, and actively drains FromRadio until configuration completes.
+
+One supervisor owns the connection, reader, configuration, and reconnect tasks.
+Initial setup has hard connect and configuration deadlines; reconnect starts
+only after a previously active session is lost and uses bounded backoff. Stop
+cancels and awaits subordinate tasks, then performs bounded GATT teardown before
+the endpoint lease is released. No MQTT, broker, Internet, Wi-Fi, or LAN path is
+part of this transport.
 
 ## Normalized Models
 

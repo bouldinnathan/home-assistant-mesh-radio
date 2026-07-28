@@ -197,8 +197,9 @@ Diagnostics include:
 - Coordinator update health and background startup/reconnect/send/outbox state
 - Per-gateway protocol, transport, connection timestamps, packet counters,
   categorized errors, repair aggregates, and provider-client lifecycle state
-- Meshtastic startup phase and elapsed time, native constructor ownership,
-  last-start outcome, and identity-free local Bluetooth adapter validation
+- Meshtastic startup phase and elapsed time, synchronous serial/TCP constructor
+  ownership, async Bluetooth GATT/configuration/reconnect task state,
+  last-start outcome, and identity-free local adapter validation
 - Per-node hardware, firmware, role, online state, last-heard time, and safe
   cached connectivity, power, radio, routing-hop, and environmental telemetry
 - Mesh-wide online/offline, protocol, role, hardware, firmware, location-

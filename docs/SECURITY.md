@@ -139,7 +139,7 @@ Avoid sending:
 - Sensitive medical or financial data
 - Precise home location unless intentionally shared
 
-## Bluetooth Pairing Security (version 0.4)
+## Bluetooth Pairing and Runtime Security (version 0.5)
 
 Meshtastic pairing is limited to a local BlueZ adapter and the exact canonical
 MAC address selected in the Home Assistant form. Bluetooth proxies are not
@@ -147,12 +147,19 @@ accepted for this direct connection. MeshNet registers a temporary,
 application-scoped BlueZ agent; it does not request the system-default agent
 role and rejects pairing callbacks for any other device.
 
-The verified adapter must also be the only powered local Bluetooth adapter.
-Meshtastic 2.7.11 cannot select a controller, so this check prevents the SDK
-from silently using a different powered adapter. Ownership is bound to the
-controller's stable Adapter1 address as well as the radio address; an `hciN`
-rename cannot redirect deletion. New Meshtastic Bluetooth gateways cannot
+Ownership is bound to the controller's stable Adapter1 address as well as the
+radio address. Runtime resolves a fresh Home Assistant `BLEDevice` through that
+exact current controller and rejects proxy or wrong-controller candidates, so
+other valid local adapters may remain powered when ownership is unambiguous and
+an `hciN` rename cannot redirect the connection or deletion. New Meshtastic Bluetooth gateways cannot
 bypass pairing through YAML or Advanced JSON.
+
+Bluetooth protocol work is asynchronous and stage-bounded. A single supervisor
+owns GATT, configuration, reader, and reconnect tasks; it cancels and awaits
+them before releasing MeshNet's endpoint lease. Configuration subscribes to
+notifications before sending `want_config` and performs an active FromRadio
+read, including firmware that does not emit a fresh notification for that
+request. Runtime does not use MQTT, Internet, Wi-Fi, or the LAN.
 
 The six-digit PIN field is password-masked. The value exists only for the
 active pairing request and is not written to config entries, options,

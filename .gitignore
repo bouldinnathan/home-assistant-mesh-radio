@@ -136,6 +136,10 @@ backup*/
 /diagnostics/
 /diagnostics*.json
 *diagnostic*.json
+# Home Assistant diagnostic downloads can contain config-entry IDs and system
+# metadata even when the integration-specific payload is redacted.
+config_entry-*.json
+device-*.json
 /logs/
 /tmp/
 /.cache/

@@ -75,21 +75,27 @@ Supported combinations:
 
 Invalid combinations are rejected by the config flow.
 
-## Meshtastic Bluetooth pairing (version 0.4)
+## Direct Meshtastic Bluetooth (version 0.5)
 
 > [!NOTE]
-> This section describes the version 0.4 behavior. Install a version 0.4 build
+> This section describes the version 0.5 behavior. Install a version 0.5 build
 > before expecting these controls in Home Assistant.
 
 Meshtastic Bluetooth setup uses a local Linux BlueZ adapter. Home Assistant
 Bluetooth proxies are not supported for pairing or for the subsequent direct
-Meshtastic SDK connection.
+Meshtastic connection.
 
-Meshtastic 2.7.11 cannot be told which Linux Bluetooth controller to use.
-MeshNet therefore fails closed unless the verified adapter is the only powered
-local adapter. Other installed adapters may remain present while powered off.
-The stored pairing record includes the controller's stable Bluetooth address,
-so an `hciN` rename after reboot does not authorize a different controller.
+The stored pairing record includes the controller's stable Bluetooth address.
+MeshNet resolves the current `hciN` identity and a fresh Home Assistant
+`BLEDevice` through that exact controller for every connection attempt, so
+other valid local adapters may remain powered when the radio resolves through
+one unambiguous local controller. An `hciN` rename after reboot does not
+authorize a different controller.
+
+This path is fully local after installation. It does not configure or require
+MQTT, a broker, Internet access, radio Wi-Fi, or a LAN connection. Home
+Assistant owns one persistent BLE connection and reconnects with bounded
+backoff if an established link is lost.
 
 Before starting:
 
@@ -124,6 +130,10 @@ OS, normal pairing therefore does not require a root shell or `bluetoothctl`.
 The first verified Bluetooth gateway is saved immediately with safe global
 defaults, rather than leaving a provisional bond at the Add-another/settings
 screens. Use **Configure** afterward to add gateways or change global options.
+
+The Meshtastic radio normally allows only one Bluetooth client. Close the
+Android/iOS app, web client, and any BLE command-line client while MeshNet is
+connected. Keeping an app merely in the background may leave its link active.
 
 Deleting a gateway, config entry, or HACS package preserves external BlueZ
 state. BlueZ has no bond-generation identifier, so MeshNet cannot prove that a

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
-import sys
-import types
+from collections.abc import Mapping
+from typing import Any
 
 import pytest
 
@@ -14,139 +15,237 @@ from custom_components.meshnet.const import (
     PROTOCOL_MESHTASTIC,
     TRANSPORT_BLUETOOTH,
 )
+from custom_components.meshnet.meshtastic_ble import MeshtasticBluetoothTransport
 from custom_components.meshnet.meshtastic_client import MeshtasticClient
 from custom_components.meshnet.models import GatewayConfig
 
 ADAPTER_ADDRESS = "00:11:22:33:44:55"
+OTHER_ADAPTER_ADDRESS = "00:11:22:33:44:66"
 
 
-class _ControlledExecutorHass:
-    """Home Assistant shim that can hold the first executor job in flight."""
+class _FakeHass:
+    """Small Home Assistant shim that records accidental executor use."""
 
     def __init__(self) -> None:
         self.loop = asyncio.get_running_loop()
-        self.constructor_started = asyncio.Event()
-        self.release_constructor = asyncio.Event()
-        self.executor_calls = 0
         self.background_task_names: list[str] = []
-
-    def async_create_task(self, coroutine):
-        return asyncio.create_task(coroutine)
-
-    def async_create_background_task(self, coroutine, name):
-        self.background_task_names.append(name)
-        return asyncio.create_task(coroutine)
-
-    async def async_add_executor_job(self, target, *args):
-        self.executor_calls += 1
-        if self.executor_calls == 1:
-            self.constructor_started.set()
-            await self.release_constructor.wait()
-        return target(*args)
-
-
-class _FakeInterface:
-    def __init__(self) -> None:
-        self.nodes = {}
-        self.close_calls = 0
-
-    def close(self) -> None:
-        self.close_calls += 1
-
-
-class _CancellationResistantExecutorHass:
-    """Model a worker that continues after its asyncio waiter is cancelled."""
-
-    def __init__(self) -> None:
-        self.operation_started = asyncio.Event()
-        self.release_operation = asyncio.Event()
-        self.background_task_names: list[str] = []
-        self.interface = None
-
-    def async_create_task(self, coroutine):
-        return asyncio.create_task(coroutine)
-
-    def async_create_background_task(self, coroutine, name):
-        self.background_task_names.append(name)
-        return asyncio.create_task(coroutine)
-
-    async def async_add_executor_job(self, target, *args):
-        if getattr(target, "__self__", None) is self.interface:
-            return target(*args)
-        self.operation_started.set()
-        try:
-            await self.release_operation.wait()
-        except asyncio.CancelledError:
-            # A running executor function cannot actually be cancelled. Model
-            # that ownership even if a wrapper task is cancelled by shutdown.
-            await self.release_operation.wait()
-        return target(*args)
-
-
-class _BlockingNativeInterface:
-    """Expose independently blocking send and refresh executor operations."""
-
-    def __init__(self) -> None:
-        self.send_started = False
-        self.send_finished = False
-        self.refresh_started = False
-        self.refresh_finished = False
-        self.close_started = asyncio.Event()
-        self.close_calls = 0
-        self.close_overlapped_send = False
-        self.close_overlapped_refresh = False
-
-    def sendText(self, *_args, **_kwargs) -> None:
-        self.send_finished = True
+        self.executor_targets: list[Any] = []
 
     @property
-    def nodes(self) -> dict:
-        self.refresh_finished = True
-        return {}
+    def executor_calls(self) -> int:
+        return len(self.executor_targets)
 
-    def close(self) -> None:
-        self.close_overlapped_send = self.send_started and not self.send_finished
-        self.close_overlapped_refresh = (
-            self.refresh_started and not self.refresh_finished
+    def async_create_task(self, coroutine):
+        return asyncio.create_task(coroutine)
+
+    def async_create_background_task(self, coroutine, name):
+        self.background_task_names.append(name)
+        return asyncio.create_task(coroutine, name=name)
+
+    async def async_add_executor_job(self, target, *args):
+        self.executor_targets.append(target)
+        return target(*args)
+
+
+class _FakeBluetoothTransport:
+    """Controllable implementation of the async Bluetooth transport contract."""
+
+    def __init__(
+        self,
+        *,
+        block_start: bool = False,
+        block_stop: bool = False,
+        block_send: bool = False,
+        block_refresh: bool = False,
+        resist_start_cancel: bool = False,
+        resist_send_cancel: bool = False,
+        fail_start: Exception | None = None,
+        fail_stop: Exception | None = None,
+        nodes: Mapping[Any, Mapping[str, Any]] | None = None,
+    ) -> None:
+        self.start_gate = asyncio.Event()
+        self.stop_gate = asyncio.Event()
+        self.send_gate = asyncio.Event()
+        self.refresh_gate = asyncio.Event()
+        if not block_start:
+            self.start_gate.set()
+        if not block_stop:
+            self.stop_gate.set()
+        if not block_send:
+            self.send_gate.set()
+        if not block_refresh:
+            self.refresh_gate.set()
+
+        self.start_entered = asyncio.Event()
+        self.start_cancelled = asyncio.Event()
+        self.stop_entered = asyncio.Event()
+        self.send_entered = asyncio.Event()
+        self.send_cancelled = asyncio.Event()
+        self.refresh_entered = asyncio.Event()
+        self.refresh_cancelled = asyncio.Event()
+
+        self.fail_start = fail_start
+        self.fail_stop = fail_stop
+        self.resist_start_cancel = resist_start_cancel
+        self.resist_send_cancel = resist_send_cancel
+        self.nodes = dict(nodes or {})
+        self.phase_callback = None
+        self.state = "idle"
+        self.active = False
+        self.send_active = False
+        self.refresh_active = False
+        self.stop_overlapped_send = False
+        self.stop_overlapped_refresh = False
+        self.start_calls = 0
+        self.stop_calls = 0
+        self.send_calls: list[dict[str, Any]] = []
+        self.refresh_calls = 0
+        self.packet_callbacks: list[Any] = []
+        self.connection_callbacks: list[Any] = []
+        self.packet_unsubscribe_calls = 0
+        self.connection_unsubscribe_calls = 0
+
+    @property
+    def connected(self) -> bool:
+        return self.active
+
+    def add_packet_callback(self, callback) -> Any:
+        self.packet_callbacks.append(callback)
+
+        def unsubscribe() -> None:
+            self.packet_unsubscribe_calls += 1
+            if callback in self.packet_callbacks:
+                self.packet_callbacks.remove(callback)
+
+        return unsubscribe
+
+    def add_connection_callback(self, callback) -> Any:
+        self.connection_callbacks.append(callback)
+
+        def unsubscribe() -> None:
+            self.connection_unsubscribe_calls += 1
+            if callback in self.connection_callbacks:
+                self.connection_callbacks.remove(callback)
+
+        return unsubscribe
+
+    async def emit_packet(self, packet: dict[str, Any]) -> None:
+        for callback in tuple(self.packet_callbacks):
+            result = callback(packet)
+            if inspect.isawaitable(result):
+                await result
+
+    async def emit_connection(self, connected: bool) -> None:
+        for callback in tuple(self.connection_callbacks):
+            result = callback(connected)
+            if inspect.isawaitable(result):
+                await result
+
+    async def async_start(self) -> None:
+        self.start_calls += 1
+        self.state = "connecting"
+        if self.phase_callback is not None:
+            self.phase_callback("bluetooth_connecting")
+        self.start_entered.set()
+        try:
+            await self.start_gate.wait()
+        except asyncio.CancelledError:
+            self.state = "cancelled"
+            self.start_cancelled.set()
+            if not self.resist_start_cancel:
+                raise
+            await self.start_gate.wait()
+        if self.fail_start is not None:
+            self.state = "failed"
+            raise self.fail_start
+        self.active = True
+        self.state = "active"
+        if self.phase_callback is not None:
+            self.phase_callback("bluetooth_active")
+
+    async def async_stop(self) -> None:
+        self.stop_calls += 1
+        self.stop_overlapped_send = self.send_active
+        self.stop_overlapped_refresh = self.refresh_active
+        self.state = "stopping"
+        self.stop_entered.set()
+        await self.stop_gate.wait()
+        if self.fail_stop is not None:
+            self.state = "stop_failed"
+            raise self.fail_stop
+        self.active = False
+        self.state = "stopped"
+
+    async def async_send_text(
+        self,
+        *,
+        target_node: str | None,
+        message: str,
+        channel: str | None,
+        priority: str,
+        message_type: str,
+    ) -> None:
+        self.send_calls.append(
+            {
+                "target_node": target_node,
+                "message": message,
+                "channel": channel,
+                "priority": priority,
+                "message_type": message_type,
+            }
         )
-        self.close_calls += 1
-        self.close_started.set()
+        self.send_active = True
+        self.send_entered.set()
+        try:
+            await self.send_gate.wait()
+        except asyncio.CancelledError:
+            self.send_cancelled.set()
+            if not self.resist_send_cancel:
+                raise
+            await self.send_gate.wait()
+        finally:
+            self.send_active = False
 
+    async def async_node_snapshot(self) -> dict[Any, dict[str, Any]]:
+        self.refresh_calls += 1
+        self.refresh_active = True
+        self.refresh_entered.set()
+        try:
+            await self.refresh_gate.wait()
+        except asyncio.CancelledError:
+            self.refresh_cancelled.set()
+            raise
+        finally:
+            self.refresh_active = False
+        return {node_id: dict(node) for node_id, node in self.nodes.items()}
 
-class _FakePub:
-    def __init__(self) -> None:
-        self.subscriptions = []
-
-    def subscribe(self, handler, topic) -> None:
-        self.subscriptions.append((handler, topic))
-
-    def unsubscribe(self, handler, topic) -> None:
-        self.subscriptions.remove((handler, topic))
-
-
-def _install_fake_pubsub(monkeypatch) -> _FakePub:
-    pubsub = types.ModuleType("pubsub")
-    pub = _FakePub()
-    pubsub.pub = pub
-    monkeypatch.setitem(sys.modules, "pubsub", pubsub)
-    return pub
+    def diagnostic_snapshot(self) -> dict[str, Any]:
+        return {
+            "implementation": type(self).__name__,
+            "state": self.state,
+            "active": self.active,
+            "start_calls": self.start_calls,
+            "stop_calls": self.stop_calls,
+            "send_active": self.send_active,
+            "refresh_active": self.refresh_active,
+        }
 
 
 @pytest.fixture(autouse=True)
-def _one_powered_local_adapter(monkeypatch) -> None:
-    """Model the only layout the adapter-less Meshtastic SDK can use safely."""
+def _verified_powered_local_adapter(monkeypatch) -> None:
+    """Provide one verified local controller unless a test overrides it."""
 
     async def adapter_details():
         return {
             "hci0": {
                 "org.bluez.Adapter1": {
-                    "Address": "00:11:22:33:44:55",
+                    "Address": ADAPTER_ADDRESS,
                     "Powered": True,
                 }
             },
             "hci1": {
                 "org.bluez.Adapter1": {
-                    "Address": "00:11:22:33:44:66",
+                    "Address": OTHER_ADAPTER_ADDRESS,
                     "Powered": False,
                 }
             },
@@ -159,12 +258,26 @@ def _one_powered_local_adapter(monkeypatch) -> None:
     )
 
 
-def _client(hass, interface, statuses) -> MeshtasticClient:
-    async def async_noop(_value) -> None:
-        return None
+def _client(
+    hass: _FakeHass,
+    transports: list[_FakeBluetoothTransport],
+    *,
+    statuses: list[bool] | None = None,
+    nodes: list[Any] | None = None,
+    packets: list[Any] | None = None,
+) -> tuple[MeshtasticClient, list[str]]:
+    status_updates = statuses if statuses is not None else []
+    node_updates = nodes if nodes is not None else []
+    packet_updates = packets if packets is not None else []
+
+    async def on_packet(packet) -> None:
+        packet_updates.append(packet)
+
+    async def on_node(node) -> None:
+        node_updates.append(node)
 
     async def on_status(status) -> None:
-        statuses.append(status.connected)
+        status_updates.append(status.connected)
 
     client = MeshtasticClient(
         hass,
@@ -179,306 +292,113 @@ def _client(hass, interface, statuses) -> MeshtasticClient:
                 CONF_BLUETOOTH_ADAPTER_ADDRESS: ADAPTER_ADDRESS,
             },
         ),
-        async_noop,
-        async_noop,
+        on_packet,
+        on_node,
         on_status,
         logging.getLogger(__name__),
     )
-    client._make_native_interface = lambda: interface
-    return client
+    adapters: list[str] = []
+    remaining = list(transports)
+
+    def make_transport(adapter: str) -> _FakeBluetoothTransport:
+        adapters.append(adapter)
+        if not remaining:
+            raise AssertionError("unexpected Bluetooth transport construction")
+        transport = remaining.pop(0)
+        transport.phase_callback = client._set_startup_phase
+        return transport
+
+    def forbidden_native_constructor() -> Any:
+        raise AssertionError("Bluetooth must not use _make_native_interface")
+
+    client._make_bluetooth_transport = make_transport
+    client._make_native_interface = forbidden_native_constructor
+    return client, adapters
 
 
-def test_meshtastic_ble_start_is_single_flight(monkeypatch) -> None:
+def test_meshtastic_ble_start_is_single_flight() -> None:
     async def run() -> None:
-        _install_fake_pubsub(monkeypatch)
-        hass = _ControlledExecutorHass()
-        interface = _FakeInterface()
-        statuses = []
-        client = _client(hass, interface, statuses)
+        hass = _FakeHass()
+        transport = _FakeBluetoothTransport(block_start=True)
+        statuses: list[bool] = []
+        client, adapters = _client(hass, [transport], statuses=statuses)
 
         first_waiter = asyncio.create_task(client.async_start())
-        await hass.constructor_started.wait()
+        await transport.start_entered.wait()
         second_waiter = asyncio.create_task(client.async_start())
         await asyncio.sleep(0)
 
         assert client.start_pending is True
-        assert hass.executor_calls == 1
+        assert transport.start_calls == 1
+        assert adapters == ["hci0"]
+        assert hass.executor_calls == 0
+        assert client._native_constructor_future is None
 
-        hass.release_constructor.set()
+        transport.start_gate.set()
         await asyncio.gather(first_waiter, second_waiter)
 
-        assert client._interface is interface
+        assert client._ble_transport is transport
+        assert client._interface is None
+        assert transport.refresh_calls == 1
         assert statuses == [True]
+        assert hass.executor_calls == 0
+
         await client.async_stop()
-        assert interface.close_calls == 1
+        assert transport.stop_calls == 1
+        assert client._native_lock is None
 
     asyncio.run(run())
 
 
-def test_meshtastic_ble_diagnostics_track_pending_constructor(monkeypatch) -> None:
-    """A blocked SDK constructor must be visible without exposing its endpoint."""
-
+def test_meshtastic_ble_diagnostics_track_async_connect_without_identity() -> None:
     async def run() -> None:
-        _install_fake_pubsub(monkeypatch)
-        hass = _ControlledExecutorHass()
-        interface = _FakeInterface()
-        client = _client(hass, interface, [])
+        hass = _FakeHass()
+        transport = _FakeBluetoothTransport(block_start=True)
+        client, _adapters = _client(hass, [transport])
 
         start_waiter = asyncio.create_task(client.async_start())
-        await hass.constructor_started.wait()
+        await transport.start_entered.wait()
 
         diagnostics = client.diagnostic_snapshot()
 
-        assert diagnostics["startup_phase"] == "constructing_interface"
+        assert diagnostics["startup_phase"] == "bluetooth_connecting"
         assert diagnostics["startup_elapsed_seconds"] is not None
         assert diagnostics["startup_phase_elapsed_seconds"] is not None
-        assert diagnostics["native_constructor_state"] == "pending"
-        assert diagnostics["native_constructor_pending"] is True
-        assert diagnostics["native_executor_operation_count"] == 1
+        assert diagnostics["native_constructor_state"] == "not_created"
+        assert diagnostics["native_constructor_pending"] is False
+        assert diagnostics["native_executor_operation_count"] == 0
+        assert diagnostics["native_subscription_count"] == 0
         assert diagnostics["last_start_outcome"] == "pending"
         assert diagnostics["bluetooth_adapter_validation"] == {
             "status": "passed",
             "adapter_count": 2,
             "powered_adapter_count": 1,
             "saved_adapter_is_powered": True,
-            "only_powered_adapter_matches": True,
+            "selected_adapter_path_count": 1,
         }
+        assert diagnostics["bluetooth_transport"]["state"] == "connecting"
         serialized = repr(diagnostics)
         assert "AA:BB:CC:DD:EE:FF" not in serialized
         assert ADAPTER_ADDRESS not in serialized
 
-        hass.release_constructor.set()
+        transport.start_gate.set()
         await start_waiter
-        await asyncio.sleep(0)
 
         completed = client.diagnostic_snapshot()
         assert completed["startup_phase"] == "ready"
-        assert completed["native_constructor_pending"] is False
-        assert completed["native_executor_operation_count"] == 0
         assert completed["last_start_outcome"] == "succeeded"
         assert completed["last_start_duration_seconds"] is not None
+        assert completed["bluetooth_transport"]["state"] == "active"
 
         await client.async_stop()
 
     asyncio.run(run())
 
 
-def test_cancelled_internal_start_closes_late_constructor_before_replacement(
-    monkeypatch,
-) -> None:
-    """HA owner cancellation cannot orphan an interface or overlap replacement."""
-
-    async def run() -> None:
-        _install_fake_pubsub(monkeypatch)
-        hass = _ControlledExecutorHass()
-        old_interface = _FakeInterface()
-        new_interface = _FakeInterface()
-        old_client = _client(hass, old_interface, [])
-        new_client = _client(hass, new_interface, [])
-
-        old_waiter = asyncio.create_task(old_client.async_start())
-        await hass.constructor_started.wait()
-        old_owner = old_client._start_task
-        assert old_owner is not None
-
-        old_owner.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await old_waiter
-        await asyncio.sleep(0)
-
-        abandoned = old_client.diagnostic_snapshot()
-        assert abandoned["native_constructor_abandoned"] is True
-        assert abandoned["native_constructor_abandonment_count"] == 1
-        assert abandoned["native_constructor_pending"] is True
-        assert abandoned["native_endpoint_lock_held"] is True
-
-        replacement_waiter = asyncio.create_task(new_client.async_start())
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
-
-        assert hass.executor_calls == 1
-        assert new_client._native_lock is None
-
-        hass.release_constructor.set()
-        await asyncio.wait_for(replacement_waiter, timeout=0.2)
-        await asyncio.sleep(0)
-
-        assert old_interface.close_calls == 1
-        assert old_client._native_constructor_future is None
-        assert old_client._native_constructor_cleanup_task is None
-        assert old_client._native_lock is None
-        assert old_client._native_constructor_abandoned is False
-        assert new_client._interface is new_interface
-        # Old constructor + old close + replacement constructor + replacement
-        # node refresh. The replacement cannot reach either of its calls until
-        # the old close releases the endpoint lock.
-        assert hass.executor_calls == 4
-
-        await new_client.async_stop()
-        assert new_interface.close_calls == 1
-
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize(
-    ("saved_adapter", "details"),
-    [
-        (
-            "hci0",
-            {
-                "hci0": {
-                    "org.bluez.Adapter1": {
-                        "Address": ADAPTER_ADDRESS,
-                        "Powered": True,
-                    }
-                },
-                "hci1": {
-                    "org.bluez.Adapter1": {
-                        "Address": "00:11:22:33:44:66",
-                        "Powered": True,
-                    }
-                },
-            },
-        ),
-        (
-            "hci1",
-            {
-                "hci0": {
-                    "org.bluez.Adapter1": {
-                        "Address": "00:11:22:33:44:66",
-                        "Powered": True,
-                    }
-                }
-            },
-        ),
-        (
-            "hci0",
-            {
-                "hci0": {
-                    "org.bluez.Adapter1": {
-                        "Address": ADAPTER_ADDRESS,
-                        "Powered": False,
-                    }
-                }
-            },
-        ),
-        (
-            "hci0",
-            {
-                "hci0": {
-                    "org.bluez.Adapter1": {
-                        "Address": ADAPTER_ADDRESS,
-                        "Powered": True,
-                    }
-                },
-                "hci1": {"org.bluez.Adapter1": {}},
-            },
-        ),
-        (
-            "hci0",
-            {
-                "hci0": {
-                    "org.bluez.Adapter1": {
-                        "Address": ADAPTER_ADDRESS,
-                        "Powered": True,
-                    }
-                },
-                "hci1": {
-                    "org.bluez.Adapter1": {
-                        "Address": "00:11:22:33:44:66",
-                        "Powered": "unknown",
-                    }
-                },
-            },
-        ),
-        (
-            "hci0",
-            {
-                "hci0": {
-                    "org.bluez.Adapter1": {
-                        "Address": ADAPTER_ADDRESS,
-                        "Powered": True,
-                    }
-                },
-                "hci1": {},
-            },
-        ),
-        (
-            "hci0",
-            {
-                "hci0": {
-                    "org.bluez.Adapter1": {
-                        "Address": ADAPTER_ADDRESS,
-                        "Powered": True,
-                    }
-                },
-                "not-an-adapter": {
-                    "org.bluez.Adapter1": {
-                        "Address": "00:11:22:33:44:66",
-                        "Powered": False,
-                    }
-                },
-            },
-        ),
-        (
-            None,
-            {
-                "hci0": {
-                    "org.bluez.Adapter1": {
-                        "Address": ADAPTER_ADDRESS,
-                        "Powered": True,
-                    }
-                }
-            },
-        ),
-    ],
-)
-def test_ble_start_fails_closed_before_sdk_constructor(
-    monkeypatch, saved_adapter, details
-) -> None:
-    async def run() -> None:
-        _install_fake_pubsub(monkeypatch)
-
-        async def adapter_details():
-            return details
-
-        monkeypatch.setattr(
-            meshtastic_client_module,
-            "_async_get_local_bluetooth_adapter_details",
-            adapter_details,
-        )
-        hass = _ControlledExecutorHass()
-        hass.release_constructor.set()
-        interface = _FakeInterface()
-        client = _client(hass, interface, [])
-        if saved_adapter is None:
-            client.config.options.clear()
-        else:
-            client.config.options[CONF_BLUETOOTH_ADAPTER] = saved_adapter
-        constructor_calls = 0
-
-        def make_interface():
-            nonlocal constructor_calls
-            constructor_calls += 1
-            return interface
-
-        client._make_native_interface = make_interface
-
-        with pytest.raises(RuntimeError, match="Bluetooth"):
-            await client.async_start()
-        assert constructor_calls == 0
-        assert hass.executor_calls == 0
-        assert client._interface is None
-
-    asyncio.run(run())
-
-
-def test_ble_runtime_follows_stable_adapter_identity_after_hci_renumber(
+def test_ble_runtime_follows_stable_adapter_mac_after_hci_renumber(
     monkeypatch,
 ) -> None:
     async def run() -> None:
-        _install_fake_pubsub(monkeypatch)
-
         async def adapter_details():
             return {
                 "hci7": {
@@ -494,276 +414,447 @@ def test_ble_runtime_follows_stable_adapter_identity_after_hci_renumber(
             "_async_get_local_bluetooth_adapter_details",
             adapter_details,
         )
-        hass = _ControlledExecutorHass()
-        hass.release_constructor.set()
-        interface = _FakeInterface()
-        client = _client(hass, interface, [])
+        hass = _FakeHass()
+        transport = _FakeBluetoothTransport()
+        client, adapters = _client(hass, [transport])
 
         await client.async_start()
 
-        assert client._interface is interface
+        assert adapters == ["hci7"]
+        assert transport.active is True
+        assert client.diagnostic_snapshot()["bluetooth_adapter_validation"] == {
+            "status": "passed",
+            "adapter_count": 1,
+            "powered_adapter_count": 1,
+            "saved_adapter_is_powered": True,
+            "selected_adapter_path_count": 1,
+        }
         await client.async_stop()
 
     asyncio.run(run())
 
 
-def test_meshtastic_ble_stop_disposes_late_constructor_result(monkeypatch) -> None:
+def test_ble_allows_other_powered_adapters_when_verified_path_is_unique(
+    monkeypatch,
+) -> None:
     async def run() -> None:
-        _install_fake_pubsub(monkeypatch)
-        monkeypatch.setattr(meshtastic_client_module, "_STOP_WAIT_TIMEOUT", 0.01)
-        hass = _ControlledExecutorHass()
-        interface = _FakeInterface()
-        statuses = []
-        client = _client(hass, interface, statuses)
+        async def adapter_details():
+            return {
+                "hci0": {
+                    "org.bluez.Adapter1": {
+                        "Address": ADAPTER_ADDRESS,
+                        "Powered": True,
+                    }
+                },
+                "hci1": {
+                    "org.bluez.Adapter1": {
+                        "Address": OTHER_ADAPTER_ADDRESS,
+                        "Powered": True,
+                    }
+                },
+            }
 
-        start_waiter = asyncio.create_task(client.async_start())
-        await hass.constructor_started.wait()
-        stop_waiter = asyncio.create_task(client.async_stop())
-        await asyncio.wait_for(stop_waiter, timeout=0.2)
+        monkeypatch.setattr(
+            meshtastic_client_module,
+            "_async_get_local_bluetooth_adapter_details",
+            adapter_details,
+        )
+        hass = _FakeHass()
+        transport = _FakeBluetoothTransport()
+        client, adapters = _client(hass, [transport])
 
-        assert stop_waiter.done() is True
-        assert hass.executor_calls == 1
-        assert client._interface is None
-        assert client.status.connected is False
+        await client.async_start()
 
-        hass.release_constructor.set()
-        await start_waiter
-        await asyncio.sleep(0)
-
-        assert interface.close_calls == 1
-        assert client._interface is None
-        assert client.status.connected is False
-        assert True not in statuses
-
-        # A completed unload must not spawn another constructor on its own.
-        await asyncio.sleep(0)
-        assert hass.executor_calls == 2
+        assert adapters == ["hci0"]
+        validation = client.diagnostic_snapshot()["bluetooth_adapter_validation"]
+        assert validation["powered_adapter_count"] == 2
+        assert validation["selected_adapter_path_count"] == 1
+        await client.async_stop()
 
     asyncio.run(run())
 
 
-def test_failed_start_does_not_duplicate_pubsub_subscriptions(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("clear_options", "details"),
+    [
+        (
+            True,
+            {
+                "hci0": {
+                    "org.bluez.Adapter1": {
+                        "Address": ADAPTER_ADDRESS,
+                        "Powered": True,
+                    }
+                }
+            },
+        ),
+        (
+            False,
+            {
+                "hci0": {
+                    "org.bluez.Adapter1": {
+                        "Address": ADAPTER_ADDRESS,
+                        "Powered": False,
+                    }
+                }
+            },
+        ),
+        (
+            False,
+            {
+                "hci0": {
+                    "org.bluez.Adapter1": {
+                        "Address": OTHER_ADAPTER_ADDRESS,
+                        "Powered": True,
+                    }
+                }
+            },
+        ),
+        (
+            False,
+            {
+                "hci0": {
+                    "org.bluez.Adapter1": {
+                        "Address": ADAPTER_ADDRESS,
+                        "Powered": True,
+                    }
+                },
+                "hci7": {
+                    "org.bluez.Adapter1": {
+                        "Address": ADAPTER_ADDRESS,
+                        "Powered": True,
+                    }
+                },
+            },
+        ),
+        (
+            False,
+            {
+                "not-an-adapter": {
+                    "org.bluez.Adapter1": {
+                        "Address": ADAPTER_ADDRESS,
+                        "Powered": True,
+                    }
+                }
+            },
+        ),
+        (False, {"hci0": {"org.bluez.Adapter1": {}}}),
+    ],
+)
+def test_invalid_ble_adapter_fails_before_backend_construction(
+    monkeypatch,
+    clear_options: bool,
+    details: dict[str, Any],
+) -> None:
     async def run() -> None:
-        pub = _install_fake_pubsub(monkeypatch)
-        hass = _ControlledExecutorHass()
-        hass.release_constructor.set()
-        interface = _FakeInterface()
-        statuses = []
-        client = _client(hass, interface, statuses)
-        constructor_calls = 0
+        async def adapter_details():
+            return details
 
-        def make_interface():
-            nonlocal constructor_calls
-            constructor_calls += 1
-            if constructor_calls == 1:
-                raise RuntimeError("cannot connect")
-            return interface
+        monkeypatch.setattr(
+            meshtastic_client_module,
+            "_async_get_local_bluetooth_adapter_details",
+            adapter_details,
+        )
+        hass = _FakeHass()
+        transport = _FakeBluetoothTransport()
+        client, adapters = _client(hass, [transport])
+        if clear_options:
+            client.config.options.clear()
 
-        client._make_native_interface = make_interface
+        with pytest.raises(RuntimeError):
+            await client.async_start()
+
+        assert adapters == []
+        assert transport.start_calls == 0
+        assert client._ble_transport is None
+        assert client._interface is None
+        assert client._native_lock is None
+        assert hass.executor_calls == 0
+
+    asyncio.run(run())
+
+
+def test_ble_stop_during_start_cancels_and_awaits_transport(monkeypatch) -> None:
+    async def run() -> None:
+        monkeypatch.setattr(meshtastic_client_module, "_STOP_WAIT_TIMEOUT", 0.01)
+        hass = _FakeHass()
+        transport = _FakeBluetoothTransport(block_start=True)
+        statuses: list[bool] = []
+        client, _adapters = _client(hass, [transport], statuses=statuses)
+
+        start_waiter = asyncio.create_task(client.async_start())
+        await transport.start_entered.wait()
+
+        await asyncio.wait_for(client.async_stop(), timeout=0.5)
+        with pytest.raises(asyncio.CancelledError):
+            await start_waiter
+
+        assert transport.start_cancelled.is_set()
+        assert transport.stop_calls == 1
+        assert transport.active is False
+        assert client._ble_transport is None
+        assert client._interface is None
+        assert client._native_lock is None
+        assert client.status.connected is False
+        assert True not in statuses
+        assert hass.executor_calls == 0
+
+    asyncio.run(run())
+
+
+def test_ble_stop_is_bounded_when_start_resists_cancellation(monkeypatch) -> None:
+    async def run() -> None:
+        monkeypatch.setattr(meshtastic_client_module, "_STOP_WAIT_TIMEOUT", 0.01)
+        hass = _FakeHass()
+        transport = _FakeBluetoothTransport(
+            block_start=True,
+            resist_start_cancel=True,
+        )
+        client, _adapters = _client(hass, [transport])
+
+        start_waiter = asyncio.create_task(client.async_start())
+        await transport.start_entered.wait()
+
+        with pytest.raises(RuntimeError, match="startup did not stop within"):
+            await asyncio.wait_for(client.async_stop(), timeout=0.5)
+
+        assert transport.start_cancelled.is_set()
+        assert transport.stop_calls == 0
+        assert client._ble_transport is transport
+        assert client._native_lock is not None
+        assert client._native_lock.locked()
+
+        # The original start path observes _stopping and owns teardown once the
+        # cancellation-resistant platform call finally yields.
+        transport.start_gate.set()
+        await asyncio.wait_for(start_waiter, timeout=0.5)
+        await asyncio.wait_for(transport.stop_entered.wait(), timeout=0.5)
+        for _ in range(10):
+            if client._ble_transport is None:
+                break
+            await asyncio.sleep(0)
+
+        assert transport.stop_calls >= 1
+        assert client._ble_transport is None
+        assert client._native_lock is None
+
+    asyncio.run(run())
+
+
+def test_cancelled_public_waiter_does_not_duplicate_ble_start() -> None:
+    async def run() -> None:
+        hass = _FakeHass()
+        transport = _FakeBluetoothTransport(block_start=True)
+        client, adapters = _client(hass, [transport])
+
+        cancelled_waiter = asyncio.create_task(client.async_start())
+        await transport.start_entered.wait()
+        cancelled_waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled_waiter
+
+        surviving_waiter = asyncio.create_task(client.async_start())
+        await asyncio.sleep(0)
+        assert transport.start_calls == 1
+        assert adapters == ["hci0"]
+
+        transport.start_gate.set()
+        await surviving_waiter
+        assert client._ble_transport is transport
+        await client.async_stop()
+
+    asyncio.run(run())
+
+
+def test_failed_ble_start_releases_transport_and_lock_before_retry() -> None:
+    async def run() -> None:
+        hass = _FakeHass()
+        failed = _FakeBluetoothTransport(fail_start=RuntimeError("cannot connect"))
+        replacement = _FakeBluetoothTransport()
+        client, adapters = _client(hass, [failed, replacement])
 
         with pytest.raises(RuntimeError, match="cannot connect"):
             await client.async_start()
         await asyncio.sleep(0)
 
-        assert pub.subscriptions == []
+        assert failed.stop_calls == 1
+        assert client._ble_transport is None
+        assert client._native_lock is None
+        assert client.diagnostic_snapshot()["native_subscription_count"] == 0
+
         await client.async_start()
-        assert len(pub.subscriptions) == 3
-        assert len(set(pub.subscriptions)) == 3
 
+        assert adapters == ["hci0", "hci0"]
+        assert replacement.start_calls == 1
+        assert client._ble_transport is replacement
         await client.async_stop()
-        assert pub.subscriptions == []
 
     asyncio.run(run())
 
 
-def test_cancelled_start_waiter_does_not_duplicate_ble_constructor(monkeypatch) -> None:
+def test_existing_disconnected_ble_transport_is_restarted_not_reported_ready() -> None:
     async def run() -> None:
-        _install_fake_pubsub(monkeypatch)
-        hass = _ControlledExecutorHass()
-        interface = _FakeInterface()
-        statuses = []
-        client = _client(hass, interface, statuses)
+        hass = _FakeHass()
+        transport = _FakeBluetoothTransport()
+        client, adapters = _client(hass, [transport])
 
-        cancelled_waiter = asyncio.create_task(client.async_start())
-        await hass.constructor_started.wait()
-        cancelled_waiter.cancel()
-        try:
-            await cancelled_waiter
-        except asyncio.CancelledError:
-            pass
-
-        surviving_waiter = asyncio.create_task(client.async_start())
+        await client.async_start()
         await asyncio.sleep(0)
-        assert hass.executor_calls == 1
+        assert transport.start_calls == 1
 
-        hass.release_constructor.set()
-        await surviving_waiter
-        assert client._interface is interface
+        # Model a post-active supervisor failure that leaves the transport
+        # object and endpoint lease present but no longer connected.
+        transport.active = False
+        client.status.connected = False
+
+        await client.async_start()
+
+        assert transport.start_calls == 2
+        assert transport.active is True
+        assert client.status.connected is True
+        assert adapters == ["hci0"]
         await client.async_stop()
 
     asyncio.run(run())
 
 
-def test_successive_ble_clients_serialize_constructor_and_close_late_result(
-    monkeypatch,
-) -> None:
-    """A replacement client must wait for the old late result to be closed."""
-
-    class EndpointExecutorHass(_ControlledExecutorHass):
-        def __init__(self) -> None:
-            super().__init__()
-            self.old_constructor_started = asyncio.Event()
-            self.release_old_constructor = asyncio.Event()
-            self.old_close_started = asyncio.Event()
-            self.release_old_close = asyncio.Event()
-            self.new_constructor_started = asyncio.Event()
-            self.constructor_submissions = 0
-            self.active_constructors = 0
-            self.max_active_constructors = 0
-            self.old_interface = None
-
-        async def async_add_executor_job(self, target, *args):
-            if target.__name__.startswith("make_"):
-                self.constructor_submissions += 1
-                self.active_constructors += 1
-                self.max_active_constructors = max(
-                    self.max_active_constructors,
-                    self.active_constructors,
-                )
-                try:
-                    if target.__name__ == "make_old_interface":
-                        self.old_constructor_started.set()
-                        await self.release_old_constructor.wait()
-                    else:
-                        self.new_constructor_started.set()
-                    return target(*args)
-                finally:
-                    self.active_constructors -= 1
-            if getattr(target, "__self__", None) is self.old_interface:
-                self.old_close_started.set()
-                await self.release_old_close.wait()
-            self.executor_calls += 1
-            return target(*args)
-
+def test_ble_transport_constructor_failure_never_acquires_endpoint_lock() -> None:
     async def run() -> None:
-        _install_fake_pubsub(monkeypatch)
-        monkeypatch.setattr(meshtastic_client_module, "_STOP_WAIT_TIMEOUT", 0.01)
-        hass = EndpointExecutorHass()
-        old_interface = _FakeInterface()
-        new_interface = _FakeInterface()
-        old_statuses = []
-        new_statuses = []
-        hass.old_interface = old_interface
-        old_client = _client(hass, old_interface, old_statuses)
-        new_client = _client(hass, new_interface, new_statuses)
+        hass = _FakeHass()
+        failed_client, failed_adapters = _client(hass, [])
 
-        def make_old_interface():
-            return old_interface
+        def fail_transport_construction(adapter: str) -> Any:
+            failed_adapters.append(adapter)
+            raise RuntimeError("async Bluetooth dependency is unavailable")
 
-        def make_new_interface():
-            return new_interface
+        failed_client._make_bluetooth_transport = fail_transport_construction
 
-        old_client._make_native_interface = make_old_interface
-        new_client._make_native_interface = make_new_interface
+        with pytest.raises(
+            RuntimeError,
+            match="async Bluetooth dependency is unavailable",
+        ):
+            await failed_client.async_start()
 
-        old_waiter = asyncio.create_task(old_client.async_start())
-        await hass.old_constructor_started.wait()
-        await asyncio.wait_for(old_client.async_stop(), timeout=0.2)
-        old_waiter.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await old_waiter
+        assert failed_adapters == ["hci0"]
+        assert failed_client._ble_transport is None
+        assert failed_client._native_lock is None
+
+        # A constructor error must not leave the shared endpoint lease held.
+        replacement_transport = _FakeBluetoothTransport()
+        replacement_client, replacement_adapters = _client(
+            hass,
+            [replacement_transport],
+        )
+        await asyncio.wait_for(replacement_client.async_start(), timeout=0.5)
+        assert replacement_adapters == ["hci0"]
+        await replacement_client.async_stop()
+
+    asyncio.run(run())
+
+
+def test_missing_ble_callback_api_stops_transport_and_releases_endpoint_lock() -> None:
+    async def run() -> None:
+        hass = _FakeHass()
+        incomplete_transport = _FakeBluetoothTransport()
+        incomplete_transport.add_connection_callback = None
+        failed_client, failed_adapters = _client(hass, [incomplete_transport])
+
+        with pytest.raises(
+            RuntimeError,
+            match="transport has no connection callback API",
+        ):
+            await failed_client.async_start()
+
+        assert failed_adapters == ["hci0"]
+        assert incomplete_transport.start_calls == 0
+        assert incomplete_transport.stop_calls == 1
+        assert incomplete_transport.packet_unsubscribe_calls == 1
+        assert incomplete_transport.packet_callbacks == []
+        assert failed_client._ble_transport is None
+        assert failed_client._native_lock is None
+
+        replacement_transport = _FakeBluetoothTransport()
+        replacement_client, replacement_adapters = _client(
+            hass,
+            [replacement_transport],
+        )
+        await asyncio.wait_for(replacement_client.async_start(), timeout=0.5)
+        assert replacement_adapters == ["hci0"]
+        await replacement_client.async_stop()
+
+    asyncio.run(run())
+
+
+def test_successive_ble_clients_serialize_start_until_confirmed_stop() -> None:
+    async def run() -> None:
+        hass = _FakeHass()
+        old_transport = _FakeBluetoothTransport(block_stop=True)
+        new_transport = _FakeBluetoothTransport()
+        old_client, old_adapters = _client(hass, [old_transport])
+        new_client, new_adapters = _client(hass, [new_transport])
+
+        await old_client.async_start()
+        assert old_transport.active is True
 
         new_waiter = asyncio.create_task(new_client.async_start())
         await asyncio.sleep(0)
-        assert hass.constructor_submissions == 1
-        assert not hass.new_constructor_started.is_set()
-
-        hass.release_old_constructor.set()
-        await asyncio.wait_for(hass.old_close_started.wait(), timeout=0.2)
         await asyncio.sleep(0)
-        assert not hass.new_constructor_started.is_set()
-        assert old_interface.close_calls == 0
+        # Construction is deliberately pre-lock and Bluetooth-free; the
+        # transport itself must not start until the old teardown is confirmed.
+        assert new_adapters == ["hci0"]
+        assert new_transport.start_calls == 0
 
-        hass.release_old_close.set()
-        await asyncio.wait_for(hass.new_constructor_started.wait(), timeout=0.2)
-        await asyncio.wait_for(new_waiter, timeout=0.2)
+        old_stop = asyncio.create_task(old_client.async_stop())
+        await old_transport.stop_entered.wait()
+        await asyncio.sleep(0)
+        assert old_transport.active is True
+        assert new_adapters == ["hci0"]
+        assert new_transport.start_calls == 0
 
-        assert hass.constructor_submissions == 2
-        assert hass.max_active_constructors == 1
-        assert old_interface.close_calls == 1
-        assert old_client._interface is None
-        assert True not in old_statuses
-        assert new_client._interface is new_interface
-        assert new_statuses == [True]
+        old_transport.stop_gate.set()
+        await old_stop
+        await asyncio.wait_for(new_transport.start_entered.wait(), timeout=0.5)
+        await asyncio.wait_for(new_waiter, timeout=0.5)
 
+        assert old_adapters == ["hci0"]
+        assert new_adapters == ["hci0"]
+        assert old_transport.active is False
+        assert new_transport.active is True
+        assert old_client._native_lock is None
         await new_client.async_stop()
-        assert new_interface.close_calls == 1
-        assert any("transport startup" in name for name in hass.background_task_names)
-        assert any("interface close" in name for name in hass.background_task_names)
 
     asyncio.run(run())
 
 
-def test_failed_close_keeps_replacement_constructor_blocked(monkeypatch) -> None:
-    """An unconfirmed native close must keep the endpoint lease held."""
-
-    class TrackingExecutorHass(_ControlledExecutorHass):
-        def __init__(self) -> None:
-            super().__init__()
-            self.constructor_submissions = 0
-
-        async def async_add_executor_job(self, target, *args):
-            if getattr(target, "__name__", "").startswith("make_"):
-                self.constructor_submissions += 1
-            return await super().async_add_executor_job(target, *args)
-
-    class FailingCloseInterface(_FakeInterface):
-        def close(self) -> None:
-            self.close_calls += 1
-            raise RuntimeError("native close failed")
-
+def test_failed_ble_stop_retains_endpoint_lock_and_blocks_replacement() -> None:
     async def run() -> None:
-        _install_fake_pubsub(monkeypatch)
-        hass = TrackingExecutorHass()
-        hass.release_constructor.set()
-        old_interface = FailingCloseInterface()
-        new_interface = _FakeInterface()
-        old_client = _client(hass, old_interface, [])
-        new_client = _client(hass, new_interface, [])
-
-        def make_old_interface():
-            return old_interface
-
-        def make_new_interface():
-            return new_interface
-
-        old_client._make_native_interface = make_old_interface
-        new_client._make_native_interface = make_new_interface
+        hass = _FakeHass()
+        old_transport = _FakeBluetoothTransport(
+            fail_stop=RuntimeError("GATT disconnect failed")
+        )
+        new_transport = _FakeBluetoothTransport()
+        old_client, _old_adapters = _client(hass, [old_transport])
+        new_client, new_adapters = _client(hass, [new_transport])
 
         await old_client.async_start()
-        assert hass.constructor_submissions == 1
 
-        with pytest.raises(RuntimeError, match="native close failed"):
+        with pytest.raises(RuntimeError, match="GATT disconnect failed"):
             await old_client.async_stop()
 
-        assert old_interface.close_calls == 1
+        assert old_client._ble_transport is old_transport
         assert old_client._native_lock is not None
         assert old_client._native_lock.locked()
 
         new_waiter = asyncio.create_task(new_client.async_start())
         await asyncio.sleep(0)
         await asyncio.sleep(0)
-
-        # The failed close means it is unsafe to submit a second native
-        # constructor for the same Bluetooth address.
-        assert hass.constructor_submissions == 1
-        assert new_client._native_lock is None
+        assert new_adapters == ["hci0"]
+        assert new_transport.start_calls == 0
         assert not new_waiter.done()
 
         new_waiter.cancel()
         with pytest.raises(asyncio.CancelledError):
             await new_waiter
-
         pending_start = new_client._start_task
         assert pending_start is not None
         pending_start.cancel()
@@ -773,95 +864,387 @@ def test_failed_close_keeps_replacement_constructor_blocked(monkeypatch) -> None
     asyncio.run(run())
 
 
-def test_cancelled_native_send_finishes_before_interface_close(monkeypatch) -> None:
-    """A canceled service waiter cannot hide a running SDK executor thread."""
-
+def test_resume_after_uncertain_stop_restores_transport_callbacks() -> None:
     async def run() -> None:
-        monkeypatch.setattr(meshtastic_client_module, "_STOP_WAIT_TIMEOUT", 0.01)
-        hass = _CancellationResistantExecutorHass()
-        interface = _BlockingNativeInterface()
-        hass.interface = interface
-        client = _client(hass, interface, [])
-        client._interface = interface
-        client.status.connected = True
+        hass = _FakeHass()
+        transport = _FakeBluetoothTransport(
+            fail_stop=RuntimeError("uncertain teardown")
+        )
+        packets: list[Any] = []
+        client, _adapters = _client(hass, [transport], packets=packets)
+
+        await client.async_start()
+        assert len(transport.packet_callbacks) == 1
+        assert len(transport.connection_callbacks) == 1
+
+        with pytest.raises(RuntimeError, match="uncertain teardown"):
+            await client.async_stop()
+        assert client._ble_transport is transport
+        assert transport.packet_callbacks == []
+        assert transport.connection_callbacks == []
+
+        transport.fail_stop = None
+        await asyncio.sleep(0)
+        await client.async_start()
+
+        assert transport.start_calls == 1
+        assert len(transport.packet_callbacks) == 1
+        assert len(transport.connection_callbacks) == 1
+        await transport.emit_packet(
+            {
+                "id": 18,
+                "fromId": "!12345678",
+                "decoded": {
+                    "portnum": "TEXT_MESSAGE_APP",
+                    "text": "callback restored",
+                },
+            }
+        )
+        assert [packet.text for packet in packets] == ["callback restored"]
+        await client.async_stop()
+
+    asyncio.run(run())
+
+
+def test_ble_never_uses_sync_constructor_pubsub_or_executor() -> None:
+    async def run() -> None:
+        hass = _FakeHass()
+        transport = _FakeBluetoothTransport(block_start=True)
+        client, _adapters = _client(hass, [transport])
+
+        start_waiter = asyncio.create_task(client.async_start())
+        await transport.start_entered.wait()
+
+        diagnostics = client.diagnostic_snapshot()
+        assert client._interface is None
+        assert client._native_constructor_future is None
+        assert diagnostics["native_constructor_state"] == "not_created"
+        assert diagnostics["native_subscription_count"] == 0
+        assert diagnostics["native_executor_operation_count"] == 0
+        assert hass.executor_calls == 0
+
+        transport.start_gate.set()
+        await start_waiter
+        assert hass.executor_calls == 0
+        await client.async_stop()
+
+    asyncio.run(run())
+
+
+def test_real_ble_transport_implements_client_async_contract() -> None:
+    """Prevent fake-only tests from drifting away from the real transport."""
+    for method_name in (
+        "async_start",
+        "async_stop",
+        "async_send_text",
+        "async_node_snapshot",
+        "diagnostic_snapshot",
+        "add_packet_callback",
+        "add_connection_callback",
+    ):
+        assert callable(getattr(MeshtasticBluetoothTransport, method_name, None))
+
+
+def test_ble_uses_transport_local_callbacks_and_unsubscribes_on_stop() -> None:
+    async def run() -> None:
+        hass = _FakeHass()
+        transport = _FakeBluetoothTransport()
+        statuses: list[bool] = []
+        packets: list[Any] = []
+        client, _adapters = _client(
+            hass,
+            [transport],
+            statuses=statuses,
+            packets=packets,
+        )
+
+        await client.async_start()
+        assert len(transport.packet_callbacks) == 1
+        assert len(transport.connection_callbacks) == 1
+        packet_callback = transport.packet_callbacks[0]
+        connection_callback = transport.connection_callbacks[0]
+
+        await transport.emit_packet(
+            {
+                "id": 17,
+                "fromId": "!12345678",
+                "decoded": {
+                    "portnum": "TEXT_MESSAGE_APP",
+                    "text": "local packet",
+                },
+            }
+        )
+        await transport.emit_connection(False)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert len(packets) == 1
+        assert packets[0].text == "local packet"
+        assert packets[0].gateway_id == "ble-gateway"
+        # Startup reports connected, packet receipt refreshes the same status,
+        # then the transport-local link event reports the disconnect.
+        assert statuses == [True, True, False]
+
+        await client.async_stop()
+        assert transport.packet_callbacks == []
+        assert transport.connection_callbacks == []
+        assert transport.packet_unsubscribe_calls == 1
+        assert transport.connection_unsubscribe_calls == 1
+        post_stop_status_count = len(statuses)
+
+        # Even an already-queued stale callback must not mutate an unloaded
+        # client after ownership has been detached.
+        await packet_callback({"id": 18, "decoded": {"text": "late"}})
+        await connection_callback(True)
+        await asyncio.sleep(0)
+        assert len(packets) == 1
+        assert len(statuses) == post_stop_status_count
+
+    asyncio.run(run())
+
+
+def test_ble_send_uses_async_transport_without_executor() -> None:
+    async def run() -> None:
+        hass = _FakeHass()
+        transport = _FakeBluetoothTransport()
+        statuses: list[bool] = []
+        client, _adapters = _client(hass, [transport], statuses=statuses)
+        await client.async_start()
+
+        message_id = await client.async_send_message(
+            target_node="!12345678",
+            message="local only",
+            channel="2",
+            priority="normal",
+            message_type="direct",
+        )
+
+        assert len(message_id) == 16
+        assert transport.send_calls == [
+            {
+                "target_node": "!12345678",
+                "message": "local only",
+                "channel": "2",
+                "priority": "normal",
+                "message_type": "direct",
+            }
+        ]
+        assert client.status.packets_sent == 1
+        assert statuses == [True, True]
+        assert hass.executor_calls == 0
+        await client.async_stop()
+
+    asyncio.run(run())
+
+
+def test_ble_refresh_uses_async_node_snapshot_and_normalizes_nodes() -> None:
+    async def run() -> None:
+        hass = _FakeHass()
+        transport = _FakeBluetoothTransport(
+            nodes={
+                305419896: {
+                    "num": 305419896,
+                    "user": {
+                        "id": "!12345678",
+                        "longName": "Backyard node",
+                        "shortName": "BY",
+                    },
+                    "deviceMetrics": {"batteryLevel": 87},
+                }
+            }
+        )
+        nodes: list[Any] = []
+        client, _adapters = _client(hass, [transport], nodes=nodes)
+
+        await client.async_start()
+
+        assert transport.refresh_calls == 1
+        assert len(nodes) == 1
+        assert nodes[0].node_id == "!12345678"
+        assert nodes[0].long_name == "Backyard node"
+        assert nodes[0].power["battery_level"] == 87.0
+        assert nodes[0].last_gateway_id == "ble-gateway"
+        assert hass.executor_calls == 0
+        await client.async_stop()
+
+    asyncio.run(run())
+
+
+def test_cancelled_ble_send_finishes_before_transport_stop() -> None:
+    async def run() -> None:
+        hass = _FakeHass()
+        transport = _FakeBluetoothTransport(block_send=True)
+        client, _adapters = _client(hass, [transport])
+        await client.async_start()
 
         send_task = asyncio.create_task(
             client.async_send_message(
                 target_node=None,
-                message="thread-owned send",
+                message="cancel me",
                 channel=None,
                 priority="normal",
                 message_type="broadcast",
             )
         )
-        try:
-            await asyncio.wait_for(hass.operation_started.wait(), timeout=1)
-            interface.send_started = True
-            send_task.cancel()
-            await asyncio.sleep(0)
-
-            # Cancellation is retained until the executor owner drains, so the
-            # coordinator cannot mistake the SDK operation for completed work.
-            assert send_task.done() is False
-
-            await asyncio.wait_for(client.async_stop(), timeout=0.2)
-
-            # Public stop is bounded, but close remains retained behind the
-            # exact interface operation rather than racing its worker thread.
-            assert interface.close_started.is_set() is False
-            assert client._native_executor_tasks
-        finally:
-            hass.release_operation.set()
-
+        await transport.send_entered.wait()
+        send_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await send_task
-        await asyncio.wait_for(interface.close_started.wait(), timeout=1)
-        await asyncio.sleep(0)
 
-        assert interface.close_calls == 1
-        assert interface.close_overlapped_send is False
-        assert client._native_executor_tasks == {}
+        assert transport.send_cancelled.is_set()
+        assert transport.send_active is False
+        await client.async_stop()
+
+        assert transport.stop_overlapped_send is False
+        assert hass.executor_calls == 0
 
     asyncio.run(run())
 
 
-def test_cancelled_native_refresh_finishes_before_interface_close(
-    monkeypatch,
-) -> None:
-    """A canceled refresh cannot let close race an SDK node snapshot thread."""
+def test_ble_stop_cancels_and_awaits_active_send_before_transport_stop() -> None:
+    async def run() -> None:
+        hass = _FakeHass()
+        transport = _FakeBluetoothTransport(block_send=True)
+        client, _adapters = _client(hass, [transport])
+        await client.async_start()
 
+        send_task = asyncio.create_task(
+            client.async_send_message(
+                target_node=None,
+                message="stop owns cancellation",
+                channel=None,
+                priority="normal",
+                message_type="broadcast",
+            )
+        )
+        await transport.send_entered.wait()
+
+        await asyncio.wait_for(client.async_stop(), timeout=0.5)
+        with pytest.raises(asyncio.CancelledError):
+            await send_task
+
+        assert transport.send_cancelled.is_set()
+        assert transport.stop_calls == 1
+        assert transport.stop_overlapped_send is False
+        assert client._native_lock is None
+        assert hass.executor_calls == 0
+
+    asyncio.run(run())
+
+
+def test_ble_stop_is_bounded_when_send_resists_cancellation(monkeypatch) -> None:
     async def run() -> None:
         monkeypatch.setattr(meshtastic_client_module, "_STOP_WAIT_TIMEOUT", 0.01)
-        hass = _CancellationResistantExecutorHass()
-        interface = _BlockingNativeInterface()
-        hass.interface = interface
-        client = _client(hass, interface, [])
-        client._interface = interface
-        client.status.connected = True
+        hass = _FakeHass()
+        transport = _FakeBluetoothTransport(
+            block_send=True,
+            resist_send_cancel=True,
+        )
+        replacement = _FakeBluetoothTransport()
+        client, adapters = _client(hass, [transport, replacement])
+        await client.async_start()
 
-        refresh_task = asyncio.create_task(client.async_refresh())
-        try:
-            await asyncio.wait_for(hass.operation_started.wait(), timeout=1)
-            interface.refresh_started = True
-            refresh_task.cancel()
+        send_task = asyncio.create_task(
+            client.async_send_message(
+                target_node=None,
+                message="resist cancellation",
+                channel=None,
+                priority="normal",
+                message_type="broadcast",
+            )
+        )
+        await transport.send_entered.wait()
+
+        with pytest.raises(RuntimeError, match="did not stop within"):
+            await asyncio.wait_for(client.async_stop(), timeout=0.5)
+
+        assert transport.send_cancelled.is_set()
+        assert transport.stop_calls == 0
+        assert client._ble_transport is transport
+        assert client._native_lock is not None
+        assert client._native_lock.locked()
+        assert "MeshNet deferred Meshtastic Bluetooth cleanup" in (
+            hass.background_task_names
+        )
+
+        # A restart cannot adopt a session that an older deferred owner is
+        # already committed to tearing down.
+        with pytest.raises(RuntimeError, match="cleanup is still pending"):
+            await client.async_start()
+        assert transport.start_calls == 1
+        assert replacement.start_calls == 0
+
+        # Teardown is retried automatically only after the I/O owner yields.
+        transport.send_gate.set()
+        await asyncio.wait_for(send_task, timeout=0.5)
+        await asyncio.wait_for(transport.stop_entered.wait(), timeout=0.5)
+        for _ in range(10):
+            if client._ble_transport is None:
+                break
             await asyncio.sleep(0)
 
-            assert refresh_task.done() is False
+        assert transport.stop_calls == 1
+        assert transport.stop_overlapped_send is False
+        assert client._ble_transport is None
+        assert client._native_lock is None
 
-            await asyncio.wait_for(client.async_stop(), timeout=0.2)
+        await client.async_start()
+        assert replacement.start_calls == 1
+        assert client._ble_transport is replacement
+        assert adapters == ["hci0", "hci0"]
+        await client.async_stop()
 
-            assert interface.close_started.is_set() is False
-            assert client._native_executor_tasks
-        finally:
-            hass.release_operation.set()
+    asyncio.run(run())
 
+
+def test_cancelled_ble_refresh_finishes_before_transport_stop() -> None:
+    async def run() -> None:
+        hass = _FakeHass()
+        transport = _FakeBluetoothTransport(block_refresh=True)
+        client, _adapters = _client(hass, [transport])
+
+        # Install an already connected transport so the deliberately blocked
+        # snapshot does not also block the startup path.
+        client._ble_transport = transport
+        client.status.connected = True
+        transport.active = True
+
+        refresh_task = asyncio.create_task(client.async_refresh())
+        await transport.refresh_entered.wait()
+        refresh_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await refresh_task
-        await asyncio.wait_for(interface.close_started.wait(), timeout=1)
-        await asyncio.sleep(0)
 
-        assert interface.close_calls == 1
-        assert interface.close_overlapped_refresh is False
-        assert client._native_executor_tasks == {}
+        assert transport.refresh_cancelled.is_set()
+        assert transport.refresh_active is False
+        await client.async_stop()
+
+        assert transport.stop_overlapped_refresh is False
+        assert hass.executor_calls == 0
+
+    asyncio.run(run())
+
+
+def test_ble_stop_cancels_and_awaits_active_refresh_before_transport_stop() -> None:
+    async def run() -> None:
+        hass = _FakeHass()
+        transport = _FakeBluetoothTransport()
+        client, _adapters = _client(hass, [transport])
+        await client.async_start()
+
+        transport.refresh_entered.clear()
+        transport.refresh_gate.clear()
+        refresh_task = asyncio.create_task(client.async_refresh())
+        await transport.refresh_entered.wait()
+
+        await asyncio.wait_for(client.async_stop(), timeout=0.5)
+        with pytest.raises(asyncio.CancelledError):
+            await refresh_task
+
+        assert transport.refresh_cancelled.is_set()
+        assert transport.stop_calls == 1
+        assert transport.stop_overlapped_refresh is False
+        assert client._native_lock is None
+        assert hass.executor_calls == 0
 
     asyncio.run(run())

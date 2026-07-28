@@ -287,16 +287,17 @@ Configure MeshNet with:
 serial_path: /dev/meshtastic0
 ```
 
-### Meshtastic Bluetooth Pairing Fails (version 0.4)
+### Meshtastic Bluetooth Pairing or Startup Fails (version 0.5)
 
-The version 0.4 pairing wizard works only through a local BlueZ adapter on the
+The pairing wizard works only through a local BlueZ adapter on the
 Home Assistant host. Bluetooth proxies cannot pair a Meshtastic radio or carry
-this direct SDK connection.
+this direct connection.
 
-Only one local Bluetooth adapter may be powered. Meshtastic 2.7.11 cannot
-select a controller, so MeshNet refuses pairing and runtime startup when more
-than one is powered or when the verified adapter is off. Installed extra
-adapters can remain powered off.
+MeshNet selects the controller by its stored stable Bluetooth address, so other
+valid local adapters may remain powered when the radio has one unambiguous
+local controller path. It refuses startup if the verified controller is absent,
+powered off, ambiguous, or has malformed BlueZ metadata; it never silently
+falls back to another controller or a Bluetooth proxy.
 
 Before retrying:
 
@@ -331,6 +332,13 @@ BLE discovery and configuration waits cannot hold the config-flow response
 open. After updating, restart Home Assistant and reload the existing entry; the
 verified BlueZ bond is preserved.
 
+Version 0.5 replaces the indefinitely blocking synchronous BLE constructor
+with a bounded async protocol session. It resolves a fresh local `BLEDevice`,
+connects GATT, validates the Meshtastic characteristics, enables FromNum
+notifications, requests configuration, and actively reads FromRadio. Every
+stage has a deadline. A failure cleans up the partial client instead of leaving
+Home Assistant startup stuck.
+
 If the radio pairs but no data arrives, another client may have reclaimed its
 single Bluetooth connection. Close that client and reload the MeshNet config
 entry. MeshNet never removes a bond during entry/HACS teardown. If you
@@ -339,24 +347,31 @@ Remove gateway** and enable **Remove this radio's current Bluetooth bond (may
 disconnect other apps)**. The option is off by default because BlueZ cannot
 distinguish a bond another app recreated at the same address.
 
-Download diagnostics before reloading. For a stalled SDK constructor, the
-identity-free fields normally show:
+Download diagnostics before reloading. The identity-free fields show the exact
+bounded stage, for example:
 
 ```text
-runtime.gateways[0].client.startup_phase: constructing_interface
-runtime.gateways[0].client.native_constructor_pending: true
-runtime.gateways[0].client.native_executor_operation_count: 1
+runtime.gateways[0].client.startup_phase: bluetooth_synchronizing_configuration
 runtime.gateways[0].client.bluetooth_adapter_validation.status: passed
+runtime.gateways[0].client.bluetooth_transport.notifications_ready: true
+runtime.gateways[0].client.bluetooth_transport.config_ready: false
 ```
 
-This means adapter validation and endpoint locking completed, but the
-Meshtastic BLE constructor has not returned. Check for another connected phone
-or computer, wake/restart the radio's Bluetooth, and then reload the MeshNet
-entry. The elapsed fields show how long the current phase has been pending;
-diagnostic collection itself does not probe or reconnect the radio.
+This example means adapter validation, GATT connection, and notification setup
+completed, but the radio did not finish its configuration exchange. Check for
+another connected phone or computer, wake or restart the radio's Bluetooth,
+and then reload the MeshNet entry. Other phase values distinguish local-device
+resolution, GATT connection, profile validation, notification setup, config
+request, active operation, teardown, and reconnect backoff. Diagnostic
+collection itself does not probe or reconnect the radio.
+
+Direct Bluetooth needs no MQTT, broker, Internet, Wi-Fi, or LAN. If Home
+Assistant shows a dependency-install error immediately after a new HACS
+install, Internet access may be needed once to download the declared Python
+packages; that is separate from normal radio operation.
 
 On Home Assistant OS, do not use root-shell or `bluetoothctl` steps for the
-normal version 0.4 path. The wizard creates a temporary agent scoped to the
+normal path. The wizard creates a temporary agent scoped to the
 selected radio and cleans it up after success, error, cancellation, or timeout.
 If the wizard reports that the local BlueZ service is unavailable, restart the
 host Bluetooth service or Home Assistant and retry; a proxy cannot substitute

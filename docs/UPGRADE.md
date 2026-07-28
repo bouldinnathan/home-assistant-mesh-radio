@@ -37,6 +37,19 @@ the diagnostics platform. Home Assistant's outer wrapper and filename still
 include the config-entry ID and standard system metadata; inspect and rename
 the complete download before sharing it.
 
+## From 0.4.x
+
+0.5.0 replaces Meshtastic's blocking synchronous `BLEInterface` with a bounded,
+Home Assistant-native async Bluetooth session. The existing verified radio bond
+and gateway configuration are preserved. Restart Home Assistant after updating,
+close any Meshtastic phone/web client, then reload the MeshNet entry.
+
+Direct Bluetooth remains local and does not require MQTT, Internet, Wi-Fi, or
+LAN connectivity. The selected adapter is now resolved by its stored stable
+controller address on every attempt, so other valid local adapters may remain
+powered when the radio resolves through one unambiguous local controller. No
+config-entry or database migration is required.
+
 ## From 0.4.0
 
 0.4.1 moves radio SDK connection work out of Home Assistant's config-entry
@@ -56,8 +69,7 @@ and MeshNet never marks their BlueZ bonds as originally paired by MeshNet.
 
 Existing Meshtastic Bluetooth gateways do not yet contain verified adapter
 metadata. Open **Configure → Edit gateway** and complete the guided pairing
-check once after upgrading. Only one local Bluetooth adapter may be powered
-during pairing and runtime; its stable controller address is then recorded.
+check once after upgrading. Its stable controller address is then recorded.
 
 0.3.0 added the USB-device picker.
 

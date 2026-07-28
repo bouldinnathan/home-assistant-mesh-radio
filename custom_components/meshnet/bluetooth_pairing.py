@@ -455,52 +455,53 @@ def _resolve_adapter_identity(objects: Any, adapter_address: str) -> str:
     return matches[0]
 
 
-def _require_sole_powered_adapter(
+def _require_selected_powered_adapter(
     objects: Any, device: _ResolvedDevice
 ) -> None:
-    """Require the selected device's adapter to be the sole powered adapter.
+    """Require the exact selected controller to remain valid and powered.
 
-    Meshtastic's BLE SDK cannot select a local controller.  Pairing on a host
-    with another powered controller could therefore create a bond the runtime
-    cannot deterministically use.  Treat incomplete Adapter1 state as unsafe
-    instead of assuming that a missing or malformed ``Powered`` means false.
+    Pairing is pinned to one Device1 object beneath one local Adapter1 path.
+    Other local controllers are irrelevant to that ownership boundary, but the
+    selected controller must still have the stable identity captured when the
+    device was resolved and an explicit, valid ``Powered=True`` state.
     """
     if not isinstance(objects, dict):
         raise BluetoothUnavailableError("BlueZ returned invalid adapter data")
 
-    powered_adapters: set[str] = set()
-    selected_adapter_seen = False
-    missing = object()
-    for path, interfaces in objects.items():
-        if not isinstance(interfaces, dict) or BLUEZ_ADAPTER not in interfaces:
-            continue
-        path_match = _ADAPTER_PATH_RE.fullmatch(path) if isinstance(path, str) else None
-        properties = interfaces.get(BLUEZ_ADAPTER)
-        if path_match is None or not isinstance(properties, dict):
-            raise BluetoothUnavailableError("BlueZ returned invalid adapter data")
+    path_match = _ADAPTER_PATH_RE.fullmatch(device.adapter_path)
+    if path_match is None or path_match.group(1) != device.adapter:
+        raise BluetoothUnavailableError("BlueZ returned invalid adapter data")
 
-        powered = _value(properties.get("Powered", missing))
-        if not isinstance(powered, bool):
-            raise BluetoothUnavailableError("BlueZ returned invalid adapter power state")
-        raw_adapter_address = _value(properties.get("Address", missing))
-        if (
-            not isinstance(raw_adapter_address, str)
-            or _MAC_RE.fullmatch(raw_adapter_address) is None
-            or raw_adapter_address.upper()
-            in {"00:00:00:00:00:00", "FF:FF:FF:FF:FF:FF"}
-        ):
-            raise BluetoothUnavailableError("BlueZ returned invalid adapter identity")
-
-        adapter = path_match.group(1)
-        if adapter == device.adapter:
-            selected_adapter_seen = True
-        if powered:
-            powered_adapters.add(adapter)
-
-    if not selected_adapter_seen or powered_adapters != {device.adapter}:
+    interfaces = objects.get(device.adapter_path)
+    if not isinstance(interfaces, dict):
         raise BluetoothUnavailableError(
-            "The selected Bluetooth adapter must be the only powered local adapter"
+            "The selected Bluetooth adapter is unavailable"
         )
+    properties = interfaces.get(BLUEZ_ADAPTER)
+    if not isinstance(properties, dict):
+        raise BluetoothUnavailableError(
+            "The selected Bluetooth adapter is unavailable"
+        )
+
+    missing = object()
+    powered = _value(properties.get("Powered", missing))
+    if not isinstance(powered, bool):
+        raise BluetoothUnavailableError("BlueZ returned invalid adapter power state")
+    if not powered:
+        raise BluetoothUnavailableError(
+            "The selected Bluetooth adapter is not powered"
+        )
+
+    raw_adapter_address = _value(properties.get("Address", missing))
+    if (
+        not isinstance(raw_adapter_address, str)
+        or _MAC_RE.fullmatch(raw_adapter_address) is None
+        or raw_adapter_address.upper()
+        in {"00:00:00:00:00:00", "FF:FF:FF:FF:FF:FF"}
+    ):
+        raise BluetoothUnavailableError("BlueZ returned invalid adapter identity")
+    if raw_adapter_address.upper() != device.adapter_address:
+        raise BluetoothUnavailableError("BlueZ adapter identity changed")
 
 
 def _load_dbus_api() -> Any:
@@ -983,7 +984,7 @@ class _BlueZPairingBackend:
             owner = await self._owner(bus, api)
             initial_objects = await self._objects(bus, api, owner)
             device = _resolve_device(initial_objects, address)
-            _require_sole_powered_adapter(initial_objects, device)
+            _require_selected_powered_adapter(initial_objects, device)
             preexisting = device.paired
 
             if device.uuids and MESHTASTIC_SERVICE_UUID not in device.uuids:
@@ -1005,7 +1006,7 @@ class _BlueZPairingBackend:
                     device.path,
                     initial_address=address,
                 )
-                _require_sole_powered_adapter(verified_objects, verified)
+                _require_selected_powered_adapter(verified_objects, verified)
                 if verified.adapter_address != device.adapter_address:
                     raise BluetoothUnavailableError(
                         "BlueZ adapter identity changed during verification"
@@ -1073,7 +1074,7 @@ class _BlueZPairingBackend:
                 device.path,
                 initial_address=address,
             )
-            _require_sole_powered_adapter(pre_pair_objects, pre_pair_device)
+            _require_selected_powered_adapter(pre_pair_objects, pre_pair_device)
             if pre_pair_device.adapter_address != device.adapter_address:
                 raise BluetoothUnavailableError(
                     "BlueZ adapter identity changed before pairing"
@@ -1124,7 +1125,7 @@ class _BlueZPairingBackend:
                 raise BluetoothUnavailableError("BlueZ restarted during pairing")
             verified_objects = await self._objects(bus, api, owner)
             verified = _device_at_path(verified_objects, device.path)
-            _require_sole_powered_adapter(verified_objects, verified)
+            _require_selected_powered_adapter(verified_objects, verified)
             if verified.adapter_address != device.adapter_address:
                 raise BluetoothUnavailableError(
                     "BlueZ adapter identity changed during pairing"

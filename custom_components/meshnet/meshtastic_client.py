@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import json
 import logging
@@ -84,12 +86,11 @@ async def _async_get_local_bluetooth_adapter_details() -> dict[str, Any]:
 
 async def _async_validate_ble_adapter(
     config: GatewayConfig,
-) -> dict[str, int | bool]:
-    """Fail closed unless the paired adapter is the only powered local one.
+) -> tuple[dict[str, int | bool], str]:
+    """Resolve the currently powered controller for the verified stable MAC.
 
-    Meshtastic 2.7.11 does not expose an adapter argument for ``BLEInterface``.
-    Allowing it to start with multiple usable adapters could therefore connect
-    through a controller other than the one whose BlueZ bond we verified.
+    The async Bluetooth transport selects the exact Home Assistant scanner that
+    belongs to this controller, so other local adapters may remain powered.
     """
     saved_adapter = config.options.get(CONF_BLUETOOTH_ADAPTER)
     saved_adapter_address = config.options.get(CONF_BLUETOOTH_ADAPTER_ADDRESS)
@@ -132,19 +133,25 @@ async def _async_validate_ble_adapter(
         if powered:
             powered_adapters.add((adapter, adapter_address.upper()))
 
-    saved_adapter_is_powered = any(
-        address == saved_adapter_address for _adapter, address in powered_adapters
-    )
-    if len(powered_adapters) != 1 or not saved_adapter_is_powered:
+    selected_adapters = [
+        adapter
+        for adapter, address in powered_adapters
+        if address == saved_adapter_address
+    ]
+    saved_adapter_is_powered = len(selected_adapters) == 1
+    if not saved_adapter_is_powered:
         raise RuntimeError(
-            "The paired Bluetooth adapter must be the only powered local adapter"
+            "The paired Bluetooth adapter is not available and powered"
         )
-    return {
-        "adapter_count": len(details),
-        "powered_adapter_count": len(powered_adapters),
-        "saved_adapter_is_powered": saved_adapter_is_powered,
-        "only_powered_adapter_matches": True,
-    }
+    return (
+        {
+            "adapter_count": len(details),
+            "powered_adapter_count": len(powered_adapters),
+            "saved_adapter_is_powered": saved_adapter_is_powered,
+            "selected_adapter_path_count": len(selected_adapters),
+        },
+        selected_adapters[0],
+    )
 
 
 def _bluetooth_adapter_failure_category(error: Exception) -> str:
@@ -152,7 +159,7 @@ def _bluetooth_adapter_failure_category(error: Exception) -> str:
     message = str(error).casefold()
     if "no verified local adapter" in message:
         return "missing_verified_adapter_metadata"
-    if "only powered local adapter" in message:
+    if "not available and powered" in message:
         return "powered_adapter_mismatch"
     if "unavailable" in message or "could not verify" in message:
         return "adapter_service_unavailable"
@@ -167,6 +174,12 @@ class MeshtasticClient(MeshGateway):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._interface: Any | None = None
+        self._ble_transport: Any | None = None
+        self._ble_packet_unsubscribe: Callable[[], None] | None = None
+        self._ble_connection_unsubscribe: Callable[[], None] | None = None
+        self._ble_callback_transport: Any | None = None
+        self._ble_operation_tasks: set[asyncio.Task[Any]] = set()
+        self._ble_deferred_cleanup_task: asyncio.Task[Any] | None = None
         self._unsub_mqtt: Any | None = None
         self._stopping = False
         self._start_task: asyncio.Task[None] | None = None
@@ -214,7 +227,9 @@ class MeshtasticClient(MeshGateway):
         now = time.monotonic()
         snapshot.update(
             {
-                "interface_active": self._interface is not None,
+                "interface_active": (
+                    self._interface is not None or self._ble_transport is not None
+                ),
                 "mqtt_subscription_active": self._unsub_mqtt is not None,
                 "stopping": self._stopping,
                 "start_task": self._diagnostic_task_state(self._start_task),
@@ -241,6 +256,15 @@ class MeshtasticClient(MeshGateway):
                     )
                 ),
                 "native_interface_executor_count": len(self._native_executor_tasks),
+                "bluetooth_operation_count": len(self._ble_operation_tasks),
+                "bluetooth_callbacks_bound": (
+                    self._ble_callback_transport is self._ble_transport
+                    and self._ble_packet_unsubscribe is not None
+                    and self._ble_connection_unsubscribe is not None
+                ),
+                "bluetooth_deferred_cleanup": self._diagnostic_task_state(
+                    self._ble_deferred_cleanup_task
+                ),
                 "native_subscription_count": sum(
                     handler is not None
                     for handler in (
@@ -268,6 +292,16 @@ class MeshtasticClient(MeshGateway):
                 "last_start_failed_phase": self._last_start_failed_phase,
                 "bluetooth_adapter_validation": dict(
                     self._bluetooth_adapter_validation
+                ),
+                "bluetooth_transport": (
+                    self._ble_transport.diagnostic_snapshot()
+                    if self._ble_transport is not None
+                    else {
+                        "implementation": "not_created",
+                        "state": "not_applicable"
+                        if self.config.transport != TRANSPORT_BLUETOOTH
+                        else "not_created",
+                    }
                 ),
             }
         )
@@ -331,6 +365,16 @@ class MeshtasticClient(MeshGateway):
         if stop_task is not None:
             await asyncio.shield(stop_task)
 
+        deferred_cleanup = self._ble_deferred_cleanup_task
+        if deferred_cleanup is not None and not deferred_cleanup.done():
+            # That task is irrevocably committed to stopping and clearing the
+            # current transport after an older cancellation-resistant operation
+            # yields. Reporting a restart now would let it tear down the newly
+            # reported session underneath the caller.
+            raise RuntimeError(
+                "Meshtastic Bluetooth cleanup is still pending; retry startup later"
+            )
+
         # An explicit start after a completed stop may safely adopt a still-
         # running constructor. It must never enqueue a second constructor.
         self._stopping = False
@@ -361,6 +405,15 @@ class MeshtasticClient(MeshGateway):
                 if self._unsub_mqtt is None:
                     self._set_startup_phase("subscribing_mqtt")
                     await self._start_mqtt()
+            elif self.config.transport == TRANSPORT_BLUETOOTH:
+                if self._ble_transport is None:
+                    await self._start_native()
+                else:
+                    # A persistent BLE supervisor can terminate after a session
+                    # failure while the adapter object and endpoint lease remain.
+                    # Rejoin/restart that exact transport instead of reporting a
+                    # disconnected object as ready.
+                    await self._resume_bluetooth_transport()
             elif self._interface is None:
                 await self._start_native()
         except asyncio.CancelledError:
@@ -428,6 +481,7 @@ class MeshtasticClient(MeshGateway):
     async def _async_stop_once(self) -> None:
         """Stop one transport instance and wait out any pending constructor."""
         start_task = self._start_task
+        start_drained = True
         try:
             if start_task is not None:
                 try:
@@ -441,6 +495,16 @@ class MeshtasticClient(MeshGateway):
                         "continuing bounded shutdown",
                         _STOP_WAIT_TIMEOUT,
                     )
+                    if self.config.transport == TRANSPORT_BLUETOOTH:
+                        # Cancellation is normally prompt, but a platform BLE
+                        # await may delay it. Never turn that OS behavior into an
+                        # unbounded Home Assistant unload.
+                        start_task.cancel()
+                        done, _ = await asyncio.wait(
+                            {start_task},
+                            timeout=_STOP_WAIT_TIMEOUT,
+                        )
+                        start_drained = start_task in done
                 except asyncio.CancelledError:
                     if not start_task.cancelled():
                         raise
@@ -449,15 +513,36 @@ class MeshtasticClient(MeshGateway):
                     # still remove subscriptions and partial state.
                     pass
         finally:
-            await self._async_cleanup_transport(emit_status=True)
+            if start_drained:
+                await self._async_cleanup_transport(emit_status=True)
             self._set_startup_phase(
                 "stopping_waiting_for_start"
                 if self.start_pending
                 else "stopped"
             )
+        if not start_drained:
+            # _start_done owns the deferred cleanup once the cancellation-
+            # resistant start finally yields. Keep the endpoint lease meanwhile.
+            raise RuntimeError(
+                "Meshtastic Bluetooth startup did not stop within the cleanup bound"
+            )
 
     async def _async_cleanup_transport(self, *, emit_status: bool) -> None:
         """Detach transport state and close its interface idempotently."""
+        deferred_cleanup = self._ble_deferred_cleanup_task
+        if (
+            deferred_cleanup is not None
+            and deferred_cleanup is not asyncio.current_task()
+            and not deferred_cleanup.done()
+        ):
+            done, _ = await asyncio.wait(
+                {deferred_cleanup},
+                timeout=_STOP_WAIT_TIMEOUT,
+            )
+            if deferred_cleanup not in done:
+                raise RuntimeError(
+                    "Meshtastic Bluetooth cleanup is waiting for an active operation"
+                )
         if self._unsub_mqtt:
             unsubscribe = self._unsub_mqtt
             self._unsub_mqtt = None
@@ -466,7 +551,30 @@ class MeshtasticClient(MeshGateway):
             except Exception as err:
                 self._logger.debug("Failed to unsubscribe Meshtastic MQTT handler: %s", err)
         self._unsubscribe_native_events()
-        if self._interface is not None:
+        if self._ble_transport is not None:
+            transport = self._ble_transport
+            self._unsubscribe_bluetooth_events()
+            pending_operations = await self._async_cancel_bluetooth_operations()
+            if pending_operations:
+                self._schedule_deferred_bluetooth_cleanup(
+                    transport,
+                    pending_operations,
+                )
+                raise RuntimeError(
+                    "Meshtastic Bluetooth operations did not stop within the cleanup bound"
+                )
+            self._interface = None
+            try:
+                await transport.async_stop()
+            except Exception:
+                # An unconfirmed GATT teardown must retain the endpoint lease.
+                self._ble_transport = transport
+                raise
+            else:
+                if self._ble_transport is transport:
+                    self._ble_transport = None
+                self._release_native_lock()
+        elif self._interface is not None:
             interface = self._interface
             self._interface = None
             await self._async_close_interface(interface, release_native_lock=True)
@@ -610,6 +718,153 @@ class MeshtasticClient(MeshGateway):
         self._connect_handler = None
         self._disconnect_handler = None
 
+    def _unsubscribe_bluetooth_events(self) -> None:
+        """Detach transport-local callbacks without touching global pubsub."""
+        callbacks = (
+            self._ble_packet_unsubscribe,
+            self._ble_connection_unsubscribe,
+        )
+        self._ble_packet_unsubscribe = None
+        self._ble_connection_unsubscribe = None
+        self._ble_callback_transport = None
+        for unsubscribe in callbacks:
+            if unsubscribe is None:
+                continue
+            try:
+                unsubscribe()
+            except Exception as err:
+                self._logger.debug(
+                    "Failed to unsubscribe Meshtastic Bluetooth callback: %s",
+                    err,
+                )
+
+    def _subscribe_bluetooth_events(self, transport: Any) -> None:
+        """Attach one exact transport's callbacks idempotently."""
+        if (
+            self._ble_callback_transport is transport
+            and self._ble_packet_unsubscribe is not None
+            and self._ble_connection_unsubscribe is not None
+        ):
+            return
+        # A partial registration is never useful and can duplicate delivery on
+        # retry. Remove it before rebuilding the pair.
+        self._unsubscribe_bluetooth_events()
+
+        async def packet_handler(packet: dict[str, Any]) -> None:
+            if self._ble_transport is not transport or self._stopping:
+                return
+            await self._handle_native_packet(packet)
+
+        async def connection_handler(connected: bool) -> None:
+            if self._ble_transport is not transport or self._stopping:
+                return
+            if self.status.connected != connected:
+                await self._set_connected(connected)
+
+        try:
+            add_packet_callback = getattr(transport, "add_packet_callback", None)
+            if not callable(add_packet_callback):
+                raise RuntimeError(
+                    "Meshtastic Bluetooth transport has no packet callback API"
+                )
+            packet_unsubscribe = add_packet_callback(packet_handler)
+            if not callable(packet_unsubscribe):
+                raise RuntimeError(
+                    "Meshtastic Bluetooth packet callback has no remover"
+                )
+            self._ble_packet_unsubscribe = packet_unsubscribe
+            add_connection_callback = getattr(
+                transport, "add_connection_callback", None
+            )
+            if not callable(add_connection_callback):
+                raise RuntimeError(
+                    "Meshtastic Bluetooth transport has no connection callback API"
+                )
+            connection_unsubscribe = add_connection_callback(connection_handler)
+            if not callable(connection_unsubscribe):
+                raise RuntimeError(
+                    "Meshtastic Bluetooth connection callback has no remover"
+                )
+            self._ble_connection_unsubscribe = connection_unsubscribe
+            self._ble_callback_transport = transport
+        except BaseException:
+            self._unsubscribe_bluetooth_events()
+            raise
+
+    async def _async_cancel_bluetooth_operations(
+        self,
+    ) -> set[asyncio.Task[Any]]:
+        """Cancel BLE operations without allowing an OS await to hang unload."""
+        current = asyncio.current_task()
+        tasks = {
+            task
+            for task in self._ble_operation_tasks
+            if task is not current and not task.done()
+        }
+        for task in tasks:
+            task.cancel()
+        if not tasks:
+            return set()
+        _done, pending = await asyncio.wait(
+            tasks,
+            timeout=_STOP_WAIT_TIMEOUT,
+        )
+        return set(pending)
+
+    def _schedule_deferred_bluetooth_cleanup(
+        self,
+        transport: Any,
+        pending_operations: set[asyncio.Task[Any]],
+    ) -> None:
+        """Retry teardown after cancellation-resistant BlueZ work yields."""
+        existing = self._ble_deferred_cleanup_task
+        if existing is not None and not existing.done():
+            return
+
+        async def cleanup_after_operations() -> None:
+            await asyncio.gather(*pending_operations, return_exceptions=True)
+            if self._ble_transport is not transport:
+                return
+            try:
+                await transport.async_stop()
+            except Exception as err:
+                # Keep both the transport and endpoint lease. A later explicit
+                # stop can retry; releasing either would permit two GATT owners.
+                self._logger.debug(
+                    "Deferred Meshtastic Bluetooth cleanup failed: %s",
+                    err,
+                )
+                return
+            if self._ble_transport is transport:
+                self._ble_transport = None
+            self._release_native_lock()
+            await self._set_connected(False)
+
+        cleanup_task = self._async_create_background_task(
+            cleanup_after_operations(),
+            "MeshNet deferred Meshtastic Bluetooth cleanup",
+        )
+        self._ble_deferred_cleanup_task = cleanup_task
+
+        def cleanup_done(done_task: asyncio.Task[Any]) -> None:
+            if self._ble_deferred_cleanup_task is done_task:
+                self._ble_deferred_cleanup_task = None
+            if not done_task.cancelled():
+                done_task.exception()
+
+        cleanup_task.add_done_callback(cleanup_done)
+
+    async def _async_run_bluetooth_operation(self, operation: Any) -> Any:
+        """Retain one caller-owned async BLE operation until it is finished."""
+        task = asyncio.current_task()
+        if task is not None:
+            self._ble_operation_tasks.add(task)
+        try:
+            return await operation
+        finally:
+            if task is not None:
+                self._ble_operation_tasks.discard(task)
+
     async def async_send_message(
         self,
         *,
@@ -631,6 +886,19 @@ class MeshtasticClient(MeshGateway):
                 priority=priority,
                 message_type=message_type,
                 message_id=message_id,
+            )
+        elif self.config.transport == TRANSPORT_BLUETOOTH:
+            transport = self._ble_transport
+            if transport is None:
+                raise RuntimeError("Meshtastic Bluetooth is not connected")
+            await self._async_run_bluetooth_operation(
+                transport.async_send_text(
+                    target_node=target_node,
+                    message=message,
+                    channel=channel,
+                    priority=priority,
+                    message_type=message_type,
+                )
             )
         else:
             interface = self._interface
@@ -655,6 +923,22 @@ class MeshtasticClient(MeshGateway):
 
     async def async_refresh(self) -> None:
         """Refresh node DB from the native interface."""
+        if self.config.transport == TRANSPORT_BLUETOOTH:
+            transport = self._ble_transport
+            if transport is None:
+                return
+            nodes = await self._async_run_bluetooth_operation(
+                transport.async_node_snapshot()
+            )
+            for node_id, node in nodes.items():
+                normalized = meshtastic_node_to_state(
+                    node,
+                    gateway_id=self.config.gateway_id,
+                    fallback_node_id=node_id,
+                )
+                await self._emit_node(normalized)
+            return
+
         interface = self._interface
         if interface is None:
             return
@@ -676,7 +960,9 @@ class MeshtasticClient(MeshGateway):
             self._set_startup_phase("validating_bluetooth_adapter")
             self._bluetooth_adapter_validation = {"status": "pending"}
             try:
-                adapter_summary = await _async_validate_ble_adapter(self.config)
+                adapter_summary, adapter = await _async_validate_ble_adapter(
+                    self.config
+                )
             except Exception as err:
                 self._bluetooth_adapter_validation = {
                     "status": "failed",
@@ -690,9 +976,14 @@ class MeshtasticClient(MeshGateway):
                 "status": "passed",
                 **adapter_summary,
             }
-            if self._stopping:
-                return
+            if not self._stopping:
+                await self._start_bluetooth(adapter)
+            return
 
+        await self._start_sync_native()
+
+    async def _start_sync_native(self) -> None:
+        """Start the legacy synchronous SDK for serial and TCP only."""
         try:
             from pubsub import pub
         except ImportError as err:
@@ -764,10 +1055,7 @@ class MeshtasticClient(MeshGateway):
             self._native_constructor_future = None
 
         if self._stopping:
-            await self._async_close_interface(
-                interface,
-                release_native_lock=True,
-            )
+            await self._async_close_interface(interface, release_native_lock=True)
             return
 
         self._interface = interface
@@ -783,10 +1071,7 @@ class MeshtasticClient(MeshGateway):
         except Exception as err:
             self._unsubscribe_native_events()
             self._interface = None
-            await self._async_close_interface(
-                interface,
-                release_native_lock=True,
-            )
+            await self._async_close_interface(interface, release_native_lock=True)
             if not self._stopping:
                 await self._emit_error(err)
             raise
@@ -801,11 +1086,90 @@ class MeshtasticClient(MeshGateway):
             if self._interface is interface:
                 self._unsubscribe_native_events()
                 self._interface = None
-                await self._async_close_interface(
-                    interface,
-                    release_native_lock=True,
-                )
+                await self._async_close_interface(interface, release_native_lock=True)
             raise
+
+    async def _start_bluetooth(self, adapter: str) -> None:
+        """Start the bounded asyncio BLE transport on one verified controller."""
+        # Construction imports protobuf code but does not touch Bluetooth. Do
+        # it before taking the process endpoint lease so a dependency or API
+        # error cannot strand a locked endpoint.
+        transport = self._make_bluetooth_transport(adapter)
+        self._set_startup_phase("waiting_for_endpoint_lock")
+        native_lock = _native_endpoint_lock(self._native_endpoint())
+        await native_lock.acquire()
+        self._native_lock = native_lock
+        if self._stopping:
+            self._release_native_lock()
+            return
+
+        self._ble_transport = transport
+
+        try:
+            self._subscribe_bluetooth_events(transport)
+            await transport.async_start()
+            if self._stopping:
+                await self._async_cleanup_transport(emit_status=False)
+                return
+            if not self.status.connected:
+                await self._set_connected(True)
+            self._set_startup_phase("refreshing_nodes")
+            await self.async_refresh()
+        except BaseException:
+            self._unsubscribe_bluetooth_events()
+            try:
+                await transport.async_stop()
+            except Exception as cleanup_error:
+                self._ble_transport = transport
+                self._logger.debug(
+                    "Failed to stop Meshtastic Bluetooth after startup failure: %s",
+                    cleanup_error,
+                )
+            else:
+                if self._ble_transport is transport:
+                    self._ble_transport = None
+                self._release_native_lock()
+            raise
+
+    async def _resume_bluetooth_transport(self) -> None:
+        """Rejoin or restart the existing persistent BLE transport safely."""
+        deferred_cleanup = self._ble_deferred_cleanup_task
+        if deferred_cleanup is not None and not deferred_cleanup.done():
+            raise RuntimeError(
+                "Meshtastic Bluetooth cleanup is still pending; retry startup later"
+            )
+        transport = self._ble_transport
+        if transport is None:
+            raise RuntimeError("Meshtastic Bluetooth transport is unavailable")
+        if not bool(getattr(transport, "connected", False)):
+            self._set_startup_phase("resuming_bluetooth")
+            await transport.async_start()
+        self._subscribe_bluetooth_events(transport)
+        if self._stopping:
+            await self._async_cleanup_transport(emit_status=False)
+            return
+        if not self.status.connected:
+            await self._set_connected(True)
+        self._set_startup_phase("refreshing_nodes")
+        await self.async_refresh()
+
+    def _make_bluetooth_transport(self, adapter: str) -> Any:
+        """Construct the local-only async BLE adapter lazily."""
+        from .meshtastic_ble import MeshtasticBluetoothTransport
+
+        if not self.config.ble_address:
+            raise RuntimeError("Bluetooth transport requires ble_address")
+        adapter_address = self.config.options.get(CONF_BLUETOOTH_ADAPTER_ADDRESS)
+        if not isinstance(adapter_address, str):
+            raise RuntimeError("Bluetooth setup has no verified local adapter")
+        return MeshtasticBluetoothTransport(
+            self.hass,
+            address=self.config.ble_address,
+            adapter=adapter,
+            adapter_address=adapter_address,
+            logger=self._logger,
+            phase_callback=self._set_startup_phase,
+        )
 
     def _make_native_interface(self) -> Any:
         if self.config.transport == TRANSPORT_SERIAL:
@@ -822,11 +1186,9 @@ class MeshtasticClient(MeshGateway):
                 return meshtastic.tcp_interface.TCPInterface(host, portNumber=self.config.port)
             return meshtastic.tcp_interface.TCPInterface(host)
         if self.config.transport == TRANSPORT_BLUETOOTH:
-            import meshtastic.ble_interface
-
-            if not self.config.ble_address:
-                raise RuntimeError("Bluetooth transport requires ble_address")
-            return meshtastic.ble_interface.BLEInterface(self.config.ble_address)
+            raise RuntimeError(
+                "Bluetooth uses MeshNet's bounded asynchronous transport"
+            )
         raise RuntimeError(f"Unsupported Meshtastic transport: {self.config.transport}")
 
     async def _start_mqtt(self) -> None:
@@ -985,7 +1347,7 @@ def meshtastic_node_to_state(
     position = raw.get("position") if isinstance(raw.get("position"), dict) else {}
     device_metrics = raw.get("deviceMetrics") if isinstance(raw.get("deviceMetrics"), dict) else {}
     node_id = str(user.get("id") or raw.get("id") or raw.get("num") or fallback_node_id or "") or None
-    mac = user.get("macaddr") or user.get("mac")
+    mac = _normalize_meshtastic_mac(user.get("macaddr") or user.get("mac"))
     node_key = canonical_node_key(PROTOCOL_MESHTASTIC, node_id=node_id, mac=mac)
     last_heard = parse_timestamp(raw.get("lastHeard")) or parse_timestamp(raw.get("last_heard"))
     if last_heard is None and isinstance(raw.get("lastHeard"), (int, float)):
@@ -1051,7 +1413,7 @@ def meshtastic_packet_to_node(packet: MeshPacket) -> NodeState | None:
         }
     if not packet.sender and not user and not position and not telemetry:
         return None
-    mac = user.get("macaddr") or user.get("mac")
+    mac = _normalize_meshtastic_mac(user.get("macaddr") or user.get("mac"))
     node_id = str(user.get("id") or packet.sender or "") or None
     node_key = canonical_node_key(PROTOCOL_MESHTASTIC, node_id=node_id, mac=mac)
     sensors: dict[str, Any] = {}
@@ -1114,6 +1476,37 @@ def _flatten_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         if isinstance(value, (str, int, float, bool)) or value is None:
             flattened[_snake(key)] = value
     return flattened
+
+
+def _normalize_meshtastic_mac(value: Any) -> str | None:
+    """Return a stable hex MAC from SDK bytes or protobuf JSON base64.
+
+    ``MessageToDict`` represents the protobuf ``User.macaddr`` bytes field as
+    case-sensitive base64.  Passing that representation to the generic node-key
+    helper would lowercase and corrupt it, so normalize valid six-byte values
+    before deriving the public node key.  Existing textual identifiers that are
+    not a Meshtastic MAC are left intact for backward compatibility.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raw_bytes = bytes(value)
+        return raw_bytes.hex() if len(raw_bytes) == 6 else None
+    if not isinstance(value, str):
+        text = str(value).strip()
+        return text or None
+
+    text = value.strip()
+    if not text:
+        return None
+    compact = text.replace(":", "").replace("-", "")
+    if len(compact) == 12 and all(char in "0123456789abcdefABCDEF" for char in compact):
+        return compact.lower()
+    try:
+        decoded = base64.b64decode(text, validate=True)
+    except (binascii.Error, ValueError):
+        return text
+    return decoded.hex() if len(decoded) == 6 else text
 
 
 def _snake(value: str) -> str:

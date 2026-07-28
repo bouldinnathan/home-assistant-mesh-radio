@@ -65,13 +65,19 @@ the setup dialog or Home Assistant startup open.
 
 For USB serial, the setup form lists local devices visible to Home Assistant. Choose one from the dropdown, or type an advanced path such as `/dev/serial/by-id/usb-YOUR_RADIO` or a custom container mapping.
 
+For a fully local Meshtastic setup, choose **Bluetooth**. The radio talks
+directly to the selected adapter on the Home Assistant host; no MQTT broker,
+Internet access, Wi-Fi, or LAN connection is used after the integration and its
+Python dependencies have been installed. Wi-Fi/TCP remains an optional
+fallback, not a requirement.
+
 ## Pick the easiest connection
 
 | Radio | Connection | When to use it |
 | --- | --- | --- |
 | Meshtastic | Wi-Fi/Ethernet TCP | Recommended when the radio is on the LAN; default port `4403` |
 | Meshtastic | USB serial | Reliable local connection; use a stable `/dev/serial/by-id/` path |
-| Meshtastic | Bluetooth | Local adapter only; useful when TCP/USB is unavailable |
+| Meshtastic | Bluetooth | Direct, offline local connection; no MQTT, Wi-Fi, or Internet required |
 | Meshtastic | MQTT JSON | Advanced; requires Meshtastic JSON uplink and an exact downlink topic for sending |
 | MeshCore | USB serial | Recommended direct MeshCore connection |
 | MeshCore | Wi-Fi/Ethernet TCP | Use the TCP port configured by the device or bridge |
@@ -80,21 +86,22 @@ For USB serial, the setup form lists local devices visible to Home Assistant. Ch
 
 MQTT is not a magic replacement for a broker or bridge. Meshtastic MQTT consumes only the decoded `/json/` branch; MeshCore MQTT and REST require a compatible external JSON bridge.
 
-### Meshtastic Bluetooth pairing in version 0.4
+### Direct Meshtastic Bluetooth
 
 > [!NOTE]
-> This describes the version 0.4 behavior. Install a version 0.4 build before
+> This describes the version 0.5 behavior. Install a version 0.5 build before
 > expecting these pairing controls in Home Assistant.
 
-Version 0.4 adds a Home Assistant pairing wizard for Meshtastic radios on a
+MeshNet provides a Home Assistant pairing wizard for Meshtastic radios on a
 local BlueZ adapter. Choose a discovered radio from the dropdown, or use the
 advanced field to enter its canonical MAC address (for example,
 `AA:BB:CC:DD:EE:FF`). Bluetooth proxies cannot perform this direct pairing.
-Because Meshtastic 2.7.11 cannot select a Linux controller, the paired adapter
-must be the only powered local Bluetooth adapter; additional adapters may stay
-installed but must be powered off. MeshNet records the controller's stable
-hardware address, so Linux `hciN` renumbering cannot redirect runtime validation
-or an explicitly confirmed cleanup to another adapter.
+MeshNet records the controller's stable hardware address and resolves a fresh
+Home Assistant `BLEDevice` through that exact local controller on every
+connection attempt. Other valid local adapters may remain powered when the
+selected radio is visible through one unambiguous local controller; Linux
+`hciN` renumbering cannot redirect runtime validation or an explicitly
+confirmed cleanup to another adapter.
 
 Close the Meshtastic phone app before pairing; a radio normally accepts only
 one Bluetooth client at a time. Select **Start pairing**, then enter the
@@ -115,6 +122,15 @@ roll back the still-uncommitted bond using identity-guarded D-Bus state.
 **Configure → Remove gateway** offers an optional current-bond removal checkbox
 that is off by default and warns that other apps may be disconnected. Leaving it
 off preserves the BlueZ bond.
+
+After pairing, MeshNet keeps one persistent, local BLE connection. Its async
+transport subscribes for radio notifications before requesting configuration,
+actively reads the first response, bounds connection/configuration/teardown,
+and reconnects with backoff after an established session is lost. This avoids
+the indefinitely blocking synchronous BLE constructor used by older releases.
+The radio normally permits only one Bluetooth client, so close the Meshtastic
+phone or web client while Home Assistant owns the connection; use MeshNet's
+local Home Assistant panel for normal operation.
 
 ## Container hardware access
 
@@ -140,7 +156,7 @@ volumes:
 ```
 
 The radio SDKs require a local Bluetooth adapter; Home Assistant Bluetooth
-proxies are not supported for these direct connections or for the version 0.4
+proxies are not supported for these direct connections or for the version 0.5
 pairing wizard.
 
 ## Verify and troubleshoot
@@ -184,6 +200,7 @@ The integration source is `custom_components/meshnet`. Runtime history is stored
 
 ## License
 
-MeshNet is available under the [MIT License](LICENSE). Meshtastic, MeshCore,
-Home Assistant, and their respective names and logos belong to their respective
-owners; this project is not affiliated with or endorsed by them.
+MeshNet's source is available under the [MIT License](LICENSE). Installed
+Meshtastic, MeshCore, Home Assistant, and other third-party runtime dependencies
+remain under their own licenses. Their respective names and logos belong to
+their owners; this project is not affiliated with or endorsed by them.
