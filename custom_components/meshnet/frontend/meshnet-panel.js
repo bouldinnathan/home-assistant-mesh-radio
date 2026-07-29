@@ -30,6 +30,8 @@ class MeshNetPanel extends HTMLElement {
     this._panelReportFailureCount = 0;
     this._windowErrorHandler = null;
     this._windowRejectionHandler = null;
+    this._pollRenderPending = false;
+    this._focusFlushGeneration = 0;
   }
 
   set hass(hass) {
@@ -49,6 +51,8 @@ class MeshNetPanel extends HTMLElement {
     this._connected = false;
     this._detachWindowFailureHandlers();
     this._loaded = false;
+    this._pollRenderPending = false;
+    this._focusFlushGeneration += 1;
     this._pollEpoch += 1;
     this._snapshotGeneration += 1;
     if (this._pollTimer != null) window.clearTimeout(this._pollTimer);
@@ -62,7 +66,7 @@ class MeshNetPanel extends HTMLElement {
     void this._load(epoch).catch((error) => {
       if (!this._pollIsCurrent(epoch)) return;
       this._recordFailure("poll_unexpected", "lifecycle", error);
-      this._safeRender("render");
+      this._renderPollSnapshot();
       this._scheduleNextPoll(epoch);
     });
   }
@@ -81,7 +85,7 @@ class MeshNetPanel extends HTMLElement {
       this._error = "Snapshot unavailable";
     } finally {
       if (!this._pollIsCurrent(epoch)) return;
-      this._safeRender("render");
+      this._renderPollSnapshot();
       this._scheduleNextPoll(epoch);
     }
   }
@@ -102,6 +106,8 @@ class MeshNetPanel extends HTMLElement {
   }
 
   _safeRender(operation = "render") {
+    this._pollRenderPending = false;
+    this._focusFlushGeneration += 1;
     try {
       this._render();
       this._markOperationSuccess(operation);
@@ -109,6 +115,33 @@ class MeshNetPanel extends HTMLElement {
     } catch (error) {
       this._recordFailure(operation, "render", error);
       return false;
+    }
+  }
+
+  _renderPollSnapshot() {
+    if (this._panelInteractionActive()) {
+      this._pollRenderPending = true;
+      return false;
+    }
+    return this._safeRender("render");
+  }
+
+  _queuePendingPollRender() {
+    if (!this._pollRenderPending) return;
+    const generation = ++this._focusFlushGeneration;
+    const flush = () => {
+      if (!this._connected || generation !== this._focusFlushGeneration) return;
+      if (this._panelInteractionActive() || !this._pollRenderPending) return;
+      this._safeRender("render");
+    };
+    try {
+      if (typeof queueMicrotask === "function") {
+        queueMicrotask(flush);
+      } else {
+        void Promise.resolve().then(flush);
+      }
+    } catch (error) {
+      this._recordFailure("event_handler", "lifecycle", error);
     }
   }
 
@@ -531,9 +564,10 @@ class MeshNetPanel extends HTMLElement {
   _render() {
     const composerFocus = this._composerFocusState();
     const snapshot = this._snapshot || { nodes: {}, gateways: {}, recent_messages: [] };
-    const nodes = Object.values(snapshot.nodes || {}).filter(
+    const sourceNodes = Object.values(snapshot.nodes || {}).filter(
       (node) => node && typeof node === "object" && !Array.isArray(node),
     );
+    const nodes = this._nodesWithExactMeshtasticNameHints(sourceNodes);
     const gateways = Object.values(snapshot.gateways || {}).filter(
       (gateway) => gateway && typeof gateway === "object" && !Array.isArray(gateway),
     );
@@ -541,6 +575,12 @@ class MeshNetPanel extends HTMLElement {
     const directDelivery = this._draft.delivery === "direct";
     const recipientCount = this._recipientChoices(nodes).length;
     const locatedNodeCount = this._validLocationCount(nodes);
+    const unnamedNodeCount = sourceNodes.filter((node) => {
+      if (!this._meshtasticNodeId(node)) return false;
+      const names = this._nodeHumanNames(node);
+      return !names.primary && !names.short;
+    }).length;
+    const hintedNodeCount = nodes.filter((node) => node._name_hint_exact_node_id === true).length;
     const favoriteLabelConfigured = snapshot.panel_metadata
       && snapshot.panel_metadata.favorite_label_configured === true;
     const topology = this._passiveTopology(nodes, gateways);
@@ -878,7 +918,7 @@ class MeshNetPanel extends HTMLElement {
                   </select>
                 </label>
               </div>
-              <button type="submit"${this._sending || (directDelivery && !recipientCount) ? " disabled" : ""}>${this._sending ? "Sending…" : "Send"}</button>
+              <button id="meshnet-send-button" type="submit"${this._sending || (directDelivery && !recipientCount) ? " disabled" : ""}>${this._sending ? "Sending…" : "Send"}</button>
               <div class="send-status ${this._statusClass()}" role="status" aria-live="polite">${this._escape(this._sendStatus ? this._sendStatus.text : "")}</div>
             </form>
           </section>
@@ -908,7 +948,7 @@ class MeshNetPanel extends HTMLElement {
               <div class="row node-row">
                 <span class="node-summary">
                   <span class="node-title">${node.favorite === true ? '<span class="favorite-star" title="Favorite" aria-label="Favorite">★</span> ' : ""}${this._escape(this._nodeName(node))}</span>
-                  <span class="label">${this._escape(this._humanLastSeen(node.last_heard))}</span>
+                  <span class="label">${this._escape(this._humanLastSeen(node.last_heard))}${node._name_hint_exact_node_id === true ? " · Name matched from the same exact !ID" : ""}</span>
                 </span>
                 <span class="node-actions">
                   <span class="${node.online ? "good" : "bad"}">${node.online ? "recent" : "stale"}</span>
@@ -917,6 +957,8 @@ class MeshNetPanel extends HTMLElement {
               </div>
             `).join("") || `<div class="label">Waiting for node data</div>`}
             ${sortedNodes.length > 24 ? `<div class="label">Showing 24 of ${sortedNodes.length} nodes</div>` : ""}
+            ${unnamedNodeCount ? `<div class="label">${unnamedNodeCount} Meshtastic packet/cache record${unnamedNodeCount === 1 ? " arrived" : "s arrived"} without a NodeInfo name. MeshNet keeps uncertain identities separate.</div>` : ""}
+            ${hintedNodeCount ? `<div class="label">${hintedNodeCount} display label${hintedNodeCount === 1 ? " uses" : "s use"} an unambiguous cached name from the same exact !ID. Records and send targets remain separate.</div>` : ""}
             ${favoriteLabelConfigured ? "" : '<div class="label">To pin favorites, add the Home Assistant device label “MeshNet Favorite”.</div>'}
           </section>
           <section class="panel">
@@ -939,7 +981,7 @@ class MeshNetPanel extends HTMLElement {
                 const quality = this._quality(metric);
                 return `
                   <div class="cell ${quality}">
-                    <div>${this._escape(node.short_name || node.long_name || node.node_id || node.node_key)}</div>
+                    <div>${this._escape(this._nodeCompactName(node))}</div>
                     <div class="metric">${metric.label}: ${metric.value}</div>
                   </div>
                 `;
@@ -955,7 +997,7 @@ class MeshNetPanel extends HTMLElement {
   }
 
   _composerFocusState() {
-    const active = this.ownerDocument && this.ownerDocument.activeElement;
+    const active = this._activePanelElement();
     const fieldIds = [
       "meshnet-delivery",
       "meshnet-recipient",
@@ -971,6 +1013,48 @@ class MeshNetPanel extends HTMLElement {
       start: typeof active.selectionStart === "number" ? active.selectionStart : null,
       end: typeof active.selectionEnd === "number" ? active.selectionEnd : null,
     };
+  }
+
+  _panelInteractionActive() {
+    if (this._composerFocusState()) return true;
+    const active = this._activePanelElement();
+    if (!active || !this.contains(active)) return false;
+    if (active.id === "meshnet-send-button") return true;
+    try {
+      return typeof active.hasAttribute === "function" && active.hasAttribute("data-message-node");
+    } catch (_ignored) {
+      return false;
+    }
+  }
+
+  _handlePollFocusOut(event) {
+    if (!this._pollRenderPending) return;
+    const next = event && event.relatedTarget;
+    // A null target can mean the browser or a shadow boundary received focus.
+    // The next poll can flush safely; never risk replacing an in-flight click.
+    if (!next || this.contains(next)) return;
+    this._queuePendingPollRender();
+  }
+
+  _activePanelElement() {
+    let active = null;
+    try {
+      const root = typeof this.getRootNode === "function" ? this.getRootNode() : null;
+      active = root && root.activeElement ? root.activeElement : null;
+    } catch (_ignored) {
+      active = null;
+    }
+    try {
+      if (!active && this.ownerDocument) active = this.ownerDocument.activeElement;
+      for (let depth = 0; depth < 8; depth += 1) {
+        const nested = active && active.shadowRoot && active.shadowRoot.activeElement;
+        if (!nested || nested === active) break;
+        active = nested;
+      }
+    } catch (_ignored) {
+      // A closed or changing Home Assistant shadow root has no usable focus.
+    }
+    return active;
   }
 
   _restoreComposerFocus(state) {
@@ -998,6 +1082,7 @@ class MeshNetPanel extends HTMLElement {
     Object.entries(fields).forEach(([key, field]) => {
       if (!field) return;
       const eventName = key === "message" ? "input" : "change";
+      field.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
       field.addEventListener(eventName, () => {
         this._safeStep("composer_event", "binding", () => {
           this._draft[key] = field.value;
@@ -1008,6 +1093,10 @@ class MeshNetPanel extends HTMLElement {
         });
       });
     });
+    const sendButton = this.querySelector("#meshnet-send-button");
+    if (sendButton) {
+      sendButton.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
+    }
     form.addEventListener("submit", (event) => {
       this._safeStep(
         "composer_event",
@@ -1020,6 +1109,7 @@ class MeshNetPanel extends HTMLElement {
   _bindNodeControls() {
     const sort = this.querySelector("#meshnet-node-sort");
     if (sort) {
+      sort.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
       sort.addEventListener("change", () => {
         this._safeStep("sort_event", "binding", () => {
           this._nodeSort = ["favorites_recent", "last_seen", "name"].includes(sort.value)
@@ -1030,6 +1120,7 @@ class MeshNetPanel extends HTMLElement {
       });
     }
     this.querySelectorAll("[data-message-node]").forEach((button) => {
+      button.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
       button.addEventListener("click", () => {
         this._safeStep("node_message_event", "binding", () => {
           if (!this._chooseDirectRecipient(button.getAttribute("data-message-node"))) {
@@ -1251,14 +1342,37 @@ class MeshNetPanel extends HTMLElement {
   }
 
   _recipientChoices(nodes) {
-    return nodes
+    const choices = nodes
       .filter((node) => node && node.node_key != null && String(node.node_key))
       .map((node) => ({
         value: String(node.node_key),
-        label: this._nodeName(node),
+        label: this._recipientNodeName(node),
+        named: this._nodeHasHumanName(node),
+        node,
       }))
-      .filter((choice, index, all) => all.findIndex((item) => item.value === choice.value) === index)
-      .sort((left, right) => this._compareText(left.label, right.label) || this._compareText(left.value, right.value));
+      .filter((choice, index, all) => all.findIndex((item) => item.value === choice.value) === index);
+    const labelGroups = new Map();
+    choices.forEach((choice) => {
+      const key = this._textSortKey(choice.label);
+      if (!labelGroups.has(key)) labelGroups.set(key, []);
+      labelGroups.get(key).push(choice);
+    });
+    labelGroups.forEach((group) => {
+      if (group.length < 2) return;
+      const nodeIds = group.map((choice) => this._nodeLabelText(
+        choice.node && choice.node.node_id,
+      ));
+      const distinctNodeIds = nodeIds.every(Boolean)
+        && new Set(nodeIds.map((value) => this._textSortKey(value))).size === group.length;
+      group.forEach((choice, index) => {
+        choice.label = `${choice.label} · ${distinctNodeIds ? nodeIds[index] : choice.value}`;
+      });
+    });
+    return choices
+      .map(({ node: _node, ...choice }) => choice)
+      .sort((left, right) => Number(right.named) - Number(left.named)
+        || this._compareText(left.label, right.label)
+        || this._compareText(left.value, right.value));
   }
 
   _recipientOptions(nodes) {
@@ -1271,8 +1385,7 @@ class MeshNetPanel extends HTMLElement {
     return [
       `<option value=""${this._selected(selected, "")}>${prompt}</option>`,
       ...choices.map((choice) => {
-        const suffix = choice.label === choice.value ? "" : ` (${choice.value})`;
-        return `<option value="${this._escape(choice.value)}"${this._selected(selected, choice.value)}>${this._escape(choice.label + suffix)}</option>`;
+        return `<option value="${this._escape(choice.value)}"${this._selected(selected, choice.value)}>${this._escape(choice.label)}</option>`;
       }),
     ].join("");
   }
@@ -1420,10 +1533,198 @@ class MeshNetPanel extends HTMLElement {
   }
 
   _nodeName(node) {
-    return String(
-      (node && (node.long_name || node.user_name || node.short_name || node.node_id || node.node_key))
-      || "Unknown node",
-    );
+    const names = this._nodeHumanNames(node);
+    if (names.primary && names.short && this._textSortKey(names.primary) !== this._textSortKey(names.short)) {
+      return `${names.primary} · ${names.short}`;
+    }
+    if (names.primary || names.short) return names.primary || names.short;
+    const meshId = this._meshtasticNodeId(node);
+    if (meshId) return `Unnamed node · ${meshId}`;
+    return this._nodeLabelText(node && (node.node_id || node.node_key)) || "Unknown node";
+  }
+
+  _recipientNodeName(node) {
+    const label = this._nodeName(node);
+    const meshId = this._meshtasticNodeId(node);
+    const humanNamed = this._nodeHasHumanName(node);
+    const identifier = humanNamed && meshId && !label.includes(meshId) ? ` · ${meshId}` : "";
+    const hint = node && node._name_hint_exact_node_id === true ? " · cached-name match" : "";
+    return `${label}${identifier}${hint}`;
+  }
+
+  _nodeCompactName(node) {
+    const names = this._nodeHumanNames(node);
+    if (names.short) return names.short;
+    if (names.primary) return names.primary;
+    const meshId = this._meshtasticNodeId(node);
+    return meshId || this._nodeName(node);
+  }
+
+  _nodeHumanNames(node) {
+    const primary = ["long_name", "user_name"]
+      .map((field) => this._humanNodeNameField(node, field))
+      .find(Boolean) || "";
+    const short = this._humanNodeNameField(node, "short_name");
+    return { primary, short };
+  }
+
+  _humanNodeNameField(node, field) {
+    const text = this._nodeLabelText(node && node[field]);
+    if (!text) return "";
+    const identifiers = [node && node.node_id, node && node.node_key, this._meshtasticNodeId(node)]
+      .map((value) => this._nodeLabelText(value))
+      .filter(Boolean)
+      .map((value) => this._textSortKey(value));
+    return identifiers.includes(this._textSortKey(text)) ? "" : text;
+  }
+
+  _nodeHasHumanName(node) {
+    const names = this._nodeHumanNames(node);
+    return Boolean(names.primary || names.short);
+  }
+
+  _nodeLabelText(value) {
+    return typeof value === "string" ? value.trim().replace(/\s+/gu, " ") : "";
+  }
+
+  _nodesWithExactMeshtasticNameHints(nodes) {
+    const source = Array.isArray(nodes) ? nodes : [];
+    const groups = new Map();
+    source.forEach((node, index) => {
+      const meshId = this._meshtasticNodeId(node);
+      if (!meshId) return;
+      if (!groups.has(meshId)) groups.set(meshId, []);
+      groups.get(meshId).push({ node, index });
+    });
+    const replacements = new Map();
+    groups.forEach((members) => {
+      if (members.length < 2) return;
+      const identityProofs = members.map(({ node }) => this._nodeIdentityProofs(node));
+      if (identityProofs.some((proofs) => !proofs.valid)) return;
+      const distinctProofs = ["mac", "public_key_canonical", "public_key_explicit"]
+        .map((field) => new Set(identityProofs.map((proofs) => proofs[field]).filter(Boolean)));
+      if (distinctProofs.some((proofs) => proofs.size > 1)) return;
+
+      const fields = ["long_name", "user_name", "short_name"];
+      const uniqueValues = new Map();
+      for (const field of fields) {
+        const values = new Set(
+          members
+            .map(({ node }) => this._humanNodeNameField(node, field))
+            .filter(Boolean)
+            .map((value) => this._textSortKey(value)),
+        );
+        if (values.size > 1) return;
+        if (values.size === 1) uniqueValues.set(field, values.values().next().value);
+      }
+      if (!uniqueValues.size) return;
+
+      const donor = members.find(({ node }) => {
+        return fields.every((field) => {
+          const expected = uniqueValues.get(field);
+          if (!expected) return true;
+          const value = this._humanNodeNameField(node, field);
+          return value && this._textSortKey(value) === expected;
+        });
+      });
+      if (!donor) return;
+      const donorNames = Object.fromEntries(
+        fields
+          .map((field) => [field, this._humanNodeNameField(donor.node, field)])
+          .filter(([_field, value]) => value),
+      );
+      members.forEach(({ node, index }) => {
+        const inherited = {};
+        Object.entries(donorNames).forEach(([field, value]) => {
+          if (!this._humanNodeNameField(node, field)) inherited[field] = value;
+        });
+        if (Object.keys(inherited).length) {
+          replacements.set(index, {
+            ...node,
+            ...inherited,
+            _name_hint_exact_node_id: true,
+          });
+        }
+      });
+    });
+    return source.map((node, index) => replacements.get(index) || node);
+  }
+
+  _nodeIdentityProofs(node) {
+    const nodeKey = this._nodeLabelText(node && node.node_key);
+    const keyLower = nodeKey.toLowerCase();
+    const keyMacPresent = keyLower.startsWith("mac:");
+    const keyPublicPresent = keyLower.startsWith("pub:");
+    const keyMac = keyMacPresent ? nodeKey.slice(nodeKey.indexOf(":") + 1) : "";
+    const keyPublic = keyPublicPresent ? nodeKey.slice(nodeKey.indexOf(":") + 1) : "";
+    const explicitMacPresent = node && node.mac != null && String(node.mac).trim() !== "";
+    const explicitPublicPresent = node && node.public_key != null
+      && String(node.public_key).trim() !== "";
+    if ((explicitMacPresent && typeof node.mac !== "string")
+      || (explicitPublicPresent && typeof node.public_key !== "string")) {
+      return { valid: false };
+    }
+    const explicitMac = explicitMacPresent ? this._strictMac(node.mac) : "";
+    const normalizedKeyMac = keyMacPresent ? this._strictMac(keyMac) : "";
+    if ((explicitMacPresent && !explicitMac)
+      || (keyMacPresent && !normalizedKeyMac)
+      || (explicitMac && normalizedKeyMac && explicitMac !== normalizedKeyMac)) {
+      return { valid: false };
+    }
+    const explicitPublic = explicitPublicPresent ? node.public_key.trim() : "";
+    const normalizedKeyPublic = keyPublicPresent ? keyPublic.trim() : "";
+    if ((keyPublicPresent && !normalizedKeyPublic)
+      || (explicitPublic && normalizedKeyPublic
+        && explicitPublic.toLowerCase() !== normalizedKeyPublic.toLowerCase())) {
+      return { valid: false };
+    }
+    return {
+      valid: true,
+      mac: explicitMac || normalizedKeyMac,
+      public_key_canonical: (explicitPublic || normalizedKeyPublic).toLowerCase(),
+      public_key_explicit: explicitPublic,
+    };
+  }
+
+  _strictMac(value) {
+    const text = typeof value === "string" ? value.trim() : "";
+    if (/^[0-9a-f]{12}$/iu.test(text)) return text.toLowerCase();
+    if (/^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/iu.test(text)
+      || /^(?:[0-9a-f]{2}-){5}[0-9a-f]{2}$/iu.test(text)) {
+      return text.toLowerCase().replace(/[:-]/gu, "");
+    }
+    return "";
+  }
+
+  _meshtasticNodeId(node) {
+    const protocol = String(node && node.protocol || "").toLowerCase();
+    const nodeKey = this._nodeLabelText(node && node.node_key);
+    if (protocol !== "meshtastic") return "";
+    const keyLower = nodeKey.toLowerCase();
+    if (nodeKey && !["meshtastic:", "mac:", "pub:"].some((prefix) => keyLower.startsWith(prefix))) {
+      return "";
+    }
+    const keyIsMeshtastic = nodeKey.toLowerCase().startsWith("meshtastic:");
+    const explicitValue = node && node.node_id;
+    const explicitPresent = explicitValue != null && String(explicitValue).trim() !== "";
+    const explicitId = explicitPresent ? this._parseMeshtasticNodeId(explicitValue) : "";
+    const keyId = keyIsMeshtastic
+      ? this._parseMeshtasticNodeId(nodeKey.slice(nodeKey.indexOf(":") + 1))
+      : "";
+    if ((explicitPresent && !explicitId) || (keyIsMeshtastic && !keyId)) return "";
+    if (explicitId && keyId && explicitId !== keyId) return "";
+    return explicitId || keyId;
+  }
+
+  _parseMeshtasticNodeId(value) {
+    const text = String(value == null ? "" : value).trim();
+    let number = null;
+    if (/^![0-9a-f]{1,8}$/iu.test(text)) number = Number.parseInt(text.slice(1), 16);
+    else if (/^0x[0-9a-f]{1,8}$/iu.test(text)) number = Number.parseInt(text, 16);
+    else if (/^[0-9]{1,10}$/u.test(text)) number = Number.parseInt(text, 10);
+    return Number.isSafeInteger(number) && number > 0 && number < 0xffffffff
+      ? `!${number.toString(16).padStart(8, "0")}`
+      : "";
   }
 
   _textSortKey(value) {
@@ -1468,6 +1769,11 @@ class MeshNetPanel extends HTMLElement {
     if (mode === "favorites_recent") {
       const favoriteDifference = Number(right.favorite === true) - Number(left.favorite === true);
       if (favoriteDifference) return favoriteDifference;
+    }
+    if (mode === "name") {
+      const namedDifference = Number(this._nodeHasHumanName(right))
+        - Number(this._nodeHasHumanName(left));
+      if (namedDifference) return namedDifference;
     }
     if (mode !== "name") {
       const recentDifference = this._compareLastSeen(left, right);
@@ -1727,7 +2033,7 @@ class MeshNetPanel extends HTMLElement {
           <g>
             <title>${this._escape(this._nodeName(node))}</title>
             <circle class="node ${node.online ? "" : "offline"}" cx="${point.x}" cy="${point.y}" r="14"></circle>
-            <text x="${point.x + 19}" y="${point.y + 4}">${this._escape(this._nodeName(node).slice(0, 18))}</text>
+            <text x="${point.x + 19}" y="${point.y + 4}">${this._escape(this._nodeCompactName(node).slice(0, 18))}</text>
           </g>`;
         }).join("")}
         ${topology.edges.length ? "" : '<text class="topology-empty" x="500" y="610">No passive connection evidence yet</text>'}

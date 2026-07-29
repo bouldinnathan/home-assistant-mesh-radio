@@ -1688,10 +1688,13 @@ def meshtastic_node_to_state(
         protocol=PROTOCOL_MESHTASTIC,
         node_id=node_id,
         mac=mac,
-        user_name=user.get("userName") or user.get("name"),
-        long_name=user.get("longName"),
-        short_name=user.get("shortName"),
-        hardware_model=user.get("hwModel") or raw.get("hwModel"),
+        user_name=_first_text(user, "userName", "username", "user_name", "name"),
+        long_name=_first_text(user, "longName", "long_name", "longname"),
+        short_name=_first_text(user, "shortName", "short_name", "shortname"),
+        hardware_model=(
+            _first_textish(user, "hwModel", "hw_model", "hardware")
+            or _first_textish(raw, "hwModel", "hw_model", "hardware")
+        ),
         firmware_version=raw.get("firmwareVersion") or raw.get("firmware_version"),
         role=raw.get("role"),
         online=True,
@@ -1778,10 +1781,10 @@ def meshtastic_packet_to_node(packet: MeshPacket) -> NodeState | None:
         protocol=PROTOCOL_MESHTASTIC,
         node_id=node_id,
         mac=mac,
-        user_name=user.get("userName") or user.get("name"),
-        long_name=user.get("longName"),
-        short_name=user.get("shortName"),
-        hardware_model=user.get("hwModel"),
+        user_name=_first_text(user, "userName", "username", "user_name", "name"),
+        long_name=_first_text(user, "longName", "long_name", "longname"),
+        short_name=_first_text(user, "shortName", "short_name", "shortname"),
+        hardware_model=_first_textish(user, "hwModel", "hw_model", "hardware"),
         online=True,
         last_heard=packet.timestamp,
         last_gateway_id=packet.gateway_id,
@@ -1800,6 +1803,27 @@ def _flatten_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         if isinstance(value, (str, int, float, bool)) or value is None:
             flattened[_snake(key)] = value
     return flattened
+
+
+def _first_text(values: dict[str, Any], *keys: str) -> str | None:
+    """Return the first non-empty text value across provider naming styles."""
+    for key in keys:
+        value = values.get(key)
+        if isinstance(value, str) and (text := value.strip()):
+            return text
+    return None
+
+
+def _first_textish(values: dict[str, Any], *keys: str) -> str | None:
+    """Return provider text while preserving numeric model identifiers."""
+    text = _first_text(values, *keys)
+    if text is not None:
+        return text
+    for key in keys:
+        value = values.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return str(value)
+    return None
 
 
 def _normalize_meshtastic_mac(value: Any) -> str | None:

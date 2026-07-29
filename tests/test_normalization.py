@@ -87,6 +87,73 @@ def test_meshtastic_node_db_hops_away_is_normalized_without_losing_zero(
     assert node.connectivity["hops_gateway_id"] == "g1"
 
 
+@pytest.mark.parametrize(
+    "user",
+    [
+        {
+            "id": "!12345678",
+            "userName": " Radio User ",
+            "longName": " Hill Repeater ",
+            "shortName": " HR ",
+            "hwModel": " RAK4631 ",
+        },
+        {
+            "id": "!12345678",
+            "username": " Radio User ",
+            "long_name": " Hill Repeater ",
+            "short_name": " HR ",
+            "hw_model": " RAK4631 ",
+        },
+        {
+            "id": "!12345678",
+            "user_name": " Radio User ",
+            "longname": " Hill Repeater ",
+            "shortname": " HR ",
+            "hardware": " RAK4631 ",
+        },
+    ],
+)
+def test_meshtastic_node_names_accept_provider_key_variants(
+    user: dict[str, object],
+) -> None:
+    node = meshtastic_node_to_state(
+        {"num": 0x12345678, "user": user},
+        gateway_id="g1",
+    )
+
+    assert node.user_name == "Radio User"
+    assert node.long_name == "Hill Repeater"
+    assert node.short_name == "HR"
+    assert node.hardware_model == "RAK4631"
+
+
+def test_meshtastic_packet_node_names_accept_snake_case_variants() -> None:
+    packet = meshtastic_packet_to_state_packet(
+        {
+            "from": 0x12345678,
+            "to": 0xFFFFFFFF,
+            "decoded": {
+                "user": {
+                    "id": "!12345678",
+                    "user_name": "Packet User",
+                    "long_name": "Packet Long Name",
+                    "short_name": "PLN",
+                    "hw_model": "T-Echo",
+                }
+            },
+        },
+        gateway_id="g1",
+    )
+
+    node = meshtastic_packet_to_node(packet)
+
+    assert node is not None
+    assert node.user_name == "Packet User"
+    assert node.long_name == "Packet Long Name"
+    assert node.short_name == "PLN"
+    assert node.hardware_model == "T-Echo"
+
+
 def test_mqtt_origin_never_becomes_direct_radio_hop_evidence() -> None:
     packet = meshtastic_packet_to_state_packet(
         {

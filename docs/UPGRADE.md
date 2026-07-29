@@ -1,5 +1,32 @@
 # Upgrade Guide
 
+## From 0.5.9
+
+0.5.10 keeps periodic sidebar snapshots from replacing an active message,
+recipient, gateway, channel, priority, delivery, or sort control. Polling and
+data collection continue while the control is active; one pending visual update
+is applied after focus leaves the editor. Focus detection follows Home
+Assistant's shadow roots, so native selects, text selection, cursor position,
+and input-method composition are not interrupted by the five-second refresh.
+
+Meshtastic node labels now show the long or user name together with a distinct
+short name. Provider variants such as `short_name`, `shortname`, `long_name`,
+and `longname` are normalized. Records that have not received NodeInfo are
+labeled as unnamed with their normalized `!xxxxxxxx` identifier instead of
+presenting the identifier as if it were a name. Exact canonical destination
+keys remain unchanged in selector values. Recipient labels include the
+normalized Meshtastic `!ID`; when two other nodes still have the same visible
+name, only those colliding choices gain an exact node-ID or canonical-key
+suffix so they cannot be mistaken for one another.
+When a separate cached record with the exact same normalized Meshtastic node ID
+has one coherent, unambiguous NodeInfo name tuple, the sidebar may use that
+tuple as a clearly marked, display-only hint. Conflicting cached names or
+identity proofs are never inherited.
+
+This is a display and normalization update only. It does not merge or delete
+cached nodes, change entity unique IDs, transmit NodeInfo requests, or add any
+radio traffic.
+
 ## From 0.5.8
 
 0.5.9 adds bounded, privacy-safe observability for the admin-only MeshNet

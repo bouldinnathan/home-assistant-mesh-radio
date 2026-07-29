@@ -193,16 +193,23 @@ def test_recipient_choices_and_node_message_shortcut_use_canonical_keys() -> Non
         r"""
   const nodes = [
     { node_key: "meshcore:key&one", long_name: "B <unsafe>" },
-    { node_key: "meshtastic:!12345678", short_name: "Alpha" },
+    { protocol: "meshtastic", node_key: "meshtastic:!12345678", short_name: "Alpha" },
+    {
+      protocol: "meshtastic",
+      node_key: "meshtastic:!00000001",
+      node_id: "!00000001",
+    },
   ];
-  panel._snapshot = { nodes: { first: nodes[0], second: nodes[1] } };
+  panel._snapshot = { nodes: { first: nodes[0], second: nodes[1], third: nodes[2] } };
   const choices = panel._recipientChoices(nodes);
   assert.deepEqual(choices.map((choice) => choice.value), [
     "meshtastic:!12345678",
     "meshcore:key&one",
+    "meshtastic:!00000001",
   ]);
   assert.match(panel._recipientOptions(nodes), /B &lt;unsafe&gt;/);
   assert.match(panel._recipientOptions(nodes), /meshcore:key&amp;one/);
+  assert.equal((panel._recipientOptions(nodes).match(/meshtastic:!12345678/g) || []).length, 1);
   assert.match(panel._recipientOptions([]), /No cached nodes available yet/);
   assert.equal(panel._chooseDirectRecipient("meshtastic:!12345678"), true);
   assert.equal(panel._draft.delivery, "direct");
@@ -216,6 +223,420 @@ def test_recipient_choices_and_node_message_shortcut_use_canonical_keys() -> Non
     assert 'button.getAttribute("data-message-node")' in source
 
 
+def test_recipient_name_collisions_receive_exact_disambiguators() -> None:
+    """Same-named nodes must never become indistinguishable send targets."""
+    _run_panel_script(
+        r"""
+  const nodes = [
+    {
+      protocol: "meshcore",
+      node_key: "meshcore:contact-one",
+      node_id: "contact-one",
+      long_name: "Shared Relay",
+      short_name: "SR",
+    },
+    {
+      protocol: "meshcore",
+      node_key: "meshcore:contact-two",
+      node_id: "contact-two",
+      long_name: " shared relay ",
+      short_name: "sr",
+    },
+    {
+      protocol: "meshcore",
+      node_key: "meshcore:unique",
+      node_id: "unique",
+      long_name: "Unique Relay",
+      short_name: "UR",
+    },
+    {
+      protocol: "meshcore",
+      node_key: "meshcore:alias-one",
+      node_id: "same-contact",
+      long_name: "Same Contact",
+    },
+    {
+      protocol: "meshcore",
+      node_key: "meshcore:alias-two",
+      node_id: "same-contact",
+      long_name: "same contact",
+    },
+  ];
+  const byValue = Object.fromEntries(
+    panel._recipientChoices(nodes).map((choice) => [choice.value, choice.label]),
+  );
+  assert.equal(byValue["meshcore:contact-one"], "Shared Relay · SR · contact-one");
+  assert.equal(byValue["meshcore:contact-two"], "shared relay · sr · contact-two");
+  assert.equal(byValue["meshcore:unique"], "Unique Relay · UR");
+  assert.equal(byValue["meshcore:alias-one"], "Same Contact · meshcore:alias-one");
+  assert.equal(byValue["meshcore:alias-two"], "same contact · meshcore:alias-two");
+  const options = panel._recipientOptions(nodes);
+  for (const node of nodes) {
+    assert.match(options, new RegExp(`value="${node.node_key}"`));
+  }
+"""
+    )
+
+
+def test_node_labels_show_long_and_short_names_without_raw_key_duplication() -> None:
+    """Use phone-like human labels while retaining exact hidden send targets."""
+    _run_panel_script(
+        r"""
+  const named = {
+    protocol: "meshtastic",
+    node_key: "meshtastic:!12345678",
+    node_id: "!12345678",
+    long_name: " Backyard   Repeater ",
+    short_name: " BY ",
+  };
+  assert.equal(panel._nodeName(named), "Backyard Repeater · BY");
+  assert.equal(panel._nodeCompactName(named), "BY");
+  assert.equal(
+    panel._nodeName({ ...named, short_name: "backyard repeater" }),
+    "Backyard Repeater",
+  );
+  assert.equal(
+    panel._nodeName({ ...named, long_name: null, user_name: null, short_name: "BY" }),
+    "BY",
+  );
+  assert.equal(
+    panel._nodeName({
+      protocol: "meshtastic",
+      node_key: "meshtastic:!12345678",
+      node_id: "!12345678",
+    }),
+    "Unnamed node · !12345678",
+  );
+  assert.equal(
+    panel._nodeName({
+      protocol: "meshtastic",
+      node_key: "meshtastic:305419896",
+      node_id: "305419896",
+    }),
+    "Unnamed node · !12345678",
+  );
+  assert.equal(
+    panel._nodeCompactName({
+      protocol: "meshtastic",
+      node_key: "meshtastic:!12345678",
+      node_id: "!12345678",
+    }),
+    "!12345678",
+  );
+  const options = panel._recipientOptions([named]);
+  assert.match(options, />Backyard Repeater · BY · !12345678<\/option>/);
+  assert.equal((options.match(/meshtastic:!12345678/g) || []).length, 1);
+"""
+    )
+
+
+def test_exact_meshtastic_id_name_hints_are_display_only_and_fail_closed() -> None:
+    """Share unambiguous labels across exact IDs without merging node state."""
+    _run_panel_script(
+        r"""
+  const named = {
+    protocol: "meshtastic",
+    node_key: "mac:aabbccddeeff",
+    node_id: "!12345678",
+    long_name: "Hill Repeater",
+    short_name: "HR",
+    favorite: true,
+  };
+  const decimal = {
+    protocol: "meshtastic",
+    node_key: "meshtastic:305419896",
+    node_id: "305419896",
+    last_heard: "2026-01-02T00:00:00Z",
+  };
+  const hexadecimal = {
+    protocol: "meshtastic",
+    node_key: "meshtastic:0x12345678",
+    node_id: "0x12345678",
+  };
+  const source = [named, decimal, hexadecimal];
+  const before = JSON.stringify(source);
+  const display = panel._nodesWithExactMeshtasticNameHints(source);
+
+  assert.equal(JSON.stringify(source), before);
+  assert.equal(display[0], named);
+  assert.notEqual(display[1], decimal);
+  assert.notEqual(display[2], hexadecimal);
+  assert.equal(panel._nodeName(display[1]), "Hill Repeater · HR");
+  assert.equal(display[1]._name_hint_exact_node_id, true);
+  assert.equal(display[1].node_key, decimal.node_key);
+  assert.equal(display[1].favorite, decimal.favorite);
+  assert.deepEqual(
+    panel._recipientChoices(display).map((choice) => choice.value).sort(),
+    source.map((node) => node.node_key).sort(),
+  );
+  assert.match(
+    panel._recipientNodeName(display[1]),
+    /^Hill Repeater · HR · !12345678 · cached-name match$/,
+  );
+
+  const conflict = panel._nodesWithExactMeshtasticNameHints([
+    {
+      protocol: "meshtastic",
+      node_key: "mac:aaaaaaaaaaaa",
+      node_id: "!22222222",
+      long_name: "Alpha",
+      short_name: "SAME",
+    },
+    {
+      protocol: "meshtastic",
+      node_key: "mac:bbbbbbbbbbbb",
+      node_id: "0x22222222",
+      long_name: "Beta",
+      short_name: " same ",
+    },
+    {
+      protocol: "meshtastic",
+      node_key: "meshtastic:572662306",
+      node_id: "572662306",
+    },
+  ]);
+  assert.equal(conflict[2].long_name, undefined);
+  assert.equal(conflict[2].short_name, undefined);
+  assert.equal(panel._nodeName(conflict[2]), "Unnamed node · !22222222");
+
+  const splitTuple = [
+    {
+      protocol: "meshtastic",
+      node_key: "mac:111111111111",
+      node_id: "!55555555",
+      long_name: "Never Combined",
+    },
+    {
+      protocol: "meshtastic",
+      node_key: "meshtastic:!55555555",
+      node_id: "!55555555",
+      short_name: "NC",
+    },
+    {
+      protocol: "meshtastic",
+      node_key: "meshtastic:1431655765",
+      node_id: "1431655765",
+    },
+  ];
+  assert.deepEqual(panel._nodesWithExactMeshtasticNameHints(splitTuple), splitTuple);
+
+  const conflictingProofs = [
+    {
+      protocol: "meshtastic",
+      node_key: "mac:111111111111",
+      node_id: "!66666666",
+      long_name: "Proof One",
+      short_name: "P1",
+    },
+    {
+      protocol: "meshtastic",
+      node_key: "meshtastic:!66666666",
+      node_id: "!66666666",
+      mac: "22:22:22:22:22:22",
+    },
+  ];
+  assert.deepEqual(
+    panel._nodesWithExactMeshtasticNameHints(conflictingProofs),
+    conflictingProofs,
+  );
+
+  const conflictingPublicKeys = [
+    {
+      protocol: "meshtastic",
+      node_key: "pub:public-key-one",
+      node_id: "!77777777",
+      public_key: "public-key-one",
+      long_name: "Public Proof",
+      short_name: "PP",
+    },
+    {
+      protocol: "meshtastic",
+      node_key: "meshtastic:!77777777",
+      node_id: "!77777777",
+      public_key: "public-key-two",
+    },
+  ];
+  assert.deepEqual(
+    panel._nodesWithExactMeshtasticNameHints(conflictingPublicKeys),
+    conflictingPublicKeys,
+  );
+
+  const selfConflictingMac = [
+    {
+      protocol: "meshtastic",
+      node_key: "mac:111111111111",
+      node_id: "!88888888",
+      mac: "22:22:22:22:22:22",
+      long_name: "Bad MAC donor",
+      short_name: "BM",
+    },
+    {
+      protocol: "meshtastic",
+      node_key: "meshtastic:!88888888",
+      node_id: "!88888888",
+    },
+  ];
+  assert.deepEqual(
+    panel._nodesWithExactMeshtasticNameHints(selfConflictingMac),
+    selfConflictingMac,
+  );
+
+  const selfConflictingPublic = [
+    {
+      protocol: "meshtastic",
+      node_key: "pub:public-key-one",
+      node_id: "!99999999",
+      public_key: "public-key-two",
+      long_name: "Bad public donor",
+      short_name: "BP",
+    },
+    {
+      protocol: "meshtastic",
+      node_key: "meshtastic:!99999999",
+      node_id: "!99999999",
+    },
+  ];
+  assert.deepEqual(
+    panel._nodesWithExactMeshtasticNameHints(selfConflictingPublic),
+    selfConflictingPublic,
+  );
+
+  const malformedMac = [
+    {
+      protocol: "meshtastic",
+      node_key: "meshtastic:!aaaaaaaa",
+      node_id: "!aaaaaaaa",
+      mac: "aa:bb-cc:dd-ee:ff",
+      long_name: "Malformed MAC donor",
+      short_name: "MM",
+    },
+    {
+      protocol: "meshtastic",
+      node_key: "meshtastic:2863311530",
+      node_id: "2863311530",
+    },
+  ];
+  assert.deepEqual(panel._nodesWithExactMeshtasticNameHints(malformedMac), malformedMac);
+
+  const unsafe = [
+    {
+      protocol: "meshtastic",
+      node_key: "meshtastic:!33333333",
+      node_id: "!44444444",
+      long_name: "Conflicting ID",
+    },
+    {
+      protocol: "meshtastic",
+      node_key: "meshtastic:!33333333",
+      node_id: "!33333333",
+    },
+    {
+      protocol: "meshcore",
+      node_key: "meshcore:!33333333",
+      node_id: "!33333333",
+      long_name: "Wrong protocol",
+    },
+    {
+      protocol: "meshtastic",
+      node_key: "mac:cccccccccccc",
+      mac: "cccccccccccc",
+      long_name: "MAC alone",
+    },
+    {
+      protocol: "meshtastic",
+      node_key: "mac:cccccccccccc-copy",
+      mac: "cccccccccccc",
+    },
+  ];
+  assert.deepEqual(panel._nodesWithExactMeshtasticNameHints(unsafe), unsafe);
+  assert.equal(panel._meshtasticNodeId(unsafe[0]), "");
+  assert.equal(panel._meshtasticNodeId({
+    protocol: "meshcore",
+    node_key: "meshtastic:!12345678",
+    node_id: "!12345678",
+  }), "");
+  assert.equal(panel._meshtasticNodeId({
+    protocol: "meshtastic",
+    node_key: "meshcore:!12345678",
+    node_id: "!12345678",
+  }), "");
+  for (const invalid of ["0", "!00000000", "4294967295", "!ffffffff", "4294967296", "!100000000", "bad"] ) {
+    assert.equal(panel._parseMeshtasticNodeId(invalid), "");
+  }
+"""
+    )
+
+
+def test_inherited_meshtastic_names_remain_html_escaped() -> None:
+    """A cached NodeInfo hint must never introduce sidebar HTML."""
+    _run_panel_script(
+        r"""
+  const nodes = panel._nodesWithExactMeshtasticNameHints([
+    {
+      protocol: "meshtastic",
+      node_key: "mac:aabbccddeeff",
+      node_id: "!12345678",
+      long_name: "<img src=x onerror=alert(1)>",
+      short_name: "A&B",
+    },
+    {
+      protocol: "meshtastic",
+      node_key: "meshtastic:!12345678",
+      node_id: "!12345678",
+    },
+  ]);
+  const options = panel._recipientOptions(nodes);
+  assert.doesNotMatch(options, /<img/);
+  assert.match(options, /&lt;img src=x onerror=alert\(1\)&gt; · A&amp;B/);
+"""
+    )
+
+
+def test_render_reports_original_unnamed_records_and_display_hints_separately() -> None:
+    """The sidebar must not imply that a hinted cache record received NodeInfo."""
+    _run_panel_script(
+        r"""
+  panel._snapshot = {
+    nodes: {
+      named: {
+        protocol: "meshtastic",
+        node_key: "mac:aabbccddeeff",
+        node_id: "!12345678",
+        long_name: "Named Node",
+        short_name: "NN",
+        gateway_ids: [],
+        connectivity: {},
+        location: {},
+        routing: {},
+      },
+      unnamed: {
+        protocol: "meshtastic",
+        node_key: "meshtastic:!12345678",
+        node_id: "!12345678",
+        gateway_ids: [],
+        connectivity: {},
+        location: {},
+        routing: {},
+      },
+    },
+    gateways: {},
+    recent_messages: [],
+    panel_metadata: { favorite_label_configured: true },
+  };
+  panel._graph = () => "";
+  panel._panelDiagnostics = () => "";
+  panel._bindComposer = () => {};
+  panel._bindNodeControls = () => {};
+  panel._restoreComposerFocus = () => {};
+  panel._render();
+  assert.match(panel.innerHTML, /Named Node · NN/);
+  assert.match(panel.innerHTML, /Name matched from the same exact !ID/);
+  assert.match(panel.innerHTML, /1 Meshtastic packet\/cache record arrived without a NodeInfo name/);
+  assert.match(panel.innerHTML, /1 display label uses an unambiguous cached name/);
+"""
+    )
+
+
 def test_node_sorting_is_deterministic_and_handles_bad_timestamps() -> None:
     """Favorites and valid recent timestamps sort before stable name/key ties."""
     _run_panel_script(
@@ -225,18 +646,25 @@ def test_node_sorting_is_deterministic_and_handles_bad_timestamps() -> None:
     { node_key: "k-new-favorite", long_name: "Beta", favorite: true, last_heard: "2026-01-03T00:00:00Z" },
     { node_key: "k-new", long_name: "Gamma", favorite: false, last_heard: "2026-01-04T00:00:00Z" },
     { node_key: "k-invalid", long_name: "Alpha", favorite: "true", last_heard: "not-a-date" },
+    {
+      protocol: "meshtastic",
+      node_key: "meshtastic:!00000001",
+      node_id: "!00000001",
+      favorite: false,
+      last_heard: "2026-01-05T00:00:00Z",
+    },
   ];
   assert.deepEqual(
     panel._sortNodes(nodes, "favorites_recent").map((node) => node.node_key),
-    ["k-new-favorite", "k-old-favorite", "k-new", "k-invalid"],
+    ["k-new-favorite", "k-old-favorite", "meshtastic:!00000001", "k-new", "k-invalid"],
   );
   assert.deepEqual(
     panel._sortNodes(nodes, "last_seen").map((node) => node.node_key),
-    ["k-new", "k-new-favorite", "k-old-favorite", "k-invalid"],
+    ["meshtastic:!00000001", "k-new", "k-new-favorite", "k-old-favorite", "k-invalid"],
   );
   assert.deepEqual(
     panel._sortNodes(nodes, "name").map((node) => node.node_key),
-    ["k-invalid", "k-new-favorite", "k-new", "k-old-favorite"],
+    ["k-invalid", "k-new-favorite", "k-new", "k-old-favorite", "meshtastic:!00000001"],
   );
   assert.equal(panel._timestampMs("not-a-date"), null);
   const originalNow = Date.now;
@@ -374,6 +802,12 @@ def test_send_composer_preserves_drafts_and_prevents_duplicate_submits() -> None
     assert "this._draft = {" in source
     assert 'const eventName = key === "message" ? "input" : "change"' in source
     assert "this._draft[key] = field.value" in source
+    assert "this._renderPollSnapshot()" in source
+    assert "this._pollRenderPending = true" in source
+    assert 'field.addEventListener("focusout"' in source
+    assert 'id="meshnet-send-button"' in source
+    assert "this._panelInteractionActive()" in source
+    assert "this._handlePollFocusOut(event)" in source
     assert "const composerFocus = this._composerFocusState()" in source
     assert "this._restoreComposerFocus(composerFocus)" in source
     for field_id in (
@@ -386,6 +820,8 @@ def test_send_composer_preserves_drafts_and_prevents_duplicate_submits() -> None
         "meshnet-node-sort",
     ):
         assert f'"{field_id}"' in source
+    assert "this.getRootNode()" in source
+    assert "root.activeElement" in source
     assert "this.ownerDocument.activeElement" in source
     assert "this.contains(active)" in source
     assert 'typeof active.selectionStart === "number"' in source
@@ -394,6 +830,139 @@ def test_send_composer_preserves_drafts_and_prevents_duplicate_submits() -> None
     assert "if (this._sending) return" in source
     assert 'this._sending || (directDelivery && !recipientCount) ? " disabled" : ""' in source
     assert 'if (this._draft.message === draft.message) this._draft.message = ""' in source
+    assert "const unnamedNodeCount = sourceNodes.filter" in source
+    assert "const nodes = this._nodesWithExactMeshtasticNameHints(sourceNodes)" in source
+
+
+def test_periodic_snapshot_waits_for_editor_focus_to_leave() -> None:
+    """Polling must not replace a textarea, native select, or IME mid-use."""
+    _run_panel_script(
+        r"""
+  let renders = 0;
+  let schedules = 0;
+  const textarea = {
+    id: "meshnet-message",
+    selectionStart: 4,
+    selectionEnd: 7,
+  };
+  const recipient = { id: "meshnet-recipient" };
+  const outside = { id: "outside" };
+  let rootActive = textarea;
+  panel.getRootNode = () => ({ activeElement: rootActive });
+  panel.ownerDocument = {
+    activeElement: { id: "home-assistant-shadow-host" },
+  };
+  panel.contains = (element) => element === textarea || element === recipient;
+  panel._connected = true;
+  panel._loaded = true;
+  panel._pollEpoch = 4;
+  panel._render = () => { renders += 1; };
+  panel._scheduleNextPoll = () => { schedules += 1; };
+  panel._refreshSnapshot = async () => {
+    panel._snapshot = { nodes: {}, gateways: {}, recent_messages: [], marker: "new" };
+    return panel._snapshot;
+  };
+
+  assert.deepEqual(panel._composerFocusState(), {
+    id: "meshnet-message",
+    start: 4,
+    end: 7,
+  });
+  await panel._load(4);
+  assert.equal(panel._snapshot.marker, "new");
+  assert.equal(renders, 0);
+  assert.equal(schedules, 1);
+  assert.equal(panel._pollRenderPending, true);
+
+  rootActive = recipient;
+  panel._queuePendingPollRender();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(renders, 0);
+  assert.equal(panel._pollRenderPending, true);
+
+  rootActive = outside;
+  panel._queuePendingPollRender();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(renders, 1);
+  assert.equal(panel._pollRenderPending, false);
+
+  panel._pollRenderPending = true;
+  rootActive = textarea;
+  panel._queuePendingPollRender();
+  panel.disconnectedCallback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(renders, 1);
+  assert.equal(panel._pollRenderPending, false);
+"""
+    )
+
+
+def test_focus_resolution_descends_home_assistant_shadow_roots() -> None:
+    """Fallback focus discovery must cross open HA shadow-root hosts."""
+    _run_panel_script(
+        r"""
+  const select = { id: "meshnet-recipient" };
+  panel.getRootNode = () => ({ activeElement: null });
+  panel.ownerDocument = {
+    activeElement: {
+      shadowRoot: {
+        activeElement: {
+          shadowRoot: { activeElement: select },
+        },
+      },
+    },
+  };
+  panel.contains = (element) => element === select;
+  assert.deepEqual(panel._composerFocusState(), {
+    id: "meshnet-recipient",
+    start: null,
+    end: null,
+  });
+"""
+    )
+
+
+def test_pending_poll_does_not_replace_an_action_before_its_click() -> None:
+    """Moving from an editor to Send/Message must not swallow activation."""
+    _run_panel_script(
+        r"""
+  const sendButton = {
+    id: "meshnet-send-button",
+    hasAttribute() { return false; },
+  };
+  const messageButton = {
+    id: "",
+    hasAttribute(name) { return name === "data-message-node"; },
+  };
+  let active = sendButton;
+  panel.getRootNode = () => ({ activeElement: active });
+  panel.contains = (element) => element === sendButton || element === messageButton;
+  panel._connected = true;
+  panel._pollRenderPending = true;
+  let renders = 0;
+  panel._render = () => { renders += 1; };
+
+  assert.equal(panel._panelInteractionActive(), true);
+  assert.equal(panel._renderPollSnapshot(), false);
+  assert.equal(renders, 0);
+
+  active = messageButton;
+  assert.equal(panel._panelInteractionActive(), true);
+  assert.equal(panel._renderPollSnapshot(), false);
+  assert.equal(renders, 0);
+
+  let queued = 0;
+  panel._queuePendingPollRender = () => { queued += 1; };
+  panel._handlePollFocusOut({ relatedTarget: sendButton });
+  panel._handlePollFocusOut({ relatedTarget: messageButton });
+  panel._handlePollFocusOut({ relatedTarget: null });
+  assert.equal(queued, 0);
+
+  const outside = { id: "outside" };
+  panel._handlePollFocusOut({ relatedTarget: outside });
+  assert.equal(queued, 1);
+"""
+    )
 
 
 def test_send_composer_enforces_utf8_byte_limit_client_side() -> None:

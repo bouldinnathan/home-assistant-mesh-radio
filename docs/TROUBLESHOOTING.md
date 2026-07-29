@@ -578,6 +578,8 @@ Checks:
    the sidebar dropdown or press **Message** on its node row. In YAML, use a
    full Meshtastic `!` node ID, integer node number, or exact unique cached
    short/long name. Quote numeric short names.
+   Meshtastic choices show their normalized `!ID`; any remaining duplicate
+   human labels receive an exact disambiguator so distinct targets are visible.
 6. For MQTT, does `options.publish_topic` match the command topic consumed by your bridge?
 7. For MeshCore direct messages, is the destination contact known to the MeshCore SDK?
 
@@ -603,10 +605,45 @@ The MeshNet sidebar panel is admin-only by design. Use an admin Home Assistant a
 
 ### Updated Sidebar Still Looks Old
 
-MeshNet 0.5.9 version-stamps the sidebar JavaScript URL. Restart Home Assistant
+MeshNet 0.5.10 version-stamps the sidebar JavaScript URL. Restart Home Assistant
 after updating, then hard-refresh the browser once. The current panel has a
 separate **Delivery** selector, node sort selector, **Message** buttons, a Map
 link, and the heading **Cached passive topology — no traceroutes sent**.
+
+### Sidebar Control Loses Focus During Refresh
+
+MeshNet 0.5.10 continues collecting its five-second snapshots while a message
+field, recipient, gateway, channel, priority, delivery, or node-sort control is
+active, but postpones replacing the visible panel until focus leaves those
+controls. This preserves text selection, the insertion cursor, input-method
+composition, and native select menus across Home Assistant's shadow roots.
+
+If a control still loses focus on 0.5.10 or newer, hard-refresh the browser once
+and reproduce it with debug logging enabled. The diagnostics download includes
+bounded, privacy-safe panel failure counters; it does not include typed message
+text, selected recipients, node names, or browser identity.
+
+### A Node Is Shown as `Unnamed node · !xxxxxxxx`
+
+`!xxxxxxxx` is the Meshtastic node ID used for routing, not a connection error.
+MeshNet shows this explicit unnamed label when it has received a packet or
+cached record for that ID but has not received usable NodeInfo containing a
+long, user, or short name. When both are available, the sidebar displays
+`Long Name · SHORT`; compact graph and RF labels prefer `SHORT`.
+
+If another retained record has the exact same normalized Meshtastic node ID and
+one actual record supplies the complete, unambiguous cached name tuple, the
+sidebar can show that tuple as a marked, display-only hint. A disagreement
+between cached names, IDs, MAC addresses, or public keys fails closed. MeshNet
+never constructs a long/short pair from separate donors. The records, entity
+identities, favorites, measurements, and direct-message targets remain separate
+and unchanged.
+
+The phone app can look different because it has its own node database and may
+hide or already have NodeInfo for records that this radio or MeshNet cache does
+not. MeshNet does not request NodeInfo, merge nodes by name or signal, or send
+extra radio traffic to fill these labels. Exact destination IDs remain the
+authoritative direct-message targets.
 
 ### Sidebar Data Looks Incomplete or Contains Distant Nodes
 
