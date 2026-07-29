@@ -47,21 +47,34 @@ class BluetoothConnection:
         connect_timeout: float = 30.0,
         notify_timeout: float = 10.0,
         io_timeout: float = 15.0,
+        read_timeout: float | None = None,
         disconnect_timeout: float = 5.0,
         idle_read_timeout: float = 300.0,
+        empty_read_retries: int = 5,
+        empty_read_retry_delay: float = 0.1,
         logger: logging.Logger | None = None,
     ) -> None:
+        if read_timeout is not None and read_timeout <= 0:
+            raise ValueError("read_timeout must be positive")
+        if empty_read_retries < 0:
+            raise ValueError("empty_read_retries cannot be negative")
+        if empty_read_retry_delay < 0:
+            raise ValueError("empty_read_retry_delay cannot be negative")
         self._address = address
         self._ble_device = ble_device
         self._connector = connector or self._default_connector
         self._connect_timeout = connect_timeout
         self._notify_timeout = notify_timeout
         self._io_timeout = io_timeout
+        self._read_timeout = read_timeout or io_timeout
         self._disconnect_timeout = disconnect_timeout
         self._idle_read_timeout = idle_read_timeout
+        self._empty_read_retries = empty_read_retries
+        self._empty_read_retry_delay = empty_read_retry_delay
         self._logger = logger or logging.getLogger(__name__)
 
         self._lifecycle_lock = asyncio.Lock()
+        self._io_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
         self._client: Any | None = None
         self._from_radio: Any | None = None
@@ -79,7 +92,11 @@ class BluetoothConnection:
         self._connect_count = 0
         self._disconnect_count = 0
         self._notification_count = 0
+        self._read_trigger_count = 0
+        self._idle_read_count = 0
         self._read_count = 0
+        self._read_timeout_count = 0
+        self._empty_read_retry_count = 0
         self._write_count = 0
         self._forced_read_count = 0
         self._notify_restart_count = 0
@@ -187,7 +204,12 @@ class BluetoothConnection:
                     # Meshtastic firmware, so it requires an ATT write request.
                     # Never retry after an exception: the backend may have
                     # delivered the protobuf before reporting its local error.
-                    await client.write_gatt_char(characteristic, payload, response=True)
+                    async with self._io_lock:
+                        await client.write_gatt_char(
+                            characteristic,
+                            payload,
+                            response=True,
+                        )
             except BaseException as err:
                 if isinstance(err, asyncio.CancelledError):
                     raise
@@ -208,22 +230,31 @@ class BluetoothConnection:
             raise MeshtasticNotConnectedError("Meshtastic Bluetooth is not connected")
         notify_timeout_count = 0
         while self.is_connected and not self._closing:
-            payload = await self._async_read()
-            if payload:
-                notify_timeout_count = 0
-                yield payload
-                continue
-
             outcome = await self._wait_for_read_request()
             if outcome == "disconnected":
                 raise MeshtasticConnectionError("Meshtastic Bluetooth disconnected")
             if outcome == "timeout":
+                self._idle_read_count += 1
                 notify_timeout_count += 1
                 if notify_timeout_count > 2:
                     notify_timeout_count = 0
                     await self._restart_notifications()
             else:
+                self._read_trigger_count += 1
                 notify_timeout_count = 0
+
+            empty_retries = 0
+            while self.is_connected and not self._closing:
+                payload = await self._async_read()
+                if payload:
+                    empty_retries = 0
+                    yield payload
+                    continue
+                if empty_retries >= self._empty_read_retries:
+                    break
+                empty_retries += 1
+                self._empty_read_retry_count += 1
+                await asyncio.sleep(self._empty_read_retry_delay)
 
     def diagnostic_snapshot(self) -> dict[str, Any]:
         """Return cached, endpoint-free transport diagnostics."""
@@ -233,10 +264,15 @@ class BluetoothConnection:
             "owns_endpoint": self.owns_endpoint,
             "notifications_ready": self._notifications_ready,
             "closing": self._closing,
+            "io_locked": self._io_lock.locked(),
             "connect_count": self._connect_count,
             "disconnect_count": self._disconnect_count,
             "notification_count": self._notification_count,
+            "read_trigger_count": self._read_trigger_count,
+            "idle_read_count": self._idle_read_count,
             "read_count": self._read_count,
+            "read_timeout_count": self._read_timeout_count,
+            "empty_read_retry_count": self._empty_read_retry_count,
             "write_count": self._write_count,
             "forced_read_count": self._forced_read_count,
             "notify_restart_count": self._notify_restart_count,
@@ -247,6 +283,7 @@ class BluetoothConnection:
                 "connect": self._connect_timeout,
                 "notify": self._notify_timeout,
                 "io": self._io_timeout,
+                "read": self._read_timeout,
                 "disconnect": self._disconnect_timeout,
                 "idle_read": self._idle_read_timeout,
             },
@@ -258,11 +295,14 @@ class BluetoothConnection:
         if not self.is_connected or self._closing or characteristic is None:
             raise MeshtasticNotConnectedError("Meshtastic Bluetooth is not connected")
         try:
-            async with asyncio.timeout(self._io_timeout):
-                payload = await client.read_gatt_char(characteristic)
+            async with asyncio.timeout(self._read_timeout):
+                async with self._io_lock:
+                    payload = await client.read_gatt_char(characteristic)
         except BaseException as err:
             if isinstance(err, asyncio.CancelledError):
                 raise
+            if isinstance(err, TimeoutError):
+                self._read_timeout_count += 1
             self._last_error_type = type(err).__name__
             self._last_failure_phase = "reading_from_radio"
             raise MeshtasticConnectionError(f"Meshtastic Bluetooth read failed: {type(err).__name__}") from err

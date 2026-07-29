@@ -119,11 +119,14 @@ selected local scanner, connects with `bleak-retry-connector`, validates the
 three Meshtastic GATT characteristics, subscribes to FromNum, sends
 `want_config`, and actively drains FromRadio until configuration completes.
 
-One supervisor owns the connection, reader, configuration, and reconnect tasks.
-Initial setup has hard connect and configuration deadlines; reconnect starts
-only after a previously active session is lost and uses bounded backoff. Stop
-cancels and awaits subordinate tasks, then performs bounded GATT teardown before
-the endpoint lease is released. No MQTT, broker, Internet, Wi-Fi, or LAN path is
+One supervisor owns the connection, reader, configuration, and fast post-active
+reconnect tasks. Initial setup has hard connect and configuration deadlines.
+The coordinator also schedules its single-flight, jittered stop-before-start
+watchdog after either an initial failure or a connected-status loss; a recovered
+status cancels that watchdog. Stop cancels and awaits subordinate tasks, then
+performs bounded GATT teardown before the endpoint lease is released. A timed-out
+ATT operation is never retried on its uncertain link, and reads and writes share
+one bounded GATT-operation lock. No MQTT, broker, Internet, Wi-Fi, or LAN path is
 part of this transport.
 
 ## Normalized Models

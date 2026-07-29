@@ -6,7 +6,7 @@ import sys
 import types
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 from custom_components.meshnet.const import PROTOCOL_MESHTASTIC, TRANSPORT_TCP
 from custom_components.meshnet.models import (
@@ -1563,6 +1563,7 @@ def test_gateway_start_repairs_follow_current_outcomes(monkeypatch) -> None:
             first_config.gateway_id: first,
             second_config.gateway_id: second,
         }
+        coordinator._schedule_reconnect = Mock()
         issue_registry_module = coordinator_class._start_gateways.__globals__["ir"]
         deleted: list[tuple[str, str]] = []
         created: list[tuple[str, str]] = []
@@ -1588,8 +1589,59 @@ def test_gateway_start_repairs_follow_current_outcomes(monkeypatch) -> None:
             ("meshnet", "gateway_start_gateway_001"),
         ]
         assert created == [("meshnet", "gateway_start_gateway_002")]
+        coordinator._schedule_reconnect.assert_called_once_with(
+            second_config.gateway_id
+        )
         assert all("private" not in issue_id for _domain, issue_id in deleted)
         assert all("private" not in issue_id for _domain, issue_id in created)
+
+    asyncio.run(run())
+
+
+def test_connected_gateway_clears_failed_start_repair(monkeypatch) -> None:
+    """A background recovery must remove the warning from its failed start."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+        coordinator = object.__new__(coordinator_class)
+        coordinator._shutting_down = False
+        coordinator._reconnect_suspended = False
+        coordinator._gateway_generation = 1
+        coordinator._reconnect_tasks = {}
+        coordinator.snapshot = MeshSnapshot()
+        coordinator.async_set_updated_data = Mock()
+        coordinator._flush_outbox = AsyncMock()
+        coordinator._delete_resolved_issue = Mock(return_value=True)
+        config = GatewayConfig(
+            gateway_id="private-gateway",
+            name="Private Gateway",
+            protocol=PROTOCOL_MESHTASTIC,
+            transport=TRANSPORT_TCP,
+        )
+        status = GatewayStatus(
+            gateway_id=config.gateway_id,
+            name=config.name,
+            protocol=config.protocol,
+            transport=config.transport,
+            connected=True,
+        )
+        coordinator._gateway_configs = [config]
+        coordinator.gateways = {
+            config.gateway_id: SimpleNamespace(config=config, status=status)
+        }
+
+        await coordinator._handle_gateway_status(
+            status,
+            gateway_generation=1,
+        )
+
+        coordinator._delete_resolved_issue.assert_called_once_with(
+            "gateway_start_gateway_001"
+        )
+        coordinator._flush_outbox.assert_awaited_once_with(
+            gateway_id=config.gateway_id,
+            gateway_generation=1,
+        )
 
     asyncio.run(run())
 

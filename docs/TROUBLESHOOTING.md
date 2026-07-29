@@ -382,14 +382,22 @@ runtime.gateways[0].client.last_bluetooth_failure.transport.last_transport_befor
 
 This example means adapter validation, GATT connection, and notification setup
 completed, but a FromRadio read timed out before the radio finished its
-configuration exchange; teardown was confirmed. Check for
-another connected phone or computer, wake or restart the radio's Bluetooth,
-and then reload the MeshNet entry. Other phase values distinguish local-device
-resolution, GATT connection, profile validation, notification setup, config
-request, active operation, teardown, and reconnect backoff. Diagnostic
-collection itself does not probe or reconnect the radio. Failure snapshots are
-strictly allowlisted primitive states and counters; they never retain a BLE
-client, device object, endpoint, address, exception message, or packet content.
+configuration exchange; teardown was confirmed. Version 0.5.11 no longer lets
+the 15-second general I/O limit preempt the full configuration budget. It also
+waits for the ToRadio write to propagate, drains FromRadio only after an actual
+write/notification/idle trigger, and schedules a fresh-link retry through the
+single-flight coordinator after confirmed teardown. A recovered gateway clears
+this warning automatically.
+
+If the warning returns after that retry, check for another connected phone or
+computer and wake or restart the radio's Bluetooth. Reloading the MeshNet entry
+requests an immediate fresh attempt but should not normally be necessary.
+Other phase values distinguish local-device resolution, GATT connection,
+profile validation, notification setup, config request, active operation,
+teardown, and reconnect backoff. Diagnostic collection itself does not probe
+or reconnect the radio. Failure snapshots are strictly allowlisted primitive
+states and counters; they never retain a BLE client, device object, endpoint,
+address, exception message, or packet content.
 
 Direct Bluetooth needs no MQTT, broker, Internet, Wi-Fi, or LAN. If Home
 Assistant shows a dependency-install error immediately after a new HACS

@@ -159,7 +159,10 @@ owns GATT, configuration, reader, and reconnect tasks; it cancels and awaits
 them before releasing MeshNet's endpoint lease. Configuration subscribes to
 notifications before sending `want_config` and performs an active FromRadio
 read, including firmware that does not emit a fresh notification for that
-request. Runtime does not use MQTT, Internet, Wi-Fi, or the LAN.
+request. Reads and writes are serialized through one bounded ATT-operation
+lock. A timed-out ATT operation poisons that connection: cleanup must confirm
+that its owner and GATT link have stopped before the coordinator may retry on a
+fresh link. Runtime does not use MQTT, Internet, Wi-Fi, or the LAN.
 
 The six-digit PIN field is password-masked. The value exists only for the
 active pairing request and is not written to config entries, options,

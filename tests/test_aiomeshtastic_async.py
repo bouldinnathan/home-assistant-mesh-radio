@@ -17,6 +17,7 @@ from custom_components.meshnet.aiomeshtastic.bluetooth import (
 )
 from custom_components.meshnet.aiomeshtastic.errors import (
     MeshtasticCleanupError,
+    MeshtasticConfigurationError,
     MeshtasticConnectionError,
 )
 
@@ -102,13 +103,17 @@ def test_force_read_wakes_reader_only_after_write() -> None:
 
         stream = connection.packet_stream()
         read = asyncio.create_task(anext(stream))
-        while client.read_count < 1:
-            await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert client.read_count == 0
         await connection.async_send(b"want-config", force_read=True)
 
         assert await read == expected
         assert client.writes == [b"want-config"]
-        assert connection.diagnostic_snapshot()["forced_read_count"] == 1
+        diagnostics = connection.diagnostic_snapshot()
+        assert diagnostics["forced_read_count"] == 1
+        assert diagnostics["read_trigger_count"] == 1
+        assert diagnostics["empty_read_retry_count"] == 1
+        assert diagnostics["read_count"] == 2
         await stream.aclose()
         await connection.async_disconnect()
 
@@ -146,8 +151,120 @@ def test_read_timeout_retains_from_radio_failure_phase() -> None:
         diagnostics = connection.diagnostic_snapshot()
         assert diagnostics["last_error_type"] == "TimeoutError"
         assert diagnostics["last_failure_phase"] == "reading_from_radio"
+        assert diagnostics["read_timeout_count"] == 1
+        assert client.read_count == 1
         await stream.aclose()
         await connection.async_disconnect()
+
+    asyncio.run(run())
+
+
+def test_reads_and_writes_share_one_bounded_gatt_owner() -> None:
+    class SerializedGattClient(_GattClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.read_started = asyncio.Event()
+            self.release_read = asyncio.Event()
+            self.read_active = False
+
+        async def read_gatt_char(self, _characteristic: object) -> bytes:
+            self.read_count += 1
+            self.read_active = True
+            self.read_started.set()
+            try:
+                await self.release_read.wait()
+                return b"from-radio-record"
+            finally:
+                self.read_active = False
+
+        async def write_gatt_char(
+            self,
+            _characteristic: object,
+            payload: bytes,
+            *,
+            response: bool = True,
+        ) -> None:
+            assert self.read_active is False
+            await super().write_gatt_char(
+                _characteristic,
+                payload,
+                response=response,
+            )
+
+    async def run() -> None:
+        client = SerializedGattClient()
+        connection = _connection(client, read_timeout=0.5)
+        await connection.async_connect()
+        await connection.async_send(b"want-config", force_read=True)
+
+        stream = connection.packet_stream()
+        read = asyncio.create_task(anext(stream))
+        await client.read_started.wait()
+        send = asyncio.create_task(connection.async_send(b"message"))
+        await asyncio.sleep(0)
+
+        assert send.done() is False
+        assert connection.diagnostic_snapshot()["io_locked"] is True
+        client.release_read.set()
+        assert await read == b"from-radio-record"
+        await send
+        assert client.writes == [b"want-config", b"message"]
+        await stream.aclose()
+        await connection.async_disconnect()
+
+    asyncio.run(run())
+
+
+def test_configuration_deadline_preempts_individual_gatt_read_timeout() -> None:
+    pytest.importorskip("meshtastic")
+    from custom_components.meshnet.aiomeshtastic.client import (
+        MeshtasticBluetoothClient,
+    )
+
+    async def run() -> None:
+        gatt_client = _GattClient()
+        factory_arguments: dict[str, Any] = {}
+
+        async def connector(_device: object, _callback: Any) -> _GattClient:
+            return gatt_client
+
+        def connection_factory(**kwargs: Any) -> BluetoothConnection:
+            factory_arguments.update(kwargs)
+            return BluetoothConnection(
+                connector=connector,
+                notify_timeout=0.1,
+                idle_read_timeout=0.1,
+                empty_read_retry_delay=0,
+                **kwargs,
+            )
+
+        client = MeshtasticBluetoothClient(
+            address="AA:BB:CC:DD:EE:FF",
+            device_provider=lambda: SimpleNamespace(),
+            connection_factory=connection_factory,
+            connect_timeout=0.1,
+            configuration_timeout=0.03,
+            io_timeout=0.01,
+            disconnect_timeout=0.1,
+            start_timeout=0.5,
+            stop_timeout=0.2,
+            heartbeat_interval=60,
+        )
+
+        with pytest.raises(
+            MeshtasticConfigurationError,
+            match="did not complete configuration in time",
+        ):
+            await client.async_start()
+
+        assert factory_arguments["read_timeout"] > 0.03
+        assert gatt_client.read_count == 1
+        assert gatt_client.is_connected is False
+        diagnostics = client.diagnostic_snapshot()
+        assert diagnostics["last_failure_phase"] == (
+            "bluetooth_synchronizing_configuration"
+        )
+        assert diagnostics["last_transport_cleanup_outcome"] == "confirmed"
 
     asyncio.run(run())
 

@@ -14,4 +14,6 @@ generated-protobuf code. It imports protobuf messages from the separately
 installed `meshtastic` package. It also adds bounded startup/shutdown,
 cancellation-safe task ownership, retry-time device resolution, plain-dict
 callbacks, privacy-safe diagnostics, and the post-`want_config` forced read
-needed by affected Meshtastic Bluetooth firmware.
+needed by affected Meshtastic Bluetooth firmware. Its read loop preserves the
+official trigger-then-drain and bounded empty-response retry behavior while
+adding an asynchronous configuration deadline and confirmed-teardown fence.

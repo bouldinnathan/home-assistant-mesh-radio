@@ -1,5 +1,26 @@
 # Upgrade Guide
 
+## From 0.5.10
+
+0.5.11 hardens direct Meshtastic Bluetooth startup for radios with a large or
+temporarily slow node database. `FromRadio` reads now follow Meshtastic's
+write/notification-triggered drain sequence, include the official post-write
+settling delay and bounded empty-response retries, and use a separate read
+deadline that cannot preempt the 60-second configuration budget.
+
+A timed-out ATT operation is still treated conservatively: MeshNet never
+retries that read or write on the same uncertain connection. It cancels and
+joins the session owner, confirms GATT teardown, and only then uses the existing
+single-flight, jittered reconnect loop to open a fresh link. Initial startup
+failures now enter that loop automatically instead of requiring a manual
+reload. A successful recovery clears its `gateway_start` repair. Reads and
+writes also share one bounded ATT-operation lock so a message or heartbeat
+cannot overlap an active `FromRadio` transaction.
+
+No gateway, pairing, node, entity, message, or history migration is required.
+Install the update and restart Home Assistant. Keep the phone app disconnected
+because Meshtastic radios still permit only one client connection.
+
 ## From 0.5.9
 
 0.5.10 keeps periodic sidebar snapshots from replacing an active message,

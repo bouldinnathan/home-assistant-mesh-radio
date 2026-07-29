@@ -1010,6 +1010,9 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             return
         self.snapshot.gateways[status.gateway_id] = status
         if status.connected:
+            self._delete_resolved_issue(
+                self._gateway_issue_id("gateway_start", status.gateway_id)
+            )
             reconnect_task = self._reconnect_tasks.get(status.gateway_id)
             if reconnect_task and reconnect_task is not asyncio.current_task():
                 reconnect_task.cancel()
@@ -1094,6 +1097,11 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                     message=f"{gateway.config.name} failed to start: {result}",
                     severity=ir.IssueSeverity.WARNING,
                 )
+                # A pre-active Bluetooth failure never emits a connected-to-
+                # disconnected transition, so it cannot reach the normal
+                # status callback. Reuse the existing single-flight,
+                # stop-before-start retry loop after startup cleanup returns.
+                self._schedule_reconnect(gateway.config.gateway_id)
             else:
                 self._delete_resolved_issue(issue_id)
 

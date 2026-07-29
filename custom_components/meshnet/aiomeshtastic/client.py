@@ -61,10 +61,15 @@ _CONNECTION_DIAGNOSTIC_FIELDS = frozenset(
         "owns_endpoint",
         "notifications_ready",
         "closing",
+        "io_locked",
         "connect_count",
         "disconnect_count",
         "notification_count",
+        "read_trigger_count",
+        "idle_read_count",
         "read_count",
+        "read_timeout_count",
+        "empty_read_retry_count",
         "write_count",
         "forced_read_count",
         "notify_restart_count",
@@ -74,7 +79,7 @@ _CONNECTION_DIAGNOSTIC_FIELDS = frozenset(
     }
 )
 _CONNECTION_TIMEOUT_FIELDS = frozenset(
-    {"connect", "notify", "io", "disconnect", "idle_read"}
+    {"connect", "notify", "io", "read", "disconnect", "idle_read"}
 )
 
 
@@ -120,6 +125,7 @@ class MeshtasticBluetoothClient:
         connect_timeout: float = 30.0,
         configuration_timeout: float = 60.0,
         io_timeout: float = 15.0,
+        read_timeout: float | None = None,
         disconnect_timeout: float = 5.0,
         start_timeout: float | None = None,
         stop_timeout: float = 12.0,
@@ -132,10 +138,16 @@ class MeshtasticBluetoothClient:
     ) -> None:
         if not address.strip():
             raise ValueError("address cannot be empty")
+        resolved_read_timeout = (
+            read_timeout
+            if read_timeout is not None
+            else max(io_timeout, configuration_timeout + 5.0)
+        )
         if min(
             connect_timeout,
             configuration_timeout,
             io_timeout,
+            resolved_read_timeout,
             disconnect_timeout,
             stop_timeout,
             reconnect_initial_delay,
@@ -152,6 +164,7 @@ class MeshtasticBluetoothClient:
         self._connect_timeout = connect_timeout
         self._configuration_timeout = configuration_timeout
         self._io_timeout = io_timeout
+        self._read_timeout = resolved_read_timeout
         self._disconnect_timeout = disconnect_timeout
         self._start_timeout = start_timeout or (
             connect_timeout + configuration_timeout + disconnect_timeout + 5.0
@@ -553,6 +566,7 @@ class MeshtasticBluetoothClient:
                 "connect": self._connect_timeout,
                 "configuration": self._configuration_timeout,
                 "io": self._io_timeout,
+                "read": self._read_timeout,
                 "disconnect": self._disconnect_timeout,
                 "start": self._start_timeout,
                 "stop": self._stop_timeout,
@@ -588,6 +602,7 @@ class MeshtasticBluetoothClient:
                         ble_device=device,
                         connect_timeout=self._connect_timeout,
                         io_timeout=self._io_timeout,
+                        read_timeout=self._read_timeout,
                         disconnect_timeout=self._disconnect_timeout,
                         logger=self._logger,
                     )
@@ -602,6 +617,11 @@ class MeshtasticBluetoothClient:
                     request = mesh_pb2.ToRadio()
                     request.want_config_id = self._config_id
                     await connection.async_send(request.SerializeToString(), force_read=True)
+                    # Match Meshtastic's official BLE client: let the completed
+                    # ToRadio ATT write propagate before beginning FromRadio
+                    # reads. The forced-read event is already armed, but no
+                    # reader exists yet, so this does not introduce a race.
+                    await asyncio.sleep(0.01)
 
                     # Meshtastic's GATT server handles ToRadio writes and
                     # FromRadio reads on the same BLE callback task.  Its
@@ -641,7 +661,10 @@ class MeshtasticBluetoothClient:
                     self._remember_error(err)
                     if not self._ever_active:
                         self._initial_error = self._public_error(err)
-                        self._start_result_event.set()
+                        # The outer finally publishes the result only after
+                        # session teardown has completed or been reported as
+                        # unconfirmed. A caller must never begin a fresh-link
+                        # retry while this connection still owns GATT.
                         return
                 finally:
                     if was_active or self._connected:
