@@ -32,12 +32,24 @@ class MeshNetPanel extends HTMLElement {
     this._windowRejectionHandler = null;
     this._pollRenderPending = false;
     this._focusFlushGeneration = 0;
+    this._activeView = "mesh";
+    this._settingsGateways = [];
+    this._settingsSnapshot = null;
+    this._settingsGatewayId = "";
+    this._settingsDraft = Object.create(null);
+    this._settingsPreview = null;
+    this._settingsStatus = null;
+    this._settingsResultWarnings = [];
+    this._settingsBusy = null;
+    this._settingsCriticalConfirmed = false;
+    this._settingsRequestGeneration = 0;
   }
 
   set hass(hass) {
     this._hass = hass;
     this._startPolling();
     this._drainPanelReports();
+    this._maybeLoadSettings();
   }
 
   connectedCallback() {
@@ -45,6 +57,7 @@ class MeshNetPanel extends HTMLElement {
     this._attachWindowFailureHandlers();
     this._startPolling();
     this._drainPanelReports();
+    this._maybeLoadSettings();
   }
 
   disconnectedCallback() {
@@ -55,6 +68,18 @@ class MeshNetPanel extends HTMLElement {
     this._focusFlushGeneration += 1;
     this._pollEpoch += 1;
     this._snapshotGeneration += 1;
+    this._settingsRequestGeneration += 1;
+    this._settingsBusy = null;
+    // Treat navigation away from the panel as abandoning the draft. Secret
+    // replacements must not linger on a detached custom-element instance.
+    this._clearSecretSettingsDrafts();
+    this._settingsDraft = Object.create(null);
+    this._settingsPreview = null;
+    this._settingsSnapshot = null;
+    this._settingsGateways = [];
+    this._settingsStatus = null;
+    this._settingsCriticalConfirmed = false;
+    this._settingsResultWarnings = [];
     if (this._pollTimer != null) window.clearTimeout(this._pollTimer);
     this._pollTimer = null;
   }
@@ -69,6 +94,16 @@ class MeshNetPanel extends HTMLElement {
       this._renderPollSnapshot();
       this._scheduleNextPoll(epoch);
     });
+  }
+
+  _maybeLoadSettings() {
+    if (
+      this._connected
+      && this._hass
+      && this._activeView === "settings"
+      && !this._settingsSnapshot
+      && this._settingsBusy == null
+    ) void this._loadGatewaySettings(this._settingsGatewayId);
   }
 
   _pollIsCurrent(epoch) {
@@ -250,6 +285,12 @@ class MeshNetPanel extends HTMLElement {
       "invalid_recipient",
       "send_submission",
       "send_finalize",
+      "settings_get",
+      "settings_preview",
+      "settings_apply",
+      "settings_event",
+      "bind_settings",
+      "bind_views",
       "reporting",
     ], "poll_unexpected");
     const safeCategory = this._safeOperation(category, [
@@ -350,6 +391,12 @@ class MeshNetPanel extends HTMLElement {
       invalid_recipient: "invalid_recipient",
       send_submission: "send_message",
       send_finalize: "render",
+      settings_get: "settings_get",
+      settings_preview: "settings_preview",
+      settings_apply: "settings_apply",
+      settings_event: "event_handler",
+      bind_settings: "event_handler",
+      bind_views: "event_handler",
       reporting: "reporting",
     };
     let operation = operationMap[event.operation] || "reporting";
@@ -415,6 +462,9 @@ class MeshNetPanel extends HTMLElement {
       snapshot_timeout: "timeout",
       post_send_refresh: "post_send_refresh_failed",
       send_message: "send_failed",
+      settings_get: "settings_load_failed",
+      settings_preview: "settings_preview_failed",
+      settings_apply: "settings_apply_failed",
       render: "render_failed",
       poll: "poll_failed",
       event_handler: "handler_failed",
@@ -562,7 +612,11 @@ class MeshNetPanel extends HTMLElement {
   }
 
   _render() {
-    const composerFocus = this._composerFocusState();
+    const composerFocus = this._composerFocusState() || this._settingsFocusState();
+    if (this._activeView === "settings") {
+      this._renderSettings(composerFocus);
+      return;
+    }
     const snapshot = this._snapshot || { nodes: {}, gateways: {}, recent_messages: [] };
     const sourceNodes = Object.values(snapshot.nodes || {}).filter(
       (node) => node && typeof node === "object" && !Array.isArray(node),
@@ -573,7 +627,14 @@ class MeshNetPanel extends HTMLElement {
     );
     const sortedNodes = this._sortNodes(nodes, this._nodeSort);
     const directDelivery = this._draft.delivery === "direct";
-    const recipientCount = this._recipientChoices(nodes).length;
+    const recipientChoices = this._recipientChoices(nodes);
+    const unsafeRecipientKeys = new Set(
+      recipientChoices
+        .filter((choice) => choice.ambiguous || choice.invalidIdentity)
+        .map((choice) => choice.value),
+    );
+    const recipientCount = recipientChoices
+      .filter((choice) => !choice.ambiguous && !choice.invalidIdentity).length;
     const locatedNodeCount = this._validLocationCount(nodes);
     const unnamedNodeCount = sourceNodes.filter((node) => {
       if (!this._meshtasticNodeId(node)) return false;
@@ -611,6 +672,25 @@ class MeshNetPanel extends HTMLElement {
           display: flex;
           align-items: center;
           gap: 12px;
+        }
+        .view-tabs {
+          display: flex;
+          gap: 6px;
+          margin-bottom: 12px;
+        }
+        .view-tab {
+          border: 1px solid var(--divider-color);
+          border-radius: 7px;
+          padding: 7px 12px;
+          color: var(--primary-text-color);
+          background: var(--card-background-color);
+          cursor: pointer;
+          font: inherit;
+        }
+        .view-tab.active {
+          border-color: var(--primary-color);
+          color: var(--text-primary-color, #fff);
+          background: var(--primary-color);
         }
         .map-link {
           color: var(--primary-color);
@@ -860,6 +940,7 @@ class MeshNetPanel extends HTMLElement {
               <span class="${this._error ? "bad" : "good"}">${this._escape(this._error || "Snapshot current")}</span>
             </div>
           </div>
+          ${this._viewTabs()}
           <div class="stats">
             ${this._stat("Nodes", nodes.length)}
             ${this._stat("Recently seen", nodes.filter((node) => node.online).length)}
@@ -952,7 +1033,7 @@ class MeshNetPanel extends HTMLElement {
                 </span>
                 <span class="node-actions">
                   <span class="${node.online ? "good" : "bad"}">${node.online ? "recent" : "stale"}</span>
-                  <button class="node-message" type="button" data-message-node="${this._escape(node.node_key)}">Message</button>
+                  <button class="node-message" type="button" data-message-node="${this._escape(node.node_key)}"${unsafeRecipientKeys.has(String(node.node_key)) ? ' disabled aria-disabled="true" title="Unsafe node identity; direct messaging is disabled"' : ""}>${unsafeRecipientKeys.has(String(node.node_key)) ? "Identity blocked" : "Message"}</button>
                 </span>
               </div>
             `).join("") || `<div class="label">Waiting for node data</div>`}
@@ -991,6 +1072,7 @@ class MeshNetPanel extends HTMLElement {
         </aside>
       </div>
     `;
+    this._safeStep("bind_views", "binding", () => this._bindViewControls());
     this._safeStep("bind_composer", "binding", () => this._bindComposer());
     this._safeStep("bind_nodes", "binding", () => this._bindNodeControls());
     this._safeStep("restore_focus", "focus", () => this._restoreComposerFocus(composerFocus));
@@ -1015,8 +1097,38 @@ class MeshNetPanel extends HTMLElement {
     };
   }
 
+  _settingsFocusState() {
+    const active = this._activePanelElement();
+    if (!active || !this.contains(active)) return null;
+    const id = typeof active.id === "string" ? active.id : "";
+    let isSetting = id.startsWith("meshnet-setting-")
+      || [
+        "meshnet-settings-gateway",
+        "meshnet-settings-preview",
+        "meshnet-settings-apply",
+        "meshnet-settings-critical",
+        "meshnet-settings-reload",
+        "meshnet-view-mesh",
+        "meshnet-view-settings",
+      ].includes(id);
+    try {
+      isSetting = isSetting
+        || (typeof active.hasAttribute === "function"
+          && (active.hasAttribute("data-setting-index")
+            || active.hasAttribute("data-setting-clear-index")));
+    } catch (_ignored) {
+      // A disappearing browser control is not an active settings editor.
+    }
+    if (!isSetting) return null;
+    return {
+      id,
+      start: typeof active.selectionStart === "number" ? active.selectionStart : null,
+      end: typeof active.selectionEnd === "number" ? active.selectionEnd : null,
+    };
+  }
+
   _panelInteractionActive() {
-    if (this._composerFocusState()) return true;
+    if (this._composerFocusState() || this._settingsFocusState()) return true;
     const active = this._activePanelElement();
     if (!active || !this.contains(active)) return false;
     if (active.id === "meshnet-send-button") return true;
@@ -1065,6 +1177,1141 @@ class MeshNetPanel extends HTMLElement {
     if (state.start != null && typeof field.setSelectionRange === "function") {
       field.setSelectionRange(state.start, state.end);
     }
+  }
+
+  _viewTabs() {
+    return `
+      <nav class="view-tabs" aria-label="MeshNet views">
+        <button id="meshnet-view-mesh" class="view-tab${this._activeView === "mesh" ? " active" : ""}" type="button" data-meshnet-view="mesh"${this._activeView === "mesh" ? ' aria-current="page"' : ""}>Mesh</button>
+        <button id="meshnet-view-settings" class="view-tab${this._activeView === "settings" ? " active" : ""}" type="button" data-meshnet-view="settings"${this._activeView === "settings" ? ' aria-current="page"' : ""}>Gateway settings</button>
+      </nav>
+    `;
+  }
+
+  _bindViewControls() {
+    this.querySelectorAll("[data-meshnet-view]").forEach((button) => {
+      button.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
+      button.addEventListener("click", () => {
+        this._safeStep("settings_event", "binding", () => {
+          this._switchView(button.getAttribute("data-meshnet-view"));
+        });
+      });
+    });
+  }
+
+  _switchView(view) {
+    const next = view === "settings" ? "settings" : "mesh";
+    if (this._activeView === next) return;
+    this._activeView = next;
+    this._safeRender("render");
+    if (next === "settings" && !this._settingsSnapshot && this._settingsBusy !== "get") {
+      void this._loadGatewaySettings();
+    }
+  }
+
+  _renderSettings(focusState = null) {
+    const snapshot = this._settingsSnapshot;
+    const fields = this._settingsFields(snapshot);
+    const hasChanges = Object.keys(this._settingsDraft).length > 0;
+    const busy = this._settingsBusy != null;
+    this.innerHTML = `
+      <style>
+        :host {
+          display: block;
+          min-height: 100vh;
+          color: var(--primary-text-color);
+          background: var(--primary-background-color);
+          font-family: var(--paper-font-body1_-_font-family);
+        }
+        .settings-wrap { max-width: 1040px; margin: 0 auto; padding: 16px; box-sizing: border-box; }
+        .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+        h1 { margin: 0; font-size: 22px; font-weight: 500; }
+        h2 { margin: 0; font-size: 17px; font-weight: 500; }
+        h3 { margin: 0; font-size: 15px; font-weight: 500; }
+        .view-tabs { display: flex; gap: 6px; margin: 12px 0; }
+        .view-tab, .settings-button {
+          border: 1px solid var(--divider-color);
+          border-radius: 7px;
+          padding: 8px 13px;
+          color: var(--primary-text-color);
+          background: var(--card-background-color);
+          cursor: pointer;
+          font: inherit;
+        }
+        .view-tab.active, .settings-button.primary {
+          border-color: var(--primary-color);
+          color: var(--text-primary-color, #fff);
+          background: var(--primary-color);
+        }
+        button:disabled { cursor: default; opacity: 0.55; }
+        .settings-card {
+          margin-top: 12px;
+          border: 1px solid var(--divider-color);
+          border-radius: 9px;
+          padding: 14px;
+          background: var(--card-background-color);
+        }
+        .settings-heading { display: flex; justify-content: space-between; gap: 12px; align-items: start; }
+        .settings-grid { display: grid; gap: 12px; margin-top: 12px; }
+        .settings-field {
+          display: grid;
+          grid-template-columns: minmax(190px, 0.8fr) minmax(220px, 1.2fr);
+          gap: 14px;
+          align-items: center;
+          padding-top: 11px;
+          border-top: 1px solid var(--divider-color);
+        }
+        .settings-label { display: grid; gap: 3px; min-width: 0; }
+        .settings-control { display: grid; gap: 4px; }
+        .settings-control input:not([type="checkbox"]), .settings-control select, .gateway-select {
+          width: 100%;
+          box-sizing: border-box;
+          border: 1px solid var(--divider-color);
+          border-radius: 6px;
+          padding: 8px;
+          color: var(--primary-text-color);
+          background: var(--card-background-color);
+          font: inherit;
+        }
+        .settings-control input[type="checkbox"] { justify-self: start; width: 20px; height: 20px; }
+        .settings-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 14px; }
+        .settings-preview-change { padding: 8px 0; border-top: 1px solid var(--divider-color); }
+        .settings-preview-change:first-of-type { border-top: 0; }
+        .critical-box {
+          display: flex;
+          gap: 8px;
+          align-items: start;
+          margin-top: 12px;
+          padding: 10px;
+          border: 1px solid var(--warning-color, #b26a00);
+          border-radius: 7px;
+        }
+        .label, .field-help { color: var(--secondary-text-color); font-size: 12px; }
+        .field-help { overflow-wrap: anywhere; }
+        .badge { display: inline-block; margin-right: 5px; font-size: 11px; }
+        .warn { color: var(--warning-color, #b26a00); }
+        .bad { color: var(--error-color, #d32f2f); }
+        .good { color: var(--success-color, #168047); }
+        .settings-status { min-height: 18px; margin-top: 10px; font-size: 13px; }
+        ul.warnings { margin: 8px 0 0; padding-left: 20px; }
+        @media (max-width: 720px) {
+          .settings-wrap { padding: 10px; }
+          .settings-field { grid-template-columns: 1fr; gap: 7px; }
+          .settings-heading { display: grid; }
+        }
+      </style>
+      <div class="settings-wrap">
+        <div class="toolbar">
+          <div>
+            <h1>MeshNet</h1>
+            <div class="label">Administrator gateway controls</div>
+          </div>
+          <span class="${snapshot && snapshot.connected ? "good" : "warn"}">${snapshot ? snapshot.connected ? "Gateway online" : "Gateway offline" : "Settings not loaded"}</span>
+        </div>
+        ${this._viewTabs()}
+        <section class="settings-card">
+          <div class="settings-heading">
+            <div>
+              <h2>Gateway settings</h2>
+              <div class="label">Changes stay in this browser tab until you preview them. MeshNet never stores a settings draft in browser storage.</div>
+            </div>
+            <label>
+              <span class="label">Gateway</span>
+              <select class="gateway-select" id="meshnet-settings-gateway"${busy ? " disabled" : ""}>
+                ${this._settingsGatewayOptions()}
+              </select>
+            </label>
+            <button class="settings-button" id="meshnet-settings-reload" type="button"${busy ? " disabled" : ""}>Reload live values</button>
+          </div>
+          ${this._settingsBusy === "get" && !snapshot ? '<div class="settings-status warn">Loading gateway settings…</div>' : ""}
+          ${!snapshot && this._settingsBusy !== "get" ? '<div class="settings-status warn">Choose a gateway to load its supported settings.</div>' : ""}
+          ${snapshot ? `
+            <div class="field-help">${this._escape(`${snapshot.name} · ${snapshot.protocol} over ${snapshot.transport} · revision ${snapshot.revision}`)}</div>
+            ${snapshot.writable ? "" : `<div class="settings-status warn">Read only${snapshot.read_only_reason ? ` · ${this._escape(snapshot.read_only_reason)}` : ""}</div>`}
+            ${this._settingsWarningList(snapshot.warnings)}
+            <form id="meshnet-settings-form">
+              ${snapshot.categories.map((category) => `
+                <section class="settings-card">
+                  <h3>${this._escape(category.label)}</h3>
+                  ${category.description ? `<div class="field-help">${this._escape(category.description)}</div>` : ""}
+                  <div class="settings-grid">
+                    ${category.fields.map((field) => this._settingsField(
+                      field,
+                      fields.findIndex((candidate) => candidate.path === field.path),
+                      snapshot,
+                    )).join("") || '<div class="label">No settings in this category.</div>'}
+                  </div>
+                </section>
+              `).join("") || '<div class="settings-status warn">This gateway did not report editable categories.</div>'}
+              <div class="settings-actions">
+                <button class="settings-button primary" id="meshnet-settings-preview" type="submit"${busy || !snapshot.writable || !hasChanges || this._settingsPreview ? " disabled" : ""}>${this._settingsBusy === "preview" ? "Preparing preview…" : "Preview changes"}</button>
+                <span class="label">Preview is required before Apply. A stale revision is rejected by Home Assistant.</span>
+              </div>
+            </form>
+            ${this._settingsPreviewHtml()}
+          ` : ""}
+          ${this._settingsWarningList(this._settingsResultWarnings)}
+          <div id="meshnet-settings-status" class="settings-status ${this._settingsStatusClass()}" role="status" aria-live="polite">${this._escape(this._settingsStatus ? this._settingsStatus.text : "")}</div>
+        </section>
+      </div>
+    `;
+    this._safeStep("bind_views", "binding", () => this._bindViewControls());
+    this._safeStep("bind_settings", "binding", () => this._bindSettingsControls());
+    this._safeStep("restore_focus", "focus", () => this._restoreComposerFocus(focusState));
+  }
+
+  _settingsGatewayOptions() {
+    const selected = this._settingsGatewayId
+      || (this._settingsSnapshot && this._settingsSnapshot.gateway_id)
+      || "";
+    const gateways = this._settingsGateways.slice();
+    if (selected && !gateways.some((gateway) => gateway.gateway_id === selected)) {
+      gateways.push({ gateway_id: selected, name: selected, connected: false });
+    }
+    if (!gateways.length) return '<option value="">No gateways available</option>';
+    return gateways.map((gateway) => {
+      const label = gateway.name === gateway.gateway_id
+        ? gateway.name
+        : `${gateway.name} (${gateway.gateway_id})`;
+      return `<option value="${this._escape(gateway.gateway_id)}"${this._selected(selected, gateway.gateway_id)}>${this._escape(`${label} — ${gateway.connected ? "online" : "offline"}`)}</option>`;
+    }).join("");
+  }
+
+  _settingsFields(snapshot = this._settingsSnapshot) {
+    if (!snapshot || !Array.isArray(snapshot.categories)) return [];
+    return snapshot.categories.flatMap((category) => category.fields);
+  }
+
+  _settingsField(field, index, snapshot) {
+    const disabled = this._settingsBusy != null || !snapshot.writable || !field.writable;
+    const value = Object.hasOwn(this._settingsDraft, field.path)
+      ? this._settingsDraft[field.path]
+      : field.value;
+    const badges = [
+      field.critical ? '<span class="badge warn">Critical</span>' : "",
+      field.requires_reconnect ? '<span class="badge warn">Reconnect required</span>' : "",
+      field.type === "secret" && field.configured ? '<span class="badge good">Configured</span>' : "",
+    ].join("");
+    const reason = !snapshot.writable
+      ? snapshot.read_only_reason
+      : !field.writable
+        ? field.read_only_reason
+        : "";
+    return `
+      <div class="settings-field">
+        <label class="settings-label" for="meshnet-setting-${index}">
+          <span>${this._escape(field.label)}</span>
+          <span>${badges}</span>
+          ${field.description ? `<span class="field-help">${this._escape(field.description)}</span>` : ""}
+          ${reason ? `<span class="field-help warn">${this._escape(reason)}</span>` : ""}
+        </label>
+        <span class="settings-control">
+          ${this._settingsInput(field, index, value, disabled)}
+          ${field.unit ? `<span class="field-help">Unit: ${this._escape(field.unit)}</span>` : ""}
+        </span>
+      </div>
+    `;
+  }
+
+  _settingsInput(field, index, value, disabled) {
+    const id = `meshnet-setting-${index}`;
+    const common = `id="${id}" data-setting-index="${index}"${disabled ? " disabled" : ""}`;
+    if (field.type === "boolean") {
+      return `<input ${common} type="checkbox"${value === true ? " checked" : ""}>`;
+    }
+    if (field.type === "select") {
+      const selectedIndex = field.options.findIndex((option) => this._settingValuesEqual(option.value, value));
+      const unknown = selectedIndex < 0 && value != null
+        ? `<option value="-1" selected disabled>Current: ${this._escape(this._formatSettingValue(value))}</option>`
+        : "";
+      return `<select ${common}>${unknown}${field.options.map((option, optionIndex) => `<option value="${optionIndex}"${optionIndex === selectedIndex ? " selected" : ""}>${this._escape(option.label)}</option>`).join("")}</select>`;
+    }
+    if (field.type === "secret") {
+      const staged = Object.hasOwn(this._settingsDraft, field.path);
+      const placeholder = staged
+        ? "Secret change staged in memory"
+        : field.configured
+          ? "Configured — leave blank to keep"
+          : "Enter a new secret";
+      const clear = field.allow_clear && field.configured
+        ? `<label class="field-help"><input id="meshnet-setting-clear-${index}" data-setting-clear-index="${index}" type="checkbox"${staged && this._settingsDraft[field.path] && this._settingsDraft[field.path].operation === "clear" ? " checked" : ""}${disabled ? " disabled" : ""}> Clear the configured secret</label>`
+        : "";
+      return `<input ${common} type="password" value="" placeholder="${this._escape(placeholder)}" autocomplete="new-password" spellcheck="false"${field.max_length != null ? ` maxlength="${field.max_length}"` : ""}>${clear}`;
+    }
+    if (field.type === "integer" || field.type === "number") {
+      const attributes = [
+        field.min != null ? `min="${this._escape(field.min)}"` : "",
+        field.max != null ? `max="${this._escape(field.max)}"` : "",
+        field.step != null ? `step="${this._escape(field.step)}"` : field.type === "integer" ? 'step="1"' : 'step="any"',
+      ].filter(Boolean).join(" ");
+      return `<input ${common} type="number" ${attributes} value="${this._escape(value == null ? "" : value)}">`;
+    }
+    return `<input ${common} type="text" value="${this._escape(value == null ? "" : value)}"${field.max_length != null ? ` maxlength="${field.max_length}"` : ""}>`;
+  }
+
+  _settingsWarningList(warnings) {
+    if (!Array.isArray(warnings) || !warnings.length) return "";
+    return `<ul class="warnings warn">${warnings.map((warning) => `<li>${this._escape(warning)}</li>`).join("")}</ul>`;
+  }
+
+  _settingsPreviewHtml() {
+    const preview = this._settingsPreview;
+    if (!preview) return "";
+    const confirmation = preview.requires_critical_confirmation ? `
+      <label class="critical-box">
+        <input id="meshnet-settings-critical" type="checkbox"${this._settingsCriticalConfirmed ? " checked" : ""}>
+        <span>I understand that the highlighted critical settings can disrupt radio access or require physical recovery.</span>
+      </label>
+    ` : "";
+    return `
+      <section class="settings-card settings-preview" id="meshnet-settings-preview-result">
+        <h3>Preview</h3>
+        <div class="field-help">Expires ${this._escape(preview.expires_at)}</div>
+        ${preview.changes.map((change) => `
+          <div class="settings-preview-change">
+            <div>${this._escape(change.label)} ${change.critical ? '<span class="badge warn">Critical</span>' : ""}${change.requires_reconnect ? '<span class="badge warn">Reconnect</span>' : ""}</div>
+            <div class="field-help">${change.secret ? `Secret value will be ${change.operation === "clear" ? "cleared" : "replaced"}; its value is not displayed.` : `${this._escape(this._formatSettingValue(change.before))} → ${this._escape(this._formatSettingValue(change.after))}`}</div>
+          </div>
+        `).join("")}
+        ${this._settingsWarningList(preview.warnings)}
+        ${confirmation}
+        <div class="settings-actions">
+          <button class="settings-button primary" id="meshnet-settings-apply" type="button"${this._settingsBusy != null || (preview.requires_critical_confirmation && !this._settingsCriticalConfirmed) ? " disabled" : ""}>${this._settingsBusy === "apply" ? "Applying…" : "Apply preview"}</button>
+          <span class="label">Only this exact preview and revision can be applied.</span>
+        </div>
+      </section>
+    `;
+  }
+
+  _settingsStatusClass() {
+    const kind = this._settingsStatus && this._settingsStatus.kind;
+    return ["good", "warn", "bad"].includes(kind) ? kind : "";
+  }
+
+  _formatSettingValue(value) {
+    if (value === true) return "On";
+    if (value === false) return "Off";
+    if (value == null || value === "") return "Not set";
+    return String(value);
+  }
+
+  _settingValuesEqual(left, right) {
+    return Object.is(left, right);
+  }
+
+  _settingValuesEquivalentForServer(left, right) {
+    // The Python settings validator treats numeric -0 and 0 as the same
+    // value. Draft inputs are strings until submission, so compare only
+    // after type coercion and use strict equality to mirror that behavior.
+    return left === right;
+  }
+
+  _bindSettingsControls() {
+    const gateway = this.querySelector("#meshnet-settings-gateway");
+    if (gateway) {
+      gateway.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
+      gateway.addEventListener("change", () => {
+        this._safeStep("settings_event", "binding", () => {
+          void this._loadGatewaySettings(gateway.value);
+        });
+      });
+    }
+    const reload = this.querySelector("#meshnet-settings-reload");
+    if (reload) {
+      reload.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
+      reload.addEventListener("click", () => {
+        this._safeStep("settings_event", "binding", () => {
+          void this._loadGatewaySettings(this._settingsGatewayId);
+        });
+      });
+    }
+    this.querySelectorAll("[data-setting-index]").forEach((input) => {
+      input.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
+      const eventName = input.type === "checkbox" || input.tagName === "SELECT" ? "change" : "input";
+      input.addEventListener(eventName, () => {
+        this._safeStep("settings_event", "binding", () => {
+          this._updateSettingsDraft(input);
+        });
+      });
+    });
+    this.querySelectorAll("[data-setting-clear-index]").forEach((input) => {
+      input.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
+      input.addEventListener("change", () => {
+        this._safeStep("settings_event", "binding", () => {
+          this._updateSecretClearDraft(input);
+        });
+      });
+    });
+    const form = this.querySelector("#meshnet-settings-form");
+    if (form) {
+      form.addEventListener("submit", (event) => {
+        this._safeStep("settings_event", "binding", () => this._previewGatewaySettings(event));
+      });
+    }
+    const critical = this.querySelector("#meshnet-settings-critical");
+    if (critical) {
+      critical.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
+      critical.addEventListener("change", () => {
+        this._settingsCriticalConfirmed = critical.checked === true;
+        const apply = this.querySelector("#meshnet-settings-apply");
+        if (apply) apply.disabled = !this._settingsCriticalConfirmed || this._settingsBusy != null;
+      });
+    }
+    const apply = this.querySelector("#meshnet-settings-apply");
+    if (apply) {
+      apply.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
+      apply.addEventListener("click", () => {
+        this._safeStep("settings_event", "binding", () => this._applyGatewaySettings());
+      });
+    }
+  }
+
+  _updateSettingsDraft(input) {
+    const index = Number.parseInt(input.getAttribute("data-setting-index"), 10);
+    const field = this._settingsFields()[index];
+    if (!field || !field.writable || !this._settingsSnapshot || !this._settingsSnapshot.writable) return;
+    const value = this._readSettingInput(field, input);
+    if ((field.type === "secret" && value === "") || this._settingValuesEqual(value, field.value)) {
+      delete this._settingsDraft[field.path];
+    } else {
+      this._settingsDraft[field.path] = value;
+    }
+    if (field.type === "secret" && value) {
+      const clear = this.querySelector(`#meshnet-setting-clear-${index}`);
+      if (clear) clear.checked = false;
+    }
+    this._invalidateSettingsPreview();
+  }
+
+  _updateSecretClearDraft(input) {
+    const index = Number.parseInt(input.getAttribute("data-setting-clear-index"), 10);
+    const field = this._settingsFields()[index];
+    if (!field || field.type !== "secret" || !field.allow_clear || !field.writable) return;
+    if (input.checked === true) {
+      this._settingsDraft[field.path] = { operation: "clear" };
+      const secret = this.querySelector(`#meshnet-setting-${index}`);
+      if (secret) secret.value = "";
+    } else {
+      delete this._settingsDraft[field.path];
+    }
+    this._invalidateSettingsPreview();
+  }
+
+  _invalidateSettingsPreview() {
+    this._settingsPreview = null;
+    this._settingsCriticalConfirmed = false;
+    this._settingsResultWarnings = [];
+    this._settingsStatus = Object.keys(this._settingsDraft).length
+      ? { kind: "warn", text: "Draft changed. Preview the current draft before applying it." }
+      : null;
+    const preview = this.querySelector("#meshnet-settings-preview-result");
+    if (preview && typeof preview.remove === "function") preview.remove();
+    const previewButton = this.querySelector("#meshnet-settings-preview");
+    if (previewButton) {
+      previewButton.disabled = this._settingsBusy != null
+        || !Object.keys(this._settingsDraft).length;
+    }
+    const status = this.querySelector("#meshnet-settings-status");
+    if (status) {
+      status.className = `settings-status ${this._settingsStatusClass()}`;
+      status.textContent = this._settingsStatus ? this._settingsStatus.text : "";
+    }
+  }
+
+  _readSettingInput(field, input) {
+    if (field.type === "boolean") return input.checked === true;
+    if (field.type === "select") {
+      const optionIndex = Number.parseInt(input.value, 10);
+      return optionIndex >= 0 && optionIndex < field.options.length
+        ? field.options[optionIndex].value
+        : field.value;
+    }
+    return input.value;
+  }
+
+  _settingsChanges() {
+    const changes = {};
+    for (const field of this._settingsFields()) {
+      if (!Object.hasOwn(this._settingsDraft, field.path)) continue;
+      const value = this._coerceSettingValue(
+        field,
+        this._settingsDraft[field.path],
+      );
+      if (
+        field.type !== "secret"
+        && this._settingValuesEquivalentForServer(value, field.value)
+      ) {
+        // A numeric input such as "17" is not Object.is-equal to the live
+        // number 17 while typing. Drop it once coerced so the server may
+        // legitimately omit no-op fields from the preview response.
+        delete this._settingsDraft[field.path];
+        continue;
+      }
+      changes[field.path] = value;
+    }
+    return changes;
+  }
+
+  _coerceSettingValue(field, value) {
+    if (field.type === "boolean") {
+      if (typeof value !== "boolean") throw { name: "ValidationError", code: "invalid_format" };
+      return value;
+    }
+    if (field.type === "integer" || field.type === "number") {
+      if (typeof value !== "string" && typeof value !== "number") {
+        throw { name: "ValidationError", code: "invalid_format" };
+      }
+      const text = typeof value === "string" ? value.trim() : value;
+      const number = field.type === "integer" ? Number(text) : Number(text);
+      if (
+        text === ""
+        || !Number.isFinite(number)
+        || (field.type === "integer" && !Number.isSafeInteger(number))
+        || (field.min != null && number < field.min)
+        || (field.max != null && number > field.max)
+      ) throw { name: "ValidationError", code: "invalid_format" };
+      return number;
+    }
+    if (field.type === "select") {
+      if (!field.options.some((option) => this._settingValuesEqual(option.value, value))) {
+        throw { name: "ValidationError", code: "invalid_format" };
+      }
+      return value;
+    }
+    if (field.type === "secret") {
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        if (value.operation === "clear" && field.allow_clear) return { operation: "clear" };
+        if (value.operation === "replace" && typeof value.value === "string" && value.value) {
+          return { operation: "replace", value: value.value };
+        }
+        throw { name: "ValidationError", code: "invalid_format" };
+      }
+      if (typeof value !== "string" || !value) {
+        throw { name: "ValidationError", code: "invalid_format" };
+      }
+      if (field.max_length != null && value.length > field.max_length) {
+        throw { name: "ValidationError", code: "invalid_format" };
+      }
+      return { operation: "replace", value };
+    }
+    if (typeof value !== "string") throw { name: "ValidationError", code: "invalid_format" };
+    if (field.max_length != null && value.length > field.max_length) {
+      throw { name: "ValidationError", code: "invalid_format" };
+    }
+    return value;
+  }
+
+  async _loadGatewaySettings(gatewayId = "") {
+    if (
+      this._settingsBusy != null
+      || !this._hass
+      || typeof this._hass.callWS !== "function"
+    ) return;
+    const generation = ++this._settingsRequestGeneration;
+    this._settingsBusy = "get";
+    this._settingsStatus = { kind: "warn", text: "Loading gateway settings…" };
+    this._settingsPreview = null;
+    this._settingsCriticalConfirmed = false;
+    this._settingsResultWarnings = [];
+    this._settingsDraft = Object.create(null);
+    this._safeRender("render");
+    const payload = { type: "meshnet/settings/get" };
+    if (gatewayId) payload.gateway_id = gatewayId;
+    try {
+      const response = await this._withTimeout(this._hass.callWS(payload), 35000);
+      if (generation !== this._settingsRequestGeneration) return;
+      const validated = this._validateSettingsResponse(response);
+      this._settingsGateways = validated.gateways;
+      this._settingsSnapshot = validated.selected;
+      this._settingsGatewayId = validated.selected
+        ? validated.selected.gateway_id
+        : gatewayId;
+      this._settingsStatus = validated.selected
+        ? { kind: "good", text: "Gateway settings loaded. Edit values, then preview." }
+        : { kind: "warn", text: "No configurable gateway was returned." };
+      this._markOperationSuccess("settings_get");
+    } catch (error) {
+      if (generation !== this._settingsRequestGeneration) return;
+      this._recordFailure(
+        "settings_get",
+        this._safeErrorCode(error) === "timeout" ? "timeout" : this._safeErrorType(error) === "PanelSchemaError" ? "schema" : "websocket",
+        error,
+      );
+      this._settingsStatus = { kind: "bad", text: "Gateway settings could not be loaded." };
+    } finally {
+      if (generation === this._settingsRequestGeneration) {
+        this._settingsBusy = null;
+        this._safeRender("render");
+      }
+    }
+  }
+
+  async _previewGatewaySettings(event = null) {
+    if (event && typeof event.preventDefault === "function") event.preventDefault();
+    if (this._settingsBusy != null || !this._settingsSnapshot || !this._settingsSnapshot.writable) return;
+    let changes;
+    try {
+      changes = this._settingsChanges();
+    } catch (error) {
+      this._recordFailure("settings_preview", "validation", error);
+      this._settingsStatus = { kind: "bad", text: "Correct the highlighted setting values before previewing." };
+      this._safeRender("render");
+      return;
+    }
+    if (!Object.keys(changes).length) {
+      this._settingsStatus = { kind: "warn", text: "Change at least one writable setting first." };
+      this._safeRender("render");
+      return;
+    }
+    const snapshot = this._settingsSnapshot;
+    const generation = this._settingsRequestGeneration;
+    this._settingsBusy = "preview";
+    this._settingsPreview = null;
+    this._settingsCriticalConfirmed = false;
+    this._settingsStatus = { kind: "warn", text: "Preparing a non-destructive preview…" };
+    this._safeRender("render");
+    try {
+      const response = await this._withTimeout(this._hass.callWS({
+        type: "meshnet/settings/preview",
+        gateway_id: snapshot.gateway_id,
+        revision: snapshot.revision,
+        changes,
+      }), 35000);
+      if (
+        generation !== this._settingsRequestGeneration
+        || this._settingsSnapshot !== snapshot
+      ) return;
+      this._settingsPreview = this._validateSettingsPreview(
+        response,
+        snapshot,
+        changes,
+      );
+      this._clearSecretSettingsDrafts(snapshot);
+      this._settingsStatus = { kind: "good", text: "Preview ready. Review every change before applying it." };
+      this._markOperationSuccess("settings_preview");
+    } catch (error) {
+      if (
+        generation !== this._settingsRequestGeneration
+        || this._settingsSnapshot !== snapshot
+      ) return;
+      // Never retain a submitted credential merely to make retry convenient.
+      // The administrator must deliberately type it again after any failed or
+      // timed-out preview request.
+      this._clearSecretSettingsDrafts(snapshot);
+      this._recordFailure(
+        "settings_preview",
+        this._safeErrorCode(error) === "timeout" ? "timeout" : this._safeErrorType(error) === "PanelSchemaError" ? "schema" : "websocket",
+        error,
+      );
+      this._settingsStatus = { kind: "bad", text: "The settings preview could not be prepared." };
+    } finally {
+      if (
+        generation === this._settingsRequestGeneration
+        && this._settingsSnapshot === snapshot
+      ) {
+        this._settingsBusy = null;
+        this._safeRender("render");
+      }
+    }
+  }
+
+  async _applyGatewaySettings() {
+    const snapshot = this._settingsSnapshot;
+    const preview = this._settingsPreview;
+    const generation = this._settingsRequestGeneration;
+    if (this._settingsBusy != null || !snapshot || !preview) return;
+    if (preview.requires_critical_confirmation && !this._settingsCriticalConfirmed) {
+      this._settingsStatus = { kind: "bad", text: "Confirm the critical-setting warning before applying." };
+      this._safeRender("render");
+      return;
+    }
+    this._settingsBusy = "apply";
+    this._settingsStatus = { kind: "warn", text: "Applying and verifying the preview…" };
+    this._safeRender("render");
+    try {
+      const response = await this._withTimeout(this._hass.callWS({
+        type: "meshnet/settings/apply",
+        gateway_id: snapshot.gateway_id,
+        revision: snapshot.revision,
+        preview_id: preview.preview_id,
+        confirm_critical: this._settingsCriticalConfirmed === true,
+      }), 130000);
+      if (
+        generation !== this._settingsRequestGeneration
+        || this._settingsSnapshot !== snapshot
+        || this._settingsPreview !== preview
+      ) return;
+      const applied = this._validateSettingsApply(response, preview, snapshot);
+      this._clearSecretSettingsDrafts(snapshot);
+      if (applied.snapshot) {
+        this._settingsSnapshot = applied.snapshot;
+        this._settingsGatewayId = applied.snapshot.gateway_id;
+      }
+      this._settingsDraft = Object.create(null);
+      this._settingsPreview = null;
+      this._settingsCriticalConfirmed = false;
+      this._settingsResultWarnings = applied.warnings;
+      const fullyVerified = applied.verified_count > 0 && applied.unverified_count === 0;
+      const verification = fullyVerified
+        ? "Settings applied and verified."
+        : `Settings applied; ${applied.unverified_count || "some"} value(s) could not be verified.`;
+      const connectionStatus = applied.connection_recovery_required
+        ? " Verify or recover the gateway connection before another settings change."
+        : applied.reconnect_required
+          ? " The gateway is restarting; wait for it to reconnect."
+          : "";
+      this._settingsStatus = {
+        kind: fullyVerified && !applied.connection_recovery_required ? "good" : "warn",
+        text: `${verification}${connectionStatus}${applied.snapshot ? "" : " Reload live values before making another change."}`,
+      };
+      this._markOperationSuccess("settings_apply");
+    } catch (error) {
+      if (
+        generation !== this._settingsRequestGeneration
+        || this._settingsSnapshot !== snapshot
+        || this._settingsPreview !== preview
+      ) return;
+      // Apply previews are single use, and a transport timeout has an unknown
+      // outcome. Never offer the same write again from the browser.
+      this._settingsPreview = null;
+      this._settingsCriticalConfirmed = false;
+      this._recordFailure(
+        "settings_apply",
+        this._safeErrorCode(error) === "timeout" ? "timeout" : this._safeErrorType(error) === "PanelSchemaError" ? "schema" : "websocket",
+        error,
+      );
+      this._settingsStatus = {
+        kind: "warn",
+        text: "The apply outcome could not be confirmed. Do not repeat the write. Reload live values and verify the radio before making another change.",
+      };
+    } finally {
+      if (
+        generation === this._settingsRequestGeneration
+        && (this._settingsSnapshot === snapshot || this._settingsPreview == null)
+      ) {
+        this._settingsBusy = null;
+        this._safeRender("render");
+      }
+    }
+  }
+
+  _clearSecretSettingsDrafts(snapshot = this._settingsSnapshot) {
+    for (const field of this._settingsFields(snapshot)) {
+      if (field.type === "secret") delete this._settingsDraft[field.path];
+    }
+    try {
+      this.querySelectorAll('input[type="password"][data-setting-index]').forEach((input) => {
+        input.value = "";
+      });
+    } catch (_ignored) {
+      // Secret drafts are already gone from JS state; DOM cleanup is best effort.
+    }
+  }
+
+  _validateSettingsResponse(response) {
+    if (
+      !response
+      || typeof response !== "object"
+      || Array.isArray(response)
+      || !Array.isArray(response.gateways)
+      || response.gateways.length > 64
+    ) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    const gateways = response.gateways.map((gateway) => this._sanitizeSettingsGateway(gateway));
+    if (new Set(gateways.map((gateway) => gateway.gateway_id)).size !== gateways.length) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    const selected = response.selected == null
+      ? null
+      : this._sanitizeSettingsSnapshot(response.selected);
+    if (selected && !gateways.some((gateway) => gateway.gateway_id === selected.gateway_id)) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    return { gateways, selected };
+  }
+
+  _sanitizeSettingsGateway(gateway) {
+    if (!gateway || typeof gateway !== "object" || Array.isArray(gateway)) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    const gatewayId = this._requiredSettingText(gateway.gateway_id, 128);
+    return {
+      gateway_id: gatewayId,
+      name: this._requiredSettingText(gateway.name || gatewayId, 128),
+      protocol: this._requiredSettingText(gateway.protocol, 64),
+      transport: this._requiredSettingText(gateway.transport, 64),
+      connected: gateway.connected === true,
+      writable: gateway.writable === true,
+      read_only_reason: this._optionalSettingText(gateway.read_only_reason, 512),
+    };
+  }
+
+  _sanitizeSettingsSnapshot(snapshot) {
+    if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    if (snapshot.schema_version !== 1) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    const revision = snapshot.revision;
+    if (typeof revision !== "string" || !/^[0-9a-f]{64}$/.test(revision)) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    if (!Array.isArray(snapshot.categories) || snapshot.categories.length > 48) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    const seenPaths = new Set();
+    const seenCategories = new Set();
+    let fieldCount = 0;
+    const categories = snapshot.categories.map((category) => {
+      if (!category || typeof category !== "object" || Array.isArray(category) || !Array.isArray(category.fields)) {
+        throw { name: "PanelSchemaError", code: "invalid_format" };
+      }
+      const key = this._requiredSettingPath(category.key);
+      if (seenCategories.has(key)) throw { name: "PanelSchemaError", code: "invalid_format" };
+      seenCategories.add(key);
+      const fields = category.fields.map((field) => {
+        fieldCount += 1;
+        if (fieldCount > 384) throw { name: "PanelSchemaError", code: "invalid_format" };
+        const sanitized = this._sanitizeSettingsField(field);
+        if (seenPaths.has(sanitized.path)) throw { name: "PanelSchemaError", code: "invalid_format" };
+        seenPaths.add(sanitized.path);
+        return sanitized;
+      });
+      return {
+        key,
+        label: this._requiredSettingText(category.label, 128),
+        description: this._optionalSettingText(category.description, 512),
+        fields,
+      };
+    });
+    const fetchedAt = this._requiredSettingText(snapshot.fetched_at, 64);
+    if (!Number.isFinite(Date.parse(fetchedAt))) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    return {
+      schema_version: snapshot.schema_version,
+      gateway_id: this._requiredSettingText(snapshot.gateway_id, 128),
+      name: this._requiredSettingText(snapshot.name, 128),
+      protocol: this._requiredSettingText(snapshot.protocol, 64),
+      transport: this._requiredSettingText(snapshot.transport, 64),
+      connected: snapshot.connected === true,
+      writable: snapshot.writable === true,
+      read_only_reason: this._optionalSettingText(snapshot.read_only_reason, 512),
+      revision,
+      fetched_at: fetchedAt,
+      categories,
+      warnings: this._settingsWarnings(snapshot.warnings),
+    };
+  }
+
+  _sanitizeSettingsField(field) {
+    if (!field || typeof field !== "object" || Array.isArray(field)) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    const type = ["boolean", "integer", "number", "string", "select", "secret"].includes(field.type)
+      ? field.type
+      : null;
+    if (!type) throw { name: "PanelSchemaError", code: "invalid_format" };
+    if (Array.isArray(field.options) && field.options.length > 256) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    const optionKeys = new Set();
+    const options = Array.isArray(field.options)
+      ? field.options.map((option) => {
+        if (!option || typeof option !== "object" || Array.isArray(option) || option.value == null || !this._settingScalar(option.value)) {
+          throw { name: "PanelSchemaError", code: "invalid_format" };
+        }
+        const optionKey = `${typeof option.value}:${JSON.stringify(option.value)}`;
+        if (optionKeys.has(optionKey)) {
+          throw { name: "PanelSchemaError", code: "invalid_format" };
+        }
+        optionKeys.add(optionKey);
+        return {
+          value: option.value,
+          label: this._requiredSettingText(option.label, 128),
+        };
+      })
+      : [];
+    if (type === "select" && !options.length) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    let value = type === "secret" ? "" : field.value;
+    if (value != null && !this._settingValueMatchesType(type, value)) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    if (field.writable === true && type !== "secret" && value == null) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    const numeric = (key) => {
+      const candidate = field[key];
+      if (candidate == null) return null;
+      if (!this._settingScalar(candidate) || typeof candidate !== "number") {
+        throw { name: "PanelSchemaError", code: "invalid_format" };
+      }
+      return candidate;
+    };
+    const min = numeric("min");
+    const max = numeric("max");
+    const step = numeric("step");
+    if (
+      ((type === "integer" || type === "number") && field.writable === true
+        && (min == null || max == null))
+      || (min != null && max != null && min > max)
+      || (step != null && step <= 0)
+      || ((type === "integer" || type === "number") && value != null
+        && ((min != null && value < min) || (max != null && value > max)))
+    ) throw { name: "PanelSchemaError", code: "invalid_format" };
+    if (
+      type === "select"
+      && !options.some((option) => this._settingValuesEqual(option.value, value))
+    ) throw { name: "PanelSchemaError", code: "invalid_format" };
+    const maxLength = field.max_length == null
+      ? null
+      : Number.isSafeInteger(field.max_length)
+        && field.max_length > 0
+        && field.max_length <= 1024
+        ? field.max_length
+        : NaN;
+    if (Number.isNaN(maxLength)) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    if (
+      type === "string"
+      && value != null
+      && maxLength != null
+      && value.length > maxLength
+    ) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    return {
+      path: this._requiredSettingPath(field.path),
+      label: this._requiredSettingText(field.label, 128),
+      type,
+      value,
+      configured: field.configured === true,
+      allow_clear: field.allow_clear === true,
+      options,
+      min,
+      max,
+      step,
+      max_length: maxLength,
+      unit: this._optionalSettingText(field.unit, 32),
+      description: this._optionalSettingText(field.description, 512),
+      writable: field.writable === true,
+      read_only_reason: this._optionalSettingText(field.read_only_reason, 256),
+      critical: field.critical === true,
+      requires_reconnect: field.requires_reconnect === true,
+    };
+  }
+
+  _validateSettingsPreview(response, snapshot, requestedChanges) {
+    if (
+      !response
+      || typeof response !== "object"
+      || Array.isArray(response)
+      || !Array.isArray(response.changes)
+      || !response.changes.length
+      || response.changes.length > 64
+    ) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    if (
+      !snapshot
+      || !requestedChanges
+      || typeof requestedChanges !== "object"
+      || Array.isArray(requestedChanges)
+      || response.gateway_id !== snapshot.gateway_id
+      || response.revision !== snapshot.revision
+    ) throw { name: "PanelSchemaError", code: "invalid_format" };
+    const previewId = this._requiredSettingText(response.preview_id);
+    if (previewId.length < 32 || previewId.length > 128) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    const fields = new Map(this._settingsFields(snapshot).map((field) => [field.path, field]));
+    const expectedPaths = Object.keys(requestedChanges);
+    const seenPaths = new Set();
+    const changes = response.changes.map((change) => {
+      if (!change || typeof change !== "object" || Array.isArray(change)) {
+        throw { name: "PanelSchemaError", code: "invalid_format" };
+      }
+      const path = this._requiredSettingPath(change.path);
+      const field = fields.get(path);
+      if (!field || seenPaths.has(path) || !Object.hasOwn(requestedChanges, path)) {
+        throw { name: "PanelSchemaError", code: "invalid_format" };
+      }
+      seenPaths.add(path);
+      const secret = change.secret === true;
+      if (
+        secret !== (field.type === "secret")
+        || change.label !== field.label
+        || (change.critical === true) !== field.critical
+        || (change.requires_reconnect === true) !== field.requires_reconnect
+      ) throw { name: "PanelSchemaError", code: "invalid_format" };
+      if (!secret && (!this._settingScalar(change.before) || !this._settingScalar(change.after))) {
+        throw { name: "PanelSchemaError", code: "invalid_format" };
+      }
+      if (
+        !secret
+        && (
+          !this._settingValuesEqual(change.before, field.value)
+          || !this._settingValuesEqual(change.after, requestedChanges[path])
+        )
+      ) throw { name: "PanelSchemaError", code: "invalid_format" };
+      const requestedOperation = secret && requestedChanges[path]
+        ? requestedChanges[path].operation
+        : null;
+      if (
+        secret
+        && !["replace", "clear"].includes(change.operation)
+        || (secret && change.operation !== requestedOperation)
+      ) throw { name: "PanelSchemaError", code: "invalid_format" };
+      return {
+        path,
+        label: this._requiredSettingText(change.label, 128),
+        before: secret ? null : change.before,
+        after: secret ? null : change.after,
+        secret,
+        operation: secret && change.operation === "clear" ? "clear" : "replace",
+        critical: change.critical === true,
+        requires_reconnect: change.requires_reconnect === true,
+      };
+    });
+    if (
+      seenPaths.size !== expectedPaths.length
+      || expectedPaths.some((path) => !seenPaths.has(path))
+    ) throw { name: "PanelSchemaError", code: "invalid_format" };
+    const requiresCritical = changes.some((change) => change.critical);
+    if (response.requires_critical_confirmation !== requiresCritical) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    const expiresAt = this._requiredSettingText(response.expires_at, 64);
+    if (!Number.isFinite(Date.parse(expiresAt))) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    return {
+      preview_id: previewId,
+      expires_at: expiresAt,
+      changes,
+      requires_critical_confirmation: requiresCritical,
+      warnings: this._settingsWarnings(response.warnings),
+    };
+  }
+
+  _validateSettingsApply(response, preview, snapshot) {
+    const statuses = ["verified", "partially_verified", "applied_unverified"];
+    if (
+      !response
+      || typeof response !== "object"
+      || Array.isArray(response)
+      || !statuses.includes(response.status)
+      || !preview
+      || !snapshot
+      || response.gateway_id !== snapshot.gateway_id
+      || !Array.isArray(response.verified)
+      || !Array.isArray(response.unverified)
+      || typeof response.reconnect_required !== "boolean"
+      || typeof response.connection_recovery_required !== "boolean"
+    ) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    const validatedPaths = [response.verified, response.unverified].map((paths) => {
+      if (paths.length > 64) throw { name: "PanelSchemaError", code: "invalid_format" };
+      const sanitized = paths.map((path) => this._requiredSettingPath(path));
+      if (new Set(sanitized).size !== sanitized.length) {
+        throw { name: "PanelSchemaError", code: "invalid_format" };
+      }
+      return sanitized;
+    });
+    const [verified, unverified] = validatedPaths;
+    const expectedPaths = preview.changes.map((change) => change.path);
+    const combined = [...verified, ...unverified];
+    if (
+      new Set(combined).size !== combined.length
+      || combined.length !== expectedPaths.length
+      || expectedPaths.some((path) => !combined.includes(path))
+      || (response.status === "verified" && (verified.length === 0 || unverified.length !== 0))
+      || (response.status === "partially_verified" && (verified.length === 0 || unverified.length === 0))
+      || (response.status === "applied_unverified" && (verified.length !== 0 || unverified.length === 0))
+    ) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    const sanitizedSnapshot = response.snapshot == null
+      ? null
+      : this._sanitizeSettingsSnapshot(response.snapshot);
+    if (sanitizedSnapshot && sanitizedSnapshot.gateway_id !== snapshot.gateway_id) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    return {
+      verified_count: verified.length,
+      unverified_count: unverified.length,
+      reconnect_required: response.reconnect_required,
+      connection_recovery_required: response.connection_recovery_required,
+      snapshot: sanitizedSnapshot,
+      warnings: this._settingsWarnings(response.warnings),
+    };
+  }
+
+  _requiredSettingText(value, maxLength = 512) {
+    if (
+      typeof value !== "string"
+      || !value.trim()
+      || value.length > maxLength
+    ) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    return value.trim();
+  }
+
+  _optionalSettingText(value, maxLength) {
+    if (value == null) return "";
+    if (typeof value !== "string" || value.length > maxLength) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    return value;
+  }
+
+  _requiredSettingPath(value) {
+    const path = this._requiredSettingText(value);
+    const parts = path.toLowerCase().split(".");
+    if (
+      !/^[a-z0-9][a-z0-9_.-]{0,127}$/.test(path)
+      || parts.some((part) => ["__proto__", "prototype", "constructor"].includes(part))
+    ) throw { name: "PanelSchemaError", code: "invalid_format" };
+    return path;
+  }
+
+  _settingsWarnings(value) {
+    if (value == null) return [];
+    if (
+      !Array.isArray(value)
+      || value.length > 16
+      || value.some((warning) => typeof warning !== "string" || warning.length > 512)
+    ) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    return value.slice();
+  }
+
+  _settingScalar(value) {
+    return value == null
+      || typeof value === "string"
+      || typeof value === "boolean"
+      || (
+        typeof value === "number"
+        && Number.isFinite(value)
+        && Math.abs(value) <= 1_000_000_000_000_000
+        && (!Number.isInteger(value) || Number.isSafeInteger(value))
+      );
+  }
+
+  _settingValueMatchesType(type, value) {
+    if (type === "boolean") return typeof value === "boolean";
+    if (type === "integer") return Number.isSafeInteger(value);
+    if (type === "number") return typeof value === "number" && Number.isFinite(value);
+    if (type === "string" || type === "secret") return typeof value === "string";
+    return type === "select" && this._settingScalar(value);
   }
 
   _bindComposer() {
@@ -1222,7 +2469,9 @@ class MeshNetPanel extends HTMLElement {
       const status = sentMessage && sentMessage.raw && sentMessage.raw.status;
       this._sendStatus = status === "sent"
         ? { kind: "good", text: "Message sent." }
-        : { kind: "warn", text: "Message queued for delivery." };
+        : status === "blocked"
+          ? { kind: "bad", text: "Message blocked because the node identity is ambiguous." }
+          : { kind: "warn", text: "Message queued for delivery." };
     } catch (error) {
       if (!this._failureWasRecorded(error)) {
         this._recordFailure("send_submission", "websocket", error);
@@ -1336,8 +2585,9 @@ class MeshNetPanel extends HTMLElement {
 
   _isKnownRecipient(nodeKey) {
     const nodes = Object.values((this._snapshot && this._snapshot.nodes) || {});
-    return nodes.some(
-      (node) => node && node.node_key != null && String(node.node_key) === String(nodeKey),
+    return this._recipientChoices(nodes).some(
+      (choice) => !choice.ambiguous && !choice.invalidIdentity
+        && choice.value === String(nodeKey),
     );
   }
 
@@ -1348,9 +2598,28 @@ class MeshNetPanel extends HTMLElement {
         value: String(node.node_key),
         label: this._recipientNodeName(node),
         named: this._nodeHasHumanName(node),
+        invalidIdentity: this._meshtasticIdentityInvalid(node),
         node,
       }))
       .filter((choice, index, all) => all.findIndex((item) => item.value === choice.value) === index);
+    const meshtasticIdGroups = new Map();
+    choices.forEach((choice) => {
+      const nodeId = this._meshtasticNodeId(choice.node);
+      if (!nodeId) return;
+      if (!meshtasticIdGroups.has(nodeId)) meshtasticIdGroups.set(nodeId, []);
+      meshtasticIdGroups.get(nodeId).push(choice);
+    });
+    meshtasticIdGroups.forEach((group) => {
+      if (group.length < 2) return;
+      group.forEach((choice) => {
+        choice.ambiguous = true;
+        choice.label = `${choice.label} · ambiguous ID — sending disabled`;
+      });
+    });
+    choices.forEach((choice) => {
+      if (!choice.invalidIdentity) return;
+      choice.label = `${choice.label} · invalid identity — sending disabled`;
+    });
     const labelGroups = new Map();
     choices.forEach((choice) => {
       const key = this._textSortKey(choice.label);
@@ -1379,13 +2648,25 @@ class MeshNetPanel extends HTMLElement {
     const selected = String(this._draft.recipient || "");
     const choices = this._recipientChoices(nodes);
     if (selected && !choices.some((choice) => choice.value === selected)) {
-      choices.push({ value: selected, label: `${selected} (currently unavailable)` });
+      choices.push({
+        value: selected,
+        label: `${selected} (currently unavailable)`,
+        unavailable: true,
+      });
     }
-    const prompt = choices.length ? "Choose a node…" : "No cached nodes available yet";
+    const prompt = choices.some((choice) => !choice.ambiguous
+      && !choice.invalidIdentity && !choice.unavailable)
+      ? "Choose a node…"
+      : choices.length
+        ? "No unambiguous direct recipients"
+        : "No cached nodes available yet";
     return [
       `<option value=""${this._selected(selected, "")}>${prompt}</option>`,
       ...choices.map((choice) => {
-        return `<option value="${this._escape(choice.value)}"${this._selected(selected, choice.value)}>${this._escape(choice.label)}</option>`;
+        const disabled = choice.ambiguous || choice.invalidIdentity || choice.unavailable
+          ? " disabled"
+          : "";
+        return `<option value="${this._escape(choice.value)}"${this._selected(selected, choice.value)}${disabled}>${this._escape(choice.label)}</option>`;
       }),
     ].join("");
   }
@@ -1419,6 +2700,9 @@ class MeshNetPanel extends HTMLElement {
       ? metadata
       : {};
     const total = this._metadataCount(safeMetadata, "total_node_count", nodes.length);
+    const retainedRecords = this._metadataCount(safeMetadata, "retained_node_record_count", total);
+    const collapsedAliases = this._metadataCount(safeMetadata, "collapsed_alias_record_count", 0);
+    const resolvedGroups = this._metadataCount(safeMetadata, "resolved_identity_group_count", 0);
     const current = this._metadataCount(safeMetadata, "current_session_node_count");
     const cached = this._metadataCount(safeMetadata, "cached_only_node_count");
     const analyzed = this._metadataCount(safeMetadata, "analyzed_node_count");
@@ -1428,8 +2712,21 @@ class MeshNetPanel extends HTMLElement {
     const locatedOffline = this._metadataCount(safeMetadata, "located_offline_node_count");
     const mqtt = this._metadataCount(safeMetadata, "mqtt_node_count");
     const mqttUnknown = this._metadataCount(safeMetadata, "mqtt_unknown_node_count");
-    const collisionGroups = this._metadataCount(safeMetadata, "identity_collision_group_count");
-    const collisionNodes = this._metadataCount(safeMetadata, "identity_collision_node_count");
+    const collisionGroups = this._metadataCount(
+      safeMetadata,
+      "unresolved_identity_group_count",
+      this._metadataCount(safeMetadata, "identity_collision_group_count"),
+    );
+    const collisionNodes = this._metadataCount(
+      safeMetadata,
+      "unresolved_identity_node_count",
+      this._metadataCount(safeMetadata, "identity_collision_node_count"),
+    );
+    const invalidIdentityRecords = this._metadataCount(
+      safeMetadata,
+      "invalid_identity_record_count",
+      0,
+    );
     const lastFailure = this._failureTelemetry.length
       ? this._failureTelemetry[this._failureTelemetry.length - 1]
       : null;
@@ -1461,8 +2758,15 @@ class MeshNetPanel extends HTMLElement {
         </div>
         <div class="row">
           <span>Nodes</span>
-          <span>${this._escape(String(total))} total · ${this._escape(String(online))} recent · ${this._escape(String(located))} located</span>
+          <span>${this._escape(String(total))} distinct · ${this._escape(String(online))} recent · ${this._escape(String(located))} located</span>
         </div>
+        ${collapsedAliases > 0 ? `
+          <div class="row">
+            <span>Identity aliases</span>
+            <span>${this._escape(String(collapsedAliases))} collapsed · ${this._escape(String(resolvedGroups))} groups · ${this._escape(String(retainedRecords))} retained records</span>
+          </div>
+          <div class="diagnostic-detail">Meshtastic records are shown once only when their ID and observed identity proof agree. Original cache records remain stored for safe rollback and are not deleted.</div>
+        ` : ""}
         ${provenanceAvailable ? `
           <div class="row">
             <span>Node source</span>
@@ -1490,11 +2794,14 @@ class MeshNetPanel extends HTMLElement {
             <span>${this._escape(String(locatedOffline))} not recently seen</span>
           </div>
         ` : ""}
-        ${collisionGroups !== "n/a" || collisionNodes !== "n/a" ? `
+        ${(typeof collisionGroups === "number" && collisionGroups > 0)
+          || (typeof collisionNodes === "number" && collisionNodes > 0)
+          || invalidIdentityRecords > 0 ? `
           <div class="row">
-            <span>Possible identity overlap</span>
-            <span>${this._escape(String(collisionGroups))} groups · ${this._escape(String(collisionNodes))} nodes</span>
+            <span>Unresolved identity evidence</span>
+            <span>${this._escape(String(collisionGroups))} conflicting groups · ${this._escape(String(collisionNodes))} records · ${this._escape(String(invalidIdentityRecords))} malformed</span>
           </div>
+          <div class="diagnostic-detail">MeshNet kept these records separate because their identity evidence conflicts, is incomplete, or is malformed.</div>
         ` : ""}
         <div class="row">
           <span>Server snapshot</span>
@@ -1591,6 +2898,7 @@ class MeshNetPanel extends HTMLElement {
     const source = Array.isArray(nodes) ? nodes : [];
     const groups = new Map();
     source.forEach((node, index) => {
+      if (this._meshtasticIdentityInvalid(node)) return;
       const meshId = this._meshtasticNodeId(node);
       if (!meshId) return;
       if (!groups.has(meshId)) groups.set(meshId, []);
@@ -1671,17 +2979,18 @@ class MeshNetPanel extends HTMLElement {
       || (explicitMac && normalizedKeyMac && explicitMac !== normalizedKeyMac)) {
       return { valid: false };
     }
-    const explicitPublic = explicitPublicPresent ? node.public_key.trim() : "";
-    const normalizedKeyPublic = keyPublicPresent ? keyPublic.trim() : "";
-    if ((keyPublicPresent && !normalizedKeyPublic)
+    const explicitPublic = explicitPublicPresent ? this._strictPublicKey(node.public_key) : "";
+    const normalizedKeyPublic = keyPublicPresent ? this._strictPublicKey(keyPublic) : "";
+    if ((explicitPublicPresent && !explicitPublic)
+      || (keyPublicPresent && !normalizedKeyPublic)
       || (explicitPublic && normalizedKeyPublic
-        && explicitPublic.toLowerCase() !== normalizedKeyPublic.toLowerCase())) {
+        && explicitPublic !== normalizedKeyPublic)) {
       return { valid: false };
     }
     return {
       valid: true,
       mac: explicitMac || normalizedKeyMac,
-      public_key_canonical: (explicitPublic || normalizedKeyPublic).toLowerCase(),
+      public_key_canonical: explicitPublic || normalizedKeyPublic,
       public_key_explicit: explicitPublic,
     };
   }
@@ -1696,14 +3005,30 @@ class MeshNetPanel extends HTMLElement {
     return "";
   }
 
+  _strictPublicKey(value) {
+    const text = typeof value === "string" ? value.trim() : "";
+    return /^[0-9a-f]{64}$/iu.test(text) ? text.toLowerCase() : "";
+  }
+
+  _meshtasticIdentityInvalid(node) {
+    if (String(node && node.protocol || "").trim().toLowerCase() !== "meshtastic") return false;
+    if (Object.prototype.hasOwnProperty.call(node, "identity_valid")) {
+      return node.identity_valid !== true;
+    }
+    return !this._meshtasticNodeId(node);
+  }
+
   _meshtasticNodeId(node) {
-    const protocol = String(node && node.protocol || "").toLowerCase();
+    const protocol = String(node && node.protocol || "").trim().toLowerCase();
     const nodeKey = this._nodeLabelText(node && node.node_key);
     if (protocol !== "meshtastic") return "";
     const keyLower = nodeKey.toLowerCase();
-    if (nodeKey && !["meshtastic:", "mac:", "pub:"].some((prefix) => keyLower.startsWith(prefix))) {
+    if (nodeKey && !["meshtastic:", "meshtastic-proof:", "mac:", "pub:"]
+      .some((prefix) => keyLower.startsWith(prefix))) {
       return "";
     }
+    const keyIsProof = keyLower.startsWith("meshtastic-proof:");
+    if (keyIsProof && !/^meshtastic-proof:[0-9a-f]{64}$/iu.test(nodeKey)) return "";
     const keyIsMeshtastic = nodeKey.toLowerCase().startsWith("meshtastic:");
     const explicitValue = node && node.node_id;
     const explicitPresent = explicitValue != null && String(explicitValue).trim() !== "";
@@ -1811,7 +3136,7 @@ class MeshNetPanel extends HTMLElement {
     const longitude = this._validCoordinate(location && location.longitude, -180, 180);
     return latitude != null
       && longitude != null
-      && !(String(node && node.protocol || "").toLowerCase() === "meshtastic"
+      && !(String(node && node.protocol || "").trim().toLowerCase() === "meshtastic"
         && latitude === 0
         && longitude === 0);
   }
@@ -1856,7 +3181,7 @@ class MeshNetPanel extends HTMLElement {
   }
 
   _routeIdentifiers(node) {
-    if (!node || String(node.protocol || "").toLowerCase() !== "meshcore") return null;
+    if (!node || String(node.protocol || "").trim().toLowerCase() !== "meshcore") return null;
     const routing = node.routing && typeof node.routing === "object" ? node.routing : {};
     const route = Array.isArray(routing.route) ? routing.route : routing.path;
     return Array.isArray(route) ? route : null;
@@ -1864,7 +3189,7 @@ class MeshNetPanel extends HTMLElement {
 
   _hopsGatewayId(node) {
     const connectivity = node && node.connectivity;
-    if (String(node && node.protocol || "").toLowerCase() !== "meshtastic") return "";
+    if (String(node && node.protocol || "").trim().toLowerCase() !== "meshtastic") return "";
     if (!connectivity || connectivity.via_mqtt === true) return "";
     const explicit = connectivity && connectivity.hops_gateway_id;
     if (explicit != null && String(explicit)) return String(explicit);

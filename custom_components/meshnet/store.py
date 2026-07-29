@@ -209,20 +209,196 @@ class MeshStore:
 
     async def async_load_snapshot(self, *, recent_limit: int = 100) -> MeshSnapshot:
         """Load cached nodes and recent messages."""
-        node_rows = await self._fetchall("SELECT data FROM nodes")
-        message_rows = await self._fetchall(
-            "SELECT data FROM messages ORDER BY timestamp DESC LIMIT ?",
-            (recent_limit,),
+        node_rows = await self._fetchall(
+            "SELECT node_key, data FROM nodes ORDER BY node_key ASC"
         )
         nodes: dict[str, NodeState] = {}
         for row in node_rows:
-            node = NodeState.from_dict(json.loads(row["data"]))
+            node = self._node_from_row(row)
+            if node is None:
+                continue
             nodes[node.node_key] = node
-        messages = [
-            MessageRecord.from_dict(json.loads(row["data"]))
-            for row in reversed(message_rows)
-        ]
+        messages = await self._async_recent_message_records(recent_limit)
         return MeshSnapshot(nodes=nodes, recent_messages=messages)
+
+    @staticmethod
+    def _node_from_row(row: sqlite3.Row) -> NodeState | None:
+        """Decode one cached node without letting corrupt data poison setup."""
+        try:
+            payload = json.loads(row["data"])
+            if not isinstance(payload, dict):
+                return None
+            if payload.get("node_key") != row["node_key"]:
+                return None
+            if not isinstance(payload.get("node_key"), str) or not isinstance(
+                payload.get("protocol"), str
+            ):
+                return None
+            if any(
+                field in payload
+                and payload[field] is not None
+                and not isinstance(payload[field], str)
+                for field in (
+                    "node_id",
+                    "mac",
+                    "public_key",
+                    "user_name",
+                    "long_name",
+                    "short_name",
+                    "hardware_model",
+                    "firmware_version",
+                    "radio_type",
+                    "role",
+                    "last_gateway_id",
+                )
+            ):
+                return None
+            if "online" in payload and not isinstance(payload["online"], bool):
+                return None
+            last_heard = payload.get("last_heard")
+            if last_heard is not None:
+                if not isinstance(last_heard, str):
+                    return None
+                parsed_last_heard = parse_timestamp(last_heard)
+                if (
+                    parsed_last_heard is None
+                    or timestamp_to_json(parsed_last_heard) != last_heard
+                ):
+                    return None
+            for field in (
+                "connectivity",
+                "power",
+                "radio",
+                "location",
+                "routing",
+                "sensors",
+                "raw",
+            ):
+                value = payload.get(field)
+                if value is not None and not isinstance(value, dict):
+                    return None
+            gateway_ids = payload.get("gateway_ids")
+            if gateway_ids is not None and (
+                not isinstance(gateway_ids, list)
+                or any(not isinstance(value, str) for value in gateway_ids)
+            ):
+                return None
+            return NodeState.from_dict(payload)
+        except (
+            json.JSONDecodeError,
+            KeyError,
+            RecursionError,
+            TypeError,
+            ValueError,
+        ):
+            return None
+
+    @staticmethod
+    def _message_from_row(row: sqlite3.Row) -> MessageRecord | None:
+        """Decode one cached message and verify its stable database identity."""
+        try:
+            payload = json.loads(row["data"])
+            if not isinstance(payload, dict):
+                return None
+            if payload.get("message_id") != row["message_id"]:
+                return None
+            if payload.get("timestamp") != row["timestamp"]:
+                return None
+            if any(
+                not isinstance(payload.get(field), str)
+                for field in (
+                    "message_id",
+                    "protocol",
+                    "gateway_id",
+                    "text",
+                    "direction",
+                )
+            ):
+                return None
+            if any(
+                field in payload
+                and payload[field] is not None
+                and not isinstance(payload[field], str)
+                for field in (
+                    "sender",
+                    "receiver",
+                    "channel",
+                    "message_type",
+                    "priority",
+                )
+            ):
+                return None
+            raw = payload.get("raw")
+            if raw is not None and not isinstance(raw, dict):
+                return None
+            encrypted = payload.get("encrypted")
+            if encrypted is not None and not isinstance(encrypted, bool):
+                return None
+            hops = payload.get("hops")
+            if hops is not None and (
+                isinstance(hops, bool) or not isinstance(hops, int)
+            ):
+                return None
+            message = MessageRecord.from_dict(payload)
+            if timestamp_to_json(message.timestamp) != row["timestamp"]:
+                return None
+            return message
+        except (
+            json.JSONDecodeError,
+            KeyError,
+            OverflowError,
+            RecursionError,
+            TypeError,
+            ValueError,
+        ):
+            return None
+
+    async def _async_recent_message_records(
+        self, limit: int
+    ) -> list[MessageRecord]:
+        """Return up to ``limit`` valid messages despite isolated bad rows."""
+        if limit <= 0:
+            return []
+        messages_descending: list[MessageRecord] = []
+        cursor: tuple[str, str] | None = None
+        while len(messages_descending) < limit:
+            batch_limit = max(100, min(500, limit - len(messages_descending)))
+            if cursor is None:
+                rows = await self._fetchall(
+                    """
+                    SELECT message_id, timestamp, data
+                    FROM messages
+                    ORDER BY timestamp DESC, message_id DESC
+                    LIMIT ?
+                    """,
+                    (batch_limit,),
+                )
+            else:
+                timestamp, message_id = cursor
+                rows = await self._fetchall(
+                    """
+                    SELECT message_id, timestamp, data
+                    FROM messages
+                    WHERE timestamp < ?
+                       OR (timestamp = ? AND message_id < ?)
+                    ORDER BY timestamp DESC, message_id DESC
+                    LIMIT ?
+                    """,
+                    (timestamp, timestamp, message_id, batch_limit),
+                )
+            if not rows:
+                break
+            for row in rows:
+                message = self._message_from_row(row)
+                if message is not None:
+                    messages_descending.append(message)
+                    if len(messages_descending) == limit:
+                        break
+            last_row = rows[-1]
+            cursor = (last_row["timestamp"], last_row["message_id"])
+            if len(rows) < batch_limit:
+                break
+        return list(reversed(messages_descending))
 
     async def async_upsert_node(self, node: NodeState) -> None:
         """Persist a node."""
@@ -297,20 +473,98 @@ class MeshStore:
 
     async def async_recent_messages(self, limit: int = 100) -> list[MessageRecord]:
         """Return recent messages oldest-first."""
-        rows = await self._fetchall(
-            "SELECT data FROM messages ORDER BY timestamp DESC LIMIT ?",
-            (limit,),
-        )
-        return [MessageRecord.from_dict(json.loads(row["data"])) for row in reversed(rows)]
+        return await self._async_recent_message_records(limit)
 
-    async def async_pending_outbox(self, limit: int = 100) -> list[MessageRecord]:
+    async def async_pending_outbox(
+        self,
+        limit: int = 100,
+        *,
+        after: tuple[str, str] | None = None,
+    ) -> list[MessageRecord]:
         """Return queued outbound messages oldest-first."""
-        rows = await self._fetchall(
-            "SELECT data FROM messages WHERE direction = 'tx' ORDER BY timestamp ASC LIMIT ?",
-            (limit,),
-        )
-        messages = [MessageRecord.from_dict(json.loads(row["data"])) for row in rows]
-        return [message for message in messages if message.raw.get("status") == "queued"]
+        if limit <= 0:
+            return []
+        messages: list[MessageRecord] = []
+        cursor = after
+        while len(messages) < limit:
+            batch_limit = max(100, min(500, limit - len(messages)))
+            if cursor is None:
+                rows = await self._fetchall(
+                    """
+                    SELECT message_id, timestamp, data
+                    FROM messages
+                    WHERE direction = 'tx'
+                      AND CASE
+                            WHEN json_valid(data)
+                            THEN json_extract(data, '$.raw.status')
+                            ELSE NULL
+                          END = 'queued'
+                    ORDER BY timestamp ASC, message_id ASC
+                    LIMIT ?
+                    """,
+                    (batch_limit,),
+                )
+            else:
+                timestamp, message_id = cursor
+                rows = await self._fetchall(
+                    """
+                    SELECT message_id, timestamp, data
+                    FROM messages
+                    WHERE direction = 'tx'
+                      AND CASE
+                            WHEN json_valid(data)
+                            THEN json_extract(data, '$.raw.status')
+                            ELSE NULL
+                          END = 'queued'
+                      AND (timestamp > ? OR
+                           (timestamp = ? AND message_id > ?))
+                    ORDER BY timestamp ASC, message_id ASC
+                    LIMIT ?
+                    """,
+                    (timestamp, timestamp, message_id, batch_limit),
+                )
+            if not rows:
+                break
+            for row in rows:
+                message = self._message_from_row(row)
+                route_gateway = (
+                    message.raw.get("gateway_id")
+                    if message is not None
+                    else None
+                )
+                if (
+                    message is None
+                    or message.direction != "tx"
+                    or message.raw.get("status") != "queued"
+                    or (
+                        route_gateway is not None
+                        and not isinstance(route_gateway, str)
+                    )
+                ):
+                    # Quarantine one parseable poison record without preventing
+                    # later valid queued messages from being delivered. Database
+                    # failures still propagate from _execute.
+                    await self._execute(
+                        """
+                        UPDATE messages
+                        SET data = json_set(
+                            data,
+                            '$.raw.status', 'blocked',
+                            '$.raw.last_error_code', 'invalid_message'
+                        )
+                        WHERE message_id = ? AND json_valid(data)
+                        """,
+                        (row["message_id"],),
+                    )
+                    continue
+                messages.append(message)
+                if len(messages) == limit:
+                    break
+            last_row = rows[-1]
+            cursor = (last_row["timestamp"], last_row["message_id"])
+            if len(messages) == limit or len(rows) < batch_limit:
+                break
+        return messages
 
     async def async_messages_since(self, when: datetime) -> int:
         """Return message count since a timestamp."""
@@ -363,7 +617,11 @@ class MeshStore:
                 SUM(
                     CASE
                         WHEN direction = 'tx'
-                        AND json_extract(data, '$.raw.status') = 'queued'
+                        AND CASE
+                              WHEN json_valid(data)
+                              THEN json_extract(data, '$.raw.status')
+                              ELSE NULL
+                            END = 'queued'
                         THEN 1 ELSE 0
                     END
                 ) AS queued_count

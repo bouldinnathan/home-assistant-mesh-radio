@@ -28,15 +28,22 @@ from .const import (
     TRANSPORT_TCP,
 )
 from .gateway import MeshGateway
+from .meshtastic_settings import (
+    state_from_native_interface,
+    unavailable_settings_snapshot,
+)
 from .models import (
     GatewayConfig,
     MeshPacket,
     NodeState,
-    canonical_node_key,
     coerce_float,
     coerce_int,
     parse_timestamp,
     utcnow,
+)
+from .node_identity import (
+    canonical_meshtastic_node_id,
+    meshtastic_observation_node_key,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -73,6 +80,14 @@ _BLUETOOTH_FAILURE_DIAGNOSTIC_FIELDS = frozenset(
         "callback_error_count",
         "dropped_stream_packet_count",
         "sent_text_count",
+        "admin_request_count",
+        "admin_response_count",
+        "admin_timeout_count",
+        "admin_nak_count",
+        "admin_response_waiter_count",
+        "connection_generation",
+        "settings_complete_sequence",
+        "settings_complete_generation",
         "last_error_type",
         "last_failure_phase",
         "last_transport_cleanup_outcome",
@@ -127,6 +142,9 @@ _BLUETOOTH_FAILURE_TIMEOUT_FIELDS = frozenset(
         "start",
         "stop",
         "heartbeat_interval",
+        "admin_response",
+        "settings_apply",
+        "settings_readback",
     }
 )
 _NATIVE_ENDPOINT_LOCKS: WeakKeyDictionary[
@@ -324,6 +342,7 @@ class MeshtasticClient(MeshGateway):
         self._ble_connection_unsubscribe: Callable[[], None] | None = None
         self._ble_callback_transport: Any | None = None
         self._ble_operation_tasks: set[asyncio.Task[Any]] = set()
+        self._settings_lock = asyncio.Lock()
         self._ble_deferred_cleanup_task: asyncio.Task[Any] | None = None
         self._unsub_mqtt: Any | None = None
         self._stopping = False
@@ -749,7 +768,10 @@ class MeshtasticClient(MeshGateway):
             try:
                 unsubscribe()
             except Exception as err:
-                self._logger.debug("Failed to unsubscribe Meshtastic MQTT handler: %s", err)
+                self._logger.debug(
+                    "Failed to unsubscribe Meshtastic MQTT handler (%s)",
+                    type(err).__name__,
+                )
         self._unsubscribe_native_events()
         if self._ble_transport is not None:
             transport = self._ble_transport
@@ -816,7 +838,10 @@ class MeshtasticClient(MeshGateway):
             except asyncio.CancelledError:
                 return
             if error is not None:
-                self._logger.debug("Failed to close Meshtastic interface: %s", error)
+                self._logger.debug(
+                    "Failed to close Meshtastic interface (%s)",
+                    type(error).__name__,
+                )
                 return
             if release_native_lock:
                 self._release_native_lock()
@@ -912,7 +937,11 @@ class MeshtasticClient(MeshGateway):
                 try:
                     self._pub.unsubscribe(handler, topic)
                 except Exception as err:
-                    self._logger.debug("Failed to unsubscribe %s handler: %s", topic, err)
+                    self._logger.debug(
+                        "Failed to unsubscribe %s handler (%s)",
+                        topic,
+                        type(err).__name__,
+                    )
         self._pub = None
         self._receive_handler = None
         self._connect_handler = None
@@ -934,8 +963,8 @@ class MeshtasticClient(MeshGateway):
                 unsubscribe()
             except Exception as err:
                 self._logger.debug(
-                    "Failed to unsubscribe Meshtastic Bluetooth callback: %s",
-                    err,
+                    "Failed to unsubscribe Meshtastic Bluetooth callback (%s)",
+                    type(err).__name__,
                 )
 
     def _subscribe_bluetooth_events(self, transport: Any) -> None:
@@ -1031,8 +1060,8 @@ class MeshtasticClient(MeshGateway):
                 # Keep both the transport and endpoint lease. A later explicit
                 # stop can retry; releasing either would permit two GATT owners.
                 self._logger.debug(
-                    "Deferred Meshtastic Bluetooth cleanup failed: %s",
-                    err,
+                    "Deferred Meshtastic Bluetooth cleanup failed (%s)",
+                    type(err).__name__,
                 )
                 return
             if self._ble_transport is transport:
@@ -1075,6 +1104,13 @@ class MeshtasticClient(MeshGateway):
         message_type: str,
     ) -> str:
         """Send a Meshtastic text message."""
+        if target_node is not None:
+            canonical_target = canonical_meshtastic_node_id(target_node)
+            if canonical_target is None:
+                raise ValueError(
+                    "Meshtastic direct sends require a validated canonical node ID"
+                )
+            target_node = canonical_target
         message_id = hashlib.sha256(
             f"{self.config.gateway_id}:{target_node}:{channel}:{message}:{utcnow().timestamp()}".encode()
         ).hexdigest()[:16]
@@ -1136,7 +1172,8 @@ class MeshtasticClient(MeshGateway):
                     gateway_id=self.config.gateway_id,
                     fallback_node_id=node_id,
                 )
-                await self._emit_node(normalized)
+                if normalized is not None:
+                    await self._emit_node(normalized)
             return
 
         interface = self._interface
@@ -1153,7 +1190,121 @@ class MeshtasticClient(MeshGateway):
                 gateway_id=self.config.gateway_id,
                 fallback_node_id=node_id,
             )
-            await self._emit_node(normalized)
+            if normalized is not None:
+                await self._emit_node(normalized)
+
+    async def async_get_settings_snapshot(self) -> dict[str, Any]:
+        """Return privacy-safe settings for the physically connected radio."""
+        reason = "confirmed_admin_write_and_verification_not_available"
+        async with self._settings_lock:
+            if self.config.transport == TRANSPORT_MQTT:
+                return unavailable_settings_snapshot(
+                    transport=self.config.transport,
+                    reason="mqtt_is_not_a_local_admin_transport",
+                )
+            if self.config.transport == TRANSPORT_BLUETOOTH:
+                transport = self._ble_transport
+                client = getattr(transport, "_client", None)
+                getter = getattr(client, "async_get_settings_snapshot", None)
+                if not callable(getter):
+                    return unavailable_settings_snapshot(
+                        transport=self.config.transport,
+                        reason="bluetooth_settings_snapshot_is_unavailable",
+                    )
+                return await self._async_run_bluetooth_operation(getter())
+
+            interface = self._interface
+            if interface is None:
+                return unavailable_settings_snapshot(
+                    transport=self.config.transport,
+                    reason="local_radio_is_not_connected",
+                )
+            state = await self._async_run_native_executor(
+                interface,
+                lambda: state_from_native_interface(interface),
+                name=f"MeshNet Meshtastic settings read {self.config.gateway_id}",
+            )
+            return state.public_snapshot(
+                transport=self.config.transport,
+                apply_reason=reason,
+            )
+
+    async def async_apply_settings_plan(
+        self, changes: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Apply through the verified BLE backend or reject unsupported transports.
+
+        Official SDK write helpers log full AdminMessages at DEBUG and do not
+        provide the response/verification contract MeshNet requires. Native
+        serial/TCP and MQTT therefore remain read-only; the isolated async BLE
+        client implements its own acknowledged, post-reboot-verified path.
+        """
+        reason = "confirmed_admin_write_and_verification_not_available"
+        async with self._settings_lock:
+            if self.config.transport == TRANSPORT_MQTT:
+                return {
+                    "success": False,
+                    "status": "read_only",
+                    "reason": "mqtt_is_not_a_local_admin_transport",
+                    "applied_paths": [],
+                    "verified": False,
+                    "blocked_paths": {
+                        path: "mqtt_is_not_a_local_admin_transport"
+                        for path in changes
+                        if isinstance(path, str)
+                    },
+                    "connection_critical_paths": [],
+                }
+            if self.config.transport == TRANSPORT_BLUETOOTH:
+                transport = self._ble_transport
+                client = getattr(transport, "_client", None)
+                apply_plan = getattr(client, "async_apply_settings_plan", None)
+                if not callable(apply_plan):
+                    return {
+                        "success": False,
+                        "status": "read_only",
+                        "reason": "bluetooth_settings_snapshot_is_unavailable",
+                        "applied_paths": [],
+                        "verified": False,
+                        "blocked_paths": {
+                            path: "bluetooth_settings_snapshot_is_unavailable"
+                            for path in changes
+                            if isinstance(path, str)
+                        },
+                        "connection_critical_paths": [],
+                    }
+                return await self._async_run_bluetooth_operation(
+                    apply_plan(changes)
+                )
+
+            interface = self._interface
+            if interface is None:
+                return {
+                    "success": False,
+                    "status": "read_only",
+                    "reason": "local_radio_is_not_connected",
+                    "applied_paths": [],
+                    "verified": False,
+                    "blocked_paths": {
+                        path: "local_radio_is_not_connected"
+                        for path in changes
+                        if isinstance(path, str)
+                    },
+                    "connection_critical_paths": [],
+                }
+            state = await self._async_run_native_executor(
+                interface,
+                lambda: state_from_native_interface(interface),
+                name=f"MeshNet Meshtastic settings plan {self.config.gateway_id}",
+            )
+            from meshtastic.protobuf import admin_pb2
+
+            plan = state.build_plan(
+                changes,
+                transport=self.config.transport,
+                admin_message_factory=admin_pb2.AdminMessage,
+            )
+            return plan.read_only_result(reason)
 
     async def _start_native(self) -> None:
         if self.config.transport == TRANSPORT_BLUETOOTH:
@@ -1345,8 +1496,8 @@ class MeshtasticClient(MeshGateway):
                 cleanup_exception_type = type(cleanup_error).__name__
                 self._ble_transport = transport
                 self._logger.debug(
-                    "Failed to stop Meshtastic Bluetooth after startup failure: %s",
-                    cleanup_error,
+                    "Failed to stop Meshtastic Bluetooth after startup failure (%s)",
+                    type(cleanup_error).__name__,
                 )
             else:
                 cleanup_outcome = "confirmed"
@@ -1459,7 +1610,10 @@ class MeshtasticClient(MeshGateway):
             try:
                 unsubscribe()
             except Exception as err:
-                self._logger.debug("Failed to unsubscribe late Meshtastic MQTT handler: %s", err)
+                self._logger.debug(
+                    "Failed to unsubscribe late Meshtastic MQTT handler (%s)",
+                    type(err).__name__,
+                )
             return
         self._unsub_mqtt = unsubscribe
         await self._set_connected(True, mqtt_topic=topic)
@@ -1613,6 +1767,25 @@ def _meshtastic_location(position: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _consistent_meshtastic_id(*values: Any) -> tuple[str | None, bool]:
+    """Return one canonical ID only when every present source agrees."""
+    present = [
+        value
+        for value in values
+        if value is not None
+        and not (isinstance(value, str) and not value.strip())
+    ]
+    if not present:
+        return None, True
+    canonical = [canonical_meshtastic_node_id(value) for value in present]
+    if any(value is None for value in canonical):
+        return None, False
+    identities = {value for value in canonical if value is not None}
+    if len(identities) != 1:
+        return None, False
+    return next(iter(identities)), True
+
+
 def meshtastic_packet_to_state_packet(
     raw: dict[str, Any],
     *,
@@ -1671,14 +1844,42 @@ def meshtastic_node_to_state(
     *,
     gateway_id: str,
     fallback_node_id: str | None = None,
-) -> NodeState:
+) -> NodeState | None:
     """Normalize Meshtastic node DB entries into NodeState."""
     user = raw.get("user") if isinstance(raw.get("user"), dict) else {}
     position = raw.get("position") if isinstance(raw.get("position"), dict) else {}
     device_metrics = raw.get("deviceMetrics") if isinstance(raw.get("deviceMetrics"), dict) else {}
-    node_id = str(user.get("id") or raw.get("id") or raw.get("num") or fallback_node_id or "") or None
-    mac = _normalize_meshtastic_mac(user.get("macaddr") or user.get("mac"))
-    node_key = canonical_node_key(PROTOCOL_MESHTASTIC, node_id=node_id, mac=mac)
+    routing_id, routing_consistent = _consistent_meshtastic_id(
+        raw.get("num"), fallback_node_id
+    )
+    claimed_id, claims_consistent = _consistent_meshtastic_id(
+        raw.get("id"), user.get("id")
+    )
+    if not routing_consistent:
+        return None
+    if routing_id is None:
+        if not claims_consistent or claimed_id is None:
+            return None
+        canonical_node_id = claimed_id
+        user_is_consistent = True
+    else:
+        canonical_node_id = routing_id
+        user_is_consistent = bool(
+            claims_consistent
+            and (claimed_id is None or claimed_id == routing_id)
+        )
+    safe_user = user if user_is_consistent else {}
+    mac = _normalize_meshtastic_mac(
+        safe_user.get("macaddr") or safe_user.get("mac")
+    )
+    public_key = _normalize_meshtastic_public_key(
+        safe_user.get("publicKey") or safe_user.get("public_key")
+    )
+    node_key = meshtastic_observation_node_key(
+        canonical_node_id,
+        mac=mac,
+        public_key=public_key,
+    )
     last_heard = parse_timestamp(raw.get("lastHeard")) or parse_timestamp(raw.get("last_heard"))
     if last_heard is None and isinstance(raw.get("lastHeard"), (int, float)):
         last_heard = datetime.fromtimestamp(raw["lastHeard"], tz=UTC)
@@ -1692,13 +1893,20 @@ def meshtastic_node_to_state(
     return NodeState(
         node_key=node_key,
         protocol=PROTOCOL_MESHTASTIC,
-        node_id=node_id,
+        node_id=canonical_node_id,
         mac=mac,
-        user_name=_first_text(user, "userName", "username", "user_name", "name"),
-        long_name=_first_text(user, "longName", "long_name", "longname"),
-        short_name=_first_text(user, "shortName", "short_name", "shortname"),
+        public_key=public_key,
+        user_name=_first_text(
+            safe_user, "userName", "username", "user_name", "name"
+        ),
+        long_name=_first_text(
+            safe_user, "longName", "long_name", "longname"
+        ),
+        short_name=_first_text(
+            safe_user, "shortName", "short_name", "shortname"
+        ),
         hardware_model=(
-            _first_textish(user, "hwModel", "hw_model", "hardware")
+            _first_textish(safe_user, "hwModel", "hw_model", "hardware")
             or _first_textish(raw, "hwModel", "hw_model", "hardware")
         ),
         firmware_version=raw.get("firmwareVersion") or raw.get("firmware_version"),
@@ -1744,11 +1952,31 @@ def meshtastic_packet_to_node(packet: MeshPacket) -> NodeState | None:
             "shortName": mqtt_payload.get("shortname") or mqtt_payload.get("short_name"),
             "hwModel": mqtt_payload.get("hardware") or mqtt_payload.get("hw_model"),
         }
-    if not packet.sender and not user and not position and not telemetry:
+    routing_id, routing_consistent = _consistent_meshtastic_id(
+        packet.sender,
+        raw.get("fromId"),
+        raw.get("from"),
+        raw.get("from_num"),
+    )
+    if not routing_consistent or routing_id is None:
         return None
-    mac = _normalize_meshtastic_mac(user.get("macaddr") or user.get("mac"))
-    node_id = str(user.get("id") or packet.sender or "") or None
-    node_key = canonical_node_key(PROTOCOL_MESHTASTIC, node_id=node_id, mac=mac)
+    claimed_id, claims_consistent = _consistent_meshtastic_id(user.get("id"))
+    user_is_consistent = bool(
+        claims_consistent
+        and (claimed_id is None or claimed_id == routing_id)
+    )
+    safe_user = user if user_is_consistent else {}
+    mac = _normalize_meshtastic_mac(
+        safe_user.get("macaddr") or safe_user.get("mac")
+    )
+    public_key = _normalize_meshtastic_public_key(
+        safe_user.get("publicKey") or safe_user.get("public_key")
+    )
+    node_key = meshtastic_observation_node_key(
+        routing_id,
+        mac=mac,
+        public_key=public_key,
+    )
     sensors: dict[str, Any] = {}
     power: dict[str, Any] = {}
     via_mqtt = _meshtastic_via_mqtt(raw)
@@ -1785,12 +2013,21 @@ def meshtastic_packet_to_node(packet: MeshPacket) -> NodeState | None:
     return NodeState(
         node_key=node_key,
         protocol=PROTOCOL_MESHTASTIC,
-        node_id=node_id,
+        node_id=routing_id,
         mac=mac,
-        user_name=_first_text(user, "userName", "username", "user_name", "name"),
-        long_name=_first_text(user, "longName", "long_name", "longname"),
-        short_name=_first_text(user, "shortName", "short_name", "shortname"),
-        hardware_model=_first_textish(user, "hwModel", "hw_model", "hardware"),
+        public_key=public_key,
+        user_name=_first_text(
+            safe_user, "userName", "username", "user_name", "name"
+        ),
+        long_name=_first_text(
+            safe_user, "longName", "long_name", "longname"
+        ),
+        short_name=_first_text(
+            safe_user, "shortName", "short_name", "shortname"
+        ),
+        hardware_model=_first_textish(
+            safe_user, "hwModel", "hw_model", "hardware"
+        ),
         online=True,
         last_heard=packet.timestamp,
         last_gateway_id=packet.gateway_id,
@@ -1838,8 +2075,8 @@ def _normalize_meshtastic_mac(value: Any) -> str | None:
     ``MessageToDict`` represents the protobuf ``User.macaddr`` bytes field as
     case-sensitive base64.  Passing that representation to the generic node-key
     helper would lowercase and corrupt it, so normalize valid six-byte values
-    before deriving the public node key.  Existing textual identifiers that are
-    not a Meshtastic MAC are left intact for backward compatibility.
+    before deriving the public node key. Malformed textual values are omitted
+    so they cannot create a durable phantom MAC identity.
     """
     if value is None:
         return None
@@ -1847,8 +2084,7 @@ def _normalize_meshtastic_mac(value: Any) -> str | None:
         raw_bytes = bytes(value)
         return raw_bytes.hex() if len(raw_bytes) == 6 else None
     if not isinstance(value, str):
-        text = str(value).strip()
-        return text or None
+        return None
 
     text = value.strip()
     if not text:
@@ -1859,8 +2095,30 @@ def _normalize_meshtastic_mac(value: Any) -> str | None:
     try:
         decoded = base64.b64decode(text, validate=True)
     except (binascii.Error, ValueError):
-        return text
-    return decoded.hex() if len(decoded) == 6 else text
+        return None
+    return decoded.hex() if len(decoded) == 6 else None
+
+
+def _normalize_meshtastic_public_key(value: Any) -> str | None:
+    """Return a stable hex identity only for an exact 32-byte public key."""
+    if value is None:
+        return None
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raw_bytes = bytes(value)
+        return raw_bytes.hex() if len(raw_bytes) == 32 else None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    compact = text.replace(":", "").replace("-", "")
+    if len(compact) == 64 and all(
+        char in "0123456789abcdefABCDEF" for char in compact
+    ):
+        return compact.lower()
+    try:
+        decoded = base64.b64decode(text, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    return decoded.hex() if len(decoded) == 32 else None
 
 
 def _snake(value: str) -> str:

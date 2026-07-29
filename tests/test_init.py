@@ -15,6 +15,7 @@ import pytest
 
 from custom_components.meshnet import (
     _async_register_panel,
+    _async_update_listener,
     _cancel_scheduled_messages,
     _coerce_target_node,
     _schedule_message_call,
@@ -62,6 +63,41 @@ def test_target_node_accepts_safe_integer_or_text_values(
 def test_target_node_rejects_boolean_fractional_or_empty_values(value) -> None:
     with pytest.raises(ValueError, match="target_node"):
         _coerce_target_node(value)
+
+
+def test_invalid_scheduled_envelope_is_rejected_before_timer_registration(
+    monkeypatch,
+) -> None:
+    """Scheduling validates fields now, not inside a future background task."""
+    homeassistant = types.ModuleType("homeassistant")
+    helpers = types.ModuleType("homeassistant.helpers")
+    event = types.ModuleType("homeassistant.helpers.event")
+    exceptions = types.ModuleType("homeassistant.exceptions")
+    exceptions.HomeAssistantError = RuntimeError
+    async_call_later = MagicMock()
+    event.async_call_later = async_call_later
+    homeassistant.helpers = helpers
+    monkeypatch.setitem(sys.modules, "homeassistant", homeassistant)
+    monkeypatch.setitem(sys.modules, "homeassistant.helpers", helpers)
+    monkeypatch.setitem(sys.modules, "homeassistant.helpers.event", event)
+    monkeypatch.setitem(sys.modules, "homeassistant.exceptions", exceptions)
+    coordinator = SimpleNamespace()
+    validate = MagicMock(side_effect=ValueError("invalid message envelope"))
+
+    with pytest.raises(ValueError, match="invalid message envelope"):
+        _schedule_message_call(
+            object(),
+            coordinator,
+            {
+                "when": "2999-01-01T00:00:00+00:00",
+                "message": "invalid",
+            },
+            service_fields=validate,
+        )
+
+    validate.assert_called_once_with({"message": "invalid"})
+    async_call_later.assert_not_called()
+    assert _scheduled_message_cancels(coordinator) == set()
 
 
 def test_action_metadata_has_no_unsupported_target_and_is_translated() -> None:
@@ -215,10 +251,53 @@ def test_one_broken_timer_cancel_does_not_block_remaining_cleanup() -> None:
     callbacks.update({broken_cancel, healthy_cancel})
 
     _cancel_scheduled_messages(coordinator)
-
     assert set(calls) == {"broken", "healthy"}
     assert callbacks == set()
     _cancel_scheduled_messages(coordinator)
+
+
+def test_connection_credential_update_skips_only_its_own_reload() -> None:
+    async def run() -> None:
+        entry = SimpleNamespace(
+            entry_id="entry-id", options={"expected": True}
+        )
+        decisions = iter((True, False))
+        coordinator = SimpleNamespace(
+            consume_connection_update_reload=MagicMock(
+                side_effect=lambda _options: next(decisions)
+            )
+        )
+        reload_entry = AsyncMock()
+        hass = SimpleNamespace(
+            data={DOMAIN: {entry.entry_id: coordinator}},
+            config_entries=SimpleNamespace(async_reload=reload_entry),
+        )
+
+        await _async_update_listener(hass, entry)
+        reload_entry.assert_not_awaited()
+
+        entry.options = {"unrelated": "later update"}
+        await _async_update_listener(hass, entry)
+        reload_entry.assert_awaited_once_with(entry.entry_id)
+        assert coordinator.consume_connection_update_reload.call_count == 2
+
+    asyncio.run(run())
+
+
+def test_update_listener_reloads_when_no_live_coordinator_exists() -> None:
+    async def run() -> None:
+        entry = SimpleNamespace(entry_id="entry-id", options={})
+        reload_entry = AsyncMock()
+        hass = SimpleNamespace(
+            data={DOMAIN: {}},
+            config_entries=SimpleNamespace(async_reload=reload_entry),
+        )
+
+        await _async_update_listener(hass, entry)
+
+        reload_entry.assert_awaited_once_with(entry.entry_id)
+
+    asyncio.run(run())
 
 
 def test_setup_entry_does_not_wait_for_radio_sdk_startup(monkeypatch) -> None:
@@ -431,6 +510,77 @@ def test_unload_failure_preserves_live_coordinator() -> None:
 
         assert await async_unload_entry(hass, entry) is False
         assert hass.data[DOMAIN][entry.entry_id] is coordinator
+        coordinator.async_shutdown.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+def test_unload_fences_settings_before_platforms_and_resumes_on_failure() -> None:
+    """No admin write may begin in the platform-unload window."""
+
+    async def run() -> None:
+        events: list[str] = []
+
+        class SettingsManager:
+            async def async_quiesce(self) -> bool:
+                events.append("settings_quiesce")
+                return True
+
+            def resume(self) -> bool:
+                events.append("settings_resume")
+                return True
+
+        async def unload_platforms(_entry, _platforms) -> bool:
+            events.append("unload_platforms")
+            return False
+
+        coordinator = SimpleNamespace(
+            gateway_settings=SettingsManager(),
+            async_shutdown=AsyncMock(),
+        )
+        entry = SimpleNamespace(entry_id="entry-id")
+        hass = SimpleNamespace(
+            data={DOMAIN: {entry.entry_id: coordinator}},
+            config_entries=SimpleNamespace(
+                async_unload_platforms=unload_platforms
+            ),
+        )
+
+        assert await async_unload_entry(hass, entry) is False
+        assert events == [
+            "settings_quiesce",
+            "unload_platforms",
+            "settings_resume",
+        ]
+        coordinator.async_shutdown.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+def test_unload_does_not_touch_platforms_when_settings_cannot_drain() -> None:
+    """A resistant write keeps ownership and transport lifecycle intact."""
+
+    async def run() -> None:
+        manager = SimpleNamespace(
+            async_quiesce=AsyncMock(return_value=False),
+            resume=MagicMock(),
+        )
+        coordinator = SimpleNamespace(
+            gateway_settings=manager,
+            async_shutdown=AsyncMock(),
+        )
+        entry = SimpleNamespace(entry_id="entry-id")
+        unload_platforms = AsyncMock(return_value=True)
+        hass = SimpleNamespace(
+            data={DOMAIN: {entry.entry_id: coordinator}},
+            config_entries=SimpleNamespace(
+                async_unload_platforms=unload_platforms
+            ),
+        )
+
+        assert await async_unload_entry(hass, entry) is False
+        unload_platforms.assert_not_awaited()
+        manager.resume.assert_not_called()
         coordinator.async_shutdown.assert_not_awaited()
 
     asyncio.run(run())

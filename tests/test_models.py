@@ -3,11 +3,22 @@ from __future__ import annotations
 from custom_components.meshnet.models import (
     NodeState,
     canonical_node_key,
+    coerce_float,
+    coerce_int,
     has_valid_location,
     location_accuracy_meters,
     merge_dict,
     parse_timestamp,
 )
+
+
+def test_numeric_coercion_rejects_booleans_nonfinite_values_and_overflow() -> None:
+    assert coerce_float("12.5") == 12.5
+    assert coerce_int("12") == 12
+    for value in (True, False, float("nan"), float("inf"), float("-inf")):
+        assert coerce_float(value) is None
+        assert coerce_int(value) is None
+    assert coerce_int(1.5) is None
 
 
 def test_canonical_node_key_prefers_mac() -> None:

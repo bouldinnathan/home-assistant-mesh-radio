@@ -1,5 +1,74 @@
 # Upgrade Guide
 
+## From 0.5.11
+
+0.6.0 adds a dedicated **Gateway settings** tab to the admin-only MeshNet
+sidebar. It reads supported values from the physically connected radio, keeps
+drafts in the current browser tab, requires a server-generated redacted
+preview, applies each exact preview once, and rereads the radio to distinguish
+verified from unverified fields. Connection-critical operations require an
+additional confirmation and run last.
+
+MeshCore native companion connections over Bluetooth, serial, and TCP support
+validated writes for the fields made writable by their live schema.
+Meshtastic writes are limited to MeshNet's bounded direct Bluetooth transport;
+Meshtastic serial/TCP and MQTT/REST bridge settings remain read-only in 0.6.0.
+Managed Meshtastic radios and unsupported firmware/SDK fields also fail closed
+to read-only. There is no raw-command, remote RF admin, reset, firmware-flash,
+or private-key interface.
+
+Existing secret values are never returned. New values are write-only and held
+only in the browser draft and short-lived in-memory preview while applying. A
+verified MeshCore Bluetooth PIN change is persisted only to that gateway's
+connection option so it can reconnect; the Meshtastic BlueZ pairing PIN remains
+transient and is never stored. See [Gateway Settings](GATEWAY_SETTINGS.md) for
+the support and recovery matrix.
+
+Treat a settings timeout as an unknown radio state and never repeat the write
+blindly. Reload live values after reconnect. Intentional settings persist in
+radio firmware, so removing the config entry or uninstalling through HACS does
+not restore prior radio values. There is no config-entry or SQLite schema
+migration for this feature.
+
+0.6.0 also replaces the sidebar's raw Meshtastic record count with a conservative
+distinct-node projection. A NodeInfo/configuration record historically used a
+MAC-based key while a later packet from the same radio used its `!xxxxxxxx`
+routing ID, so one physical node could become two or three cached records,
+devices, map trackers, and graph entries. New NodeDB and packet observations
+now use deterministic proof-aware keys and one shared effective-node
+projection. When MAC and/or public-key proof is present, a one-way composite key
+binds every available proof to the routing ID. A conflicting observation can no
+longer overwrite the earlier proof before the projection sees it.
+
+At startup MeshNet groups existing records only by an exact, valid, nonzero,
+non-broadcast 32-bit Meshtastic ID. A group collapses only when every record is
+internally consistent and all strong proof belongs to one observed MAC/public-
+key bundle. Separate MAC-only and public-key-only records do not establish a
+relationship between those proofs and therefore remain unresolved unless one
+record actually carries both.
+Conflicting or malformed evidence fails closed and remains separate. Names are
+taken from one coherent donor, the freshest connectivity observation remains
+atomic, and no grouping is performed by name, location, signal, or protocol
+guessing.
+
+If one MAC or public key appears under different routing IDs, MeshNet also keeps
+those records separate and disables direct messaging through either identity.
+That evidence may represent an old ID, cloned configuration, or corruption;
+MeshNet does not guess which record should receive a message.
+
+The projection feeds the sidebar, passive graph, Map trackers, sensors, binary
+sensors, health calculations, and direct-recipient list. Original SQLite rows
+are retained unchanged and are reported separately from the distinct count;
+there is no database or Home Assistant registry deletion. Old alias entities
+therefore become unavailable after reload instead of being destructively
+removed. An existing `MeshNet Favorite` label on one of those retained alias
+devices still marks the effective node as favorite, and an old alias remains a
+valid direct-message target.
+
+This migration sends no NodeInfo request, traceroute, or other radio packet.
+Restart Home Assistant and hard-refresh the browser after installing so the
+versioned panel module loads.
+
 ## From 0.5.10
 
 0.5.11 hardens direct Meshtastic Bluetooth startup for radios with a large or

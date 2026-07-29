@@ -77,21 +77,26 @@ def canonical_node_key(protocol: str, node_id: Any = None, mac: Any = None, publ
 
 def coerce_float(value: Any) -> float | None:
     """Return a float or None for noisy radio payload values."""
-    if value is None or value == "":
+    if value is None or value == "" or isinstance(value, bool):
         return None
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        converted = float(value)
+    except (TypeError, ValueError, OverflowError):
         return None
+    return converted if math.isfinite(converted) else None
 
 
 def coerce_int(value: Any) -> int | None:
     """Return an int or None for noisy radio payload values."""
-    if value is None or value == "":
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    if isinstance(value, float) and (
+        not math.isfinite(value) or not value.is_integer()
+    ):
         return None
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 

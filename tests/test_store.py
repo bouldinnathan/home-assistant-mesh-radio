@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -86,6 +88,9 @@ async def _pending_outbox(tmp_path) -> None:
     )
     pending = await store.async_pending_outbox()
     assert [message.message_id for message in pending] == ["queued"]
+    assert await store.async_pending_outbox(
+        after=(pending[0].timestamp.isoformat(), pending[0].message_id)
+    ) == []
     diagnostics = await store.async_diagnostics()
     assert diagnostics["message_direction_counts"] == {
         "received": 0,
@@ -96,6 +101,319 @@ async def _pending_outbox(tmp_path) -> None:
     closed_diagnostics = await store.async_diagnostics()
     assert closed_diagnostics["available"] is False
     assert "node_count" not in closed_diagnostics
+
+
+def test_cached_reads_isolate_invalid_rows(tmp_path) -> None:
+    """One malformed cache row must not prevent adjacent valid state loading."""
+
+    async def run() -> None:
+        store = MeshStore(tmp_path / "meshnet.sqlite3")
+        await store.async_open()
+        await store.async_upsert_node(
+            NodeState(
+                node_key="meshtastic:valid",
+                protocol="meshtastic",
+                node_id="!12345678",
+            )
+        )
+        await store._execute(
+            """
+            INSERT INTO nodes(node_key, protocol, updated_at, data)
+            VALUES(?, ?, ?, ?)
+            """,
+            ("broken-json", "meshtastic", "2026-07-29T12:00:00+00:00", "{"),
+        )
+        mismatched_node = NodeState(
+            node_key="meshtastic:payload-key",
+            protocol="meshtastic",
+            node_id="!22222222",
+        ).as_dict()
+        await store._execute(
+            """
+            INSERT INTO nodes(node_key, protocol, updated_at, data)
+            VALUES(?, ?, ?, ?)
+            """,
+            (
+                "meshtastic:row-key",
+                "meshtastic",
+                "2026-07-29T12:01:00+00:00",
+                json.dumps(mismatched_node),
+            ),
+        )
+        invalid_scalar_node = NodeState(
+            node_key="meshtastic:invalid-scalar",
+            protocol="meshtastic",
+            node_id="!33333333",
+        ).as_dict()
+        invalid_scalar_node["long_name"] = ["not", "text"]
+        invalid_scalar_node["hardware_model"] = {"not": "text"}
+        await store._execute(
+            """
+            INSERT INTO nodes(node_key, protocol, updated_at, data)
+            VALUES(?, ?, ?, ?)
+            """,
+            (
+                "meshtastic:invalid-scalar",
+                "meshtastic",
+                "2026-07-29T12:02:00+00:00",
+                json.dumps(invalid_scalar_node),
+            ),
+        )
+
+        base = datetime(2026, 7, 29, 12, tzinfo=UTC)
+        for message_id, offset in (("valid-old", 0), ("valid-new", 1)):
+            await store.async_add_message(
+                MessageRecord(
+                    message_id=message_id,
+                    protocol="meshtastic",
+                    gateway_id="gateway-1",
+                    sender="homeassistant",
+                    receiver=None,
+                    channel="0",
+                    text=message_id,
+                    timestamp=base + timedelta(minutes=offset),
+                )
+            )
+
+        await store._execute(
+            """
+            INSERT INTO messages(
+                message_id, protocol, gateway_id, direction, timestamp,
+                sender, receiver, channel, text, data
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "invalid-json",
+                "meshtastic",
+                "gateway-1",
+                "rx",
+                "2026-07-29T12:04:00+00:00",
+                None,
+                None,
+                "0",
+                "not exposed",
+                "{",
+            ),
+        )
+        invalid_shape = MessageRecord(
+            message_id="invalid-shape",
+            protocol="meshtastic",
+            gateway_id="gateway-1",
+            sender=None,
+            receiver=None,
+            channel="0",
+            text="not exposed",
+            timestamp=base + timedelta(minutes=3),
+        ).as_dict()
+        invalid_shape["raw"] = ["not", "a", "mapping"]
+        await store._execute(
+            """
+            INSERT INTO messages(
+                message_id, protocol, gateway_id, direction, timestamp,
+                sender, receiver, channel, text, data
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "invalid-shape",
+                "meshtastic",
+                "gateway-1",
+                "rx",
+                "2026-07-29T12:03:00+00:00",
+                None,
+                None,
+                "0",
+                "not exposed",
+                json.dumps(invalid_shape),
+            ),
+        )
+        invalid_hops = MessageRecord(
+            message_id="invalid-hops",
+            protocol="meshtastic",
+            gateway_id="gateway-1",
+            sender=None,
+            receiver=None,
+            channel="0",
+            text="not exposed",
+            timestamp=base + timedelta(minutes=3, seconds=30),
+        ).as_dict()
+        invalid_hops["hops"] = float("inf")
+        await store._execute(
+            """
+            INSERT INTO messages(
+                message_id, protocol, gateway_id, direction, timestamp,
+                sender, receiver, channel, text, data
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "invalid-hops",
+                "meshtastic",
+                "gateway-1",
+                "rx",
+                "2026-07-29T12:03:30+00:00",
+                None,
+                None,
+                "0",
+                "not exposed",
+                json.dumps(invalid_hops),
+            ),
+        )
+        mismatched_message = MessageRecord(
+            message_id="payload-message-id",
+            protocol="meshtastic",
+            gateway_id="gateway-1",
+            sender=None,
+            receiver=None,
+            channel="0",
+            text="not exposed",
+            timestamp=base + timedelta(minutes=2),
+        ).as_dict()
+        await store._execute(
+            """
+            INSERT INTO messages(
+                message_id, protocol, gateway_id, direction, timestamp,
+                sender, receiver, channel, text, data
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "row-message-id",
+                "meshtastic",
+                "gateway-1",
+                "rx",
+                "2026-07-29T12:02:00+00:00",
+                None,
+                None,
+                "0",
+                "not exposed",
+                json.dumps(mismatched_message),
+            ),
+        )
+
+        snapshot = await store.async_load_snapshot(recent_limit=2)
+        recent = await store.async_recent_messages(limit=2)
+
+        assert set(snapshot.nodes) == {"meshtastic:valid"}
+        assert [message.message_id for message in snapshot.recent_messages] == [
+            "valid-old",
+            "valid-new",
+        ]
+        assert [message.message_id for message in recent] == [
+            "valid-old",
+            "valid-new",
+        ]
+        await store.async_close()
+
+    asyncio.run(run())
+
+
+def test_pending_outbox_filters_before_limit_and_quarantines_poison(
+    tmp_path,
+) -> None:
+    """Historical and malformed rows cannot hide a valid queued message."""
+
+    async def run() -> None:
+        store = MeshStore(tmp_path / "meshnet.sqlite3")
+        await store.async_open()
+        base = datetime(2026, 7, 29, 12, tzinfo=UTC)
+        for index in range(100):
+            await store.async_add_message(
+                MessageRecord(
+                    message_id=f"sent-{index:03d}",
+                    protocol="meshtastic",
+                    gateway_id="gateway-1",
+                    sender="homeassistant",
+                    receiver=None,
+                    channel="0",
+                    text="sent",
+                    timestamp=base + timedelta(seconds=index),
+                    direction="tx",
+                    raw={"status": "sent"},
+                )
+            )
+        await store._execute(
+            """
+            INSERT INTO messages(
+                message_id, protocol, gateway_id, direction, timestamp,
+                sender, receiver, channel, text, data
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "malformed-json",
+                "unknown",
+                "queued",
+                "tx",
+                "2026-07-29T12:01:40+00:00",
+                "homeassistant",
+                None,
+                "0",
+                "not exposed",
+                "{",
+            ),
+        )
+        poisoned = MessageRecord(
+            message_id="poisoned-route",
+            protocol="unknown",
+            gateway_id="queued",
+            sender="homeassistant",
+            receiver=None,
+            channel="0",
+            text="not exposed",
+            timestamp=base + timedelta(seconds=101),
+            direction="tx",
+            raw={"status": "queued", "gateway_id": ["not", "hashable"]},
+        )
+        await store.async_add_message(poisoned)
+        poisoned_timestamp = MessageRecord(
+            message_id="poisoned-timestamp",
+            protocol="unknown",
+            gateway_id="queued",
+            sender="homeassistant",
+            receiver=None,
+            channel="0",
+            text="not exposed",
+            timestamp=base + timedelta(seconds=102),
+            direction="tx",
+            raw={"status": "queued"},
+        )
+        await store.async_add_message(poisoned_timestamp)
+        mismatched_timestamp_data = poisoned_timestamp.as_dict()
+        mismatched_timestamp_data["timestamp"] = (
+            base + timedelta(seconds=999)
+        ).isoformat()
+        await store._execute(
+            "UPDATE messages SET data = ? WHERE message_id = ?",
+            (json.dumps(mismatched_timestamp_data), "poisoned-timestamp"),
+        )
+        await store.async_add_message(
+            MessageRecord(
+                message_id="deliverable",
+                protocol="unknown",
+                gateway_id="queued",
+                sender="homeassistant",
+                receiver=None,
+                channel="0",
+                text="deliverable",
+                timestamp=base + timedelta(seconds=103),
+                direction="tx",
+                raw={"status": "queued"},
+            )
+        )
+
+        pending = await store.async_pending_outbox(limit=1)
+
+        assert [message.message_id for message in pending] == ["deliverable"]
+        for message_id in ("poisoned-route", "poisoned-timestamp"):
+            poisoned_row = await store._fetchone(
+                "SELECT data FROM messages WHERE message_id = ?", (message_id,)
+            )
+            assert poisoned_row is not None
+            quarantined = json.loads(poisoned_row["data"])
+            assert quarantined["raw"]["status"] == "blocked"
+            assert quarantined["raw"]["last_error_code"] == "invalid_message"
+        diagnostics = await store.async_diagnostics()
+        assert diagnostics["message_direction_counts"]["queued"] == 1
+        await store.async_close()
+
+    asyncio.run(run())
 
 
 def test_close_waits_for_active_database_operation(tmp_path) -> None:

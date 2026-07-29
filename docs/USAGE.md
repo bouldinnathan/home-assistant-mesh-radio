@@ -146,9 +146,15 @@ For Meshtastic, `target_node` may be a full node ID such as `!12345678`, an
 integer node number, or an exact unique short/long name already present in the
 local Bluetooth node cache. Quote a numeric short name in YAML. Name matching
 is case-insensitive but never fuzzy; an unknown or duplicated name is rejected.
-When more than one gateway is configured, supply the matching `gateway_id` for
-a manually entered name. The sidebar dropdown remains safer because it uses the
-cached canonical ID and can select the node's last connected gateway.
+Identity-shaped text is resolved as an identity before names, so a node cannot
+capture a message by advertising an ID, MAC, or public key as its name. The
+sidebar dropdown remains safest because it uses the cached canonical identity.
+
+Direct messages require a target; every other message type rejects one. Message
+text is limited to 237 UTF-8 bytes, channel indexes to `0`–`7`, and priority to
+`normal`, `high`, or `emergency`. If supplied, `gateway_id` must exactly match a
+configured gateway using the target protocol. MeshNet queues for a matching
+offline radio instead of sending through a connected radio of another protocol.
 
 Schedule:
 
@@ -163,6 +169,7 @@ data:
 ```
 
 Scheduled timestamps must include a timezone.
+The complete message envelope is validated before its timer is registered.
 Pending schedules are in memory and are canceled when the MeshNet entry unloads
 or Home Assistant restarts.
 

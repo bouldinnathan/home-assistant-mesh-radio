@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
@@ -25,8 +26,21 @@ from .const import (
     MAX_PANEL_GATEWAYS,
     MAX_PANEL_NODES,
     MESSAGE_TYPE_BROADCAST,
+    MESSAGE_TYPE_DIRECT,
+    MESSAGE_TYPE_EMERGENCY,
+    MESSAGE_TYPE_GROUP,
+    PROTOCOL_MESHTASTIC,
 )
-from .coordinator import MeshNetCoordinator
+from .coordinator import MeshNetCoordinator, message_api_dict
+from .gateway_settings import (
+    GatewaySettingsError,
+    GatewaySettingsValidationError,
+    validate_changes_payload,
+)
+from .node_identity import (
+    meshtastic_identity_is_valid,
+    meshtastic_unsafe_identity_keys,
+)
 from .panel_telemetry import (
     PANEL_ERROR_CATEGORIES,
     PANEL_ERROR_CODES,
@@ -35,6 +49,7 @@ from .panel_telemetry import (
     PanelTelemetry,
     classify_exception,
 )
+from .websocket_redaction import send_sensitive_result
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -53,7 +68,16 @@ _PANEL_PROVENANCE_KEYS = (
     "identity_collision_group_count",
     "identity_collision_node_count",
 )
+_OPTIONAL_PANEL_PROVENANCE_KEYS = (
+    "retained_node_record_count",
+    "collapsed_alias_record_count",
+    "resolved_identity_group_count",
+    "unresolved_identity_group_count",
+    "unresolved_identity_node_count",
+    "invalid_identity_record_count",
+)
 _MAX_REPORTED_COUNT = 1_000_000
+_MAX_FAVORITE_ALIASES_PER_NODE = 16
 
 
 def _bounded_positive_int(value: Any) -> int:
@@ -118,6 +142,176 @@ async def async_register_websocket_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, websocket_messages)
     websocket_api.async_register_command(hass, websocket_send_message)
     websocket_api.async_register_command(hass, websocket_panel_log)
+    websocket_api.async_register_command(hass, websocket_settings_get)
+    websocket_api.async_register_command(hass, websocket_settings_preview)
+    websocket_api.async_register_command(hass, websocket_settings_apply)
+
+
+_GATEWAY_ID = vol.All(str, vol.Length(min=1, max=128))
+_SETTINGS_REVISION = vol.Match(r"^[0-9a-f]{64}$")
+_PREVIEW_ID = vol.All(str, vol.Length(min=32, max=128))
+_MESSAGE_TYPES = (
+    MESSAGE_TYPE_DIRECT,
+    MESSAGE_TYPE_GROUP,
+    MESSAGE_TYPE_BROADCAST,
+    MESSAGE_TYPE_EMERGENCY,
+)
+_MESSAGE_PRIORITIES = ("normal", "high", "emergency")
+_SETTINGS_PREVIEW_KEYS = frozenset(
+    {"id", "type", ATTR_GATEWAY_ID, "revision", "changes"}
+)
+_SETTINGS_PREVIEW_ENVELOPE = vol.All(
+    # Secret replacements live below caller-selected setting paths, which are
+    # not part of Home Assistant's generic websocket redaction-key list.  Keep
+    # decorator validation deliberately permissive so a malformed envelope is
+    # never rendered (with its secret) by HA's generic voluptuous error logger.
+    # The admin-only handler performs the complete strict validation below and
+    # returns fixed error text.
+    vol.Schema(
+        {vol.Required("type"): "meshnet/settings/preview"},
+        extra=vol.ALLOW_EXTRA,
+    )
+)
+
+
+def _validated_settings_preview_message(
+    msg: Mapping[str, Any],
+) -> tuple[str, str, dict[str, Any]]:
+    """Strictly validate a preview after authorization without echoing it."""
+    try:
+        if set(msg) != _SETTINGS_PREVIEW_KEYS:
+            raise ValueError
+        gateway_id = msg.get(ATTR_GATEWAY_ID)
+        revision = msg.get("revision")
+        if not isinstance(gateway_id, str) or not 1 <= len(gateway_id) <= 128:
+            raise ValueError
+        if not isinstance(revision, str) or re.fullmatch(
+            r"[0-9a-f]{64}", revision
+        ) is None:
+            raise ValueError
+        changes = validate_changes_payload(msg.get("changes"))
+    except (TypeError, ValueError):
+        raise GatewaySettingsValidationError from None
+    return gateway_id, revision, changes
+
+
+def _send_settings_error(
+    connection: websocket_api.ActiveConnection,
+    message_id: int,
+    error: GatewaySettingsError,
+) -> None:
+    """Return only stable settings errors, never provider exception text."""
+    connection.send_error(message_id, error.code, error.public_message)
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "meshnet/settings/get",
+        vol.Optional(ATTR_GATEWAY_ID): _GATEWAY_ID,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_settings_get(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Return gateway choices and one live, bounded settings schema."""
+    coordinator = _get_coordinator(hass)
+
+    async def get_settings() -> None:
+        result = await coordinator.async_gateway_settings_get(
+            msg.get(ATTR_GATEWAY_ID)
+        )
+        send_sensitive_result(connection, msg["id"], result)
+
+    try:
+        await _async_panel_operation(coordinator, "settings_get", get_settings)
+    except GatewaySettingsError as err:
+        _send_settings_error(connection, msg["id"], err)
+    except Exception:
+        connection.send_error(
+            msg["id"],
+            "settings_error",
+            "MeshNet could not load gateway settings",
+        )
+
+
+@websocket_api.websocket_command(_SETTINGS_PREVIEW_ENVELOPE)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_settings_preview(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Create a server-side diff for validated typed changes."""
+    coordinator = _get_coordinator(hass)
+
+    async def preview_settings() -> None:
+        gateway_id, revision, changes = _validated_settings_preview_message(msg)
+        result = await coordinator.async_gateway_settings_preview(
+            gateway_id=gateway_id,
+            revision=revision,
+            changes=changes,
+        )
+        send_sensitive_result(connection, msg["id"], result)
+
+    try:
+        await _async_panel_operation(
+            coordinator, "settings_preview", preview_settings
+        )
+    except GatewaySettingsError as err:
+        _send_settings_error(connection, msg["id"], err)
+    except Exception:
+        connection.send_error(
+            msg["id"],
+            "settings_error",
+            "MeshNet could not preview gateway settings",
+        )
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "meshnet/settings/apply",
+        vol.Required(ATTR_GATEWAY_ID): _GATEWAY_ID,
+        vol.Required("revision"): _SETTINGS_REVISION,
+        vol.Required("preview_id"): _PREVIEW_ID,
+        vol.Optional("confirm_critical", default=False): bool,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_settings_apply(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Consume and apply one unchanged, single-use settings preview."""
+    coordinator = _get_coordinator(hass)
+
+    async def apply_settings() -> None:
+        result = await coordinator.async_gateway_settings_apply(
+            gateway_id=msg[ATTR_GATEWAY_ID],
+            revision=msg["revision"],
+            preview_id=msg["preview_id"],
+            confirm_critical=msg["confirm_critical"],
+        )
+        send_sensitive_result(connection, msg["id"], result)
+
+    try:
+        await _async_panel_operation(
+            coordinator, "settings_apply", apply_settings
+        )
+    except GatewaySettingsError as err:
+        _send_settings_error(connection, msg["id"], err)
+    except Exception:
+        connection.send_error(
+            msg["id"],
+            "settings_error",
+            "MeshNet could not apply gateway settings",
+        )
 
 
 @websocket_api.websocket_command(
@@ -136,11 +330,22 @@ async def websocket_snapshot(
     coordinator = _get_coordinator(hass)
 
     async def send_snapshot() -> None:
-        connection.send_result(
-            msg["id"], _snapshot_with_panel_metadata(hass, coordinator)
+        send_sensitive_result(
+            connection,
+            msg["id"],
+            _snapshot_with_panel_metadata(hass, coordinator),
         )
 
-    await _async_panel_operation(coordinator, "snapshot", send_snapshot)
+    try:
+        await _async_panel_operation(coordinator, "snapshot", send_snapshot)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        connection.send_error(
+            msg["id"],
+            "snapshot_failed",
+            "MeshNet could not load the panel snapshot",
+        )
 
 
 @websocket_api.websocket_command(
@@ -161,22 +366,39 @@ async def websocket_messages(
 
     async def send_messages() -> None:
         messages = await coordinator.store.async_recent_messages(msg["limit"])
-        connection.send_result(
-            msg["id"], [message.as_dict() for message in messages]
+        send_sensitive_result(
+            connection,
+            msg["id"],
+            [message_api_dict(message) for message in messages],
         )
 
-    await _async_panel_operation(coordinator, "messages", send_messages)
+    try:
+        await _async_panel_operation(coordinator, "messages", send_messages)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        connection.send_error(
+            msg["id"],
+            "messages_failed",
+            "MeshNet could not load message history",
+        )
 
 
 @websocket_api.websocket_command(
     {
         vol.Required("type"): "meshnet/send_message",
         vol.Required(ATTR_MESSAGE): str,
-        vol.Optional(ATTR_TARGET_NODE): str,
-        vol.Optional(ATTR_GATEWAY_ID): str,
-        vol.Optional(ATTR_CHANNEL): str,
-        vol.Optional(ATTR_PRIORITY, default="normal"): str,
-        vol.Optional(ATTR_MESSAGE_TYPE, default=MESSAGE_TYPE_BROADCAST): str,
+        vol.Optional(ATTR_TARGET_NODE): vol.All(
+            str, vol.Length(min=1, max=128)
+        ),
+        vol.Optional(ATTR_GATEWAY_ID): _GATEWAY_ID,
+        vol.Optional(ATTR_CHANNEL): vol.Any(str, int, float),
+        vol.Optional(ATTR_PRIORITY, default="normal"): vol.In(
+            _MESSAGE_PRIORITIES
+        ),
+        vol.Optional(
+            ATTR_MESSAGE_TYPE, default=MESSAGE_TYPE_BROADCAST
+        ): vol.In(_MESSAGE_TYPES),
     }
 )
 @websocket_api.require_admin
@@ -198,9 +420,20 @@ async def websocket_send_message(
             message_type=msg.get(ATTR_MESSAGE_TYPE, MESSAGE_TYPE_BROADCAST),
             gateway_id=msg.get(ATTR_GATEWAY_ID),
         )
-        connection.send_result(msg["id"], {"message_id": message_id})
+        send_sensitive_result(
+            connection, msg["id"], {"message_id": message_id}
+        )
 
-    await _async_panel_operation(coordinator, "send_message", send_message)
+    try:
+        await _async_panel_operation(coordinator, "send_message", send_message)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        connection.send_error(
+            msg["id"],
+            "send_failed",
+            "MeshNet could not submit the message",
+        )
 
 
 @websocket_api.websocket_command(
@@ -293,6 +526,12 @@ def _snapshot_with_panel_metadata(
         hass,
         coordinator.entry.entry_id,
         snapshot.get("nodes", {}),
+        node_aliases={
+            node_key: coordinator.node_alias_keys(node_key)
+            for node_key in snapshot.get("nodes", {})
+        }
+        if callable(getattr(coordinator, "node_alias_keys", None))
+        else None,
         telemetry=telemetry,
     )
 
@@ -305,7 +544,7 @@ def _snapshot_with_panel_metadata(
     panel_metadata: dict[str, Any] = {
         "favorite_label_configured": favorite_label_configured,
         "last_snapshot_generated_at": datetime.now(UTC).isoformat(),
-        "projection_schema_version": 1,
+        "projection_schema_version": 2,
     }
     provenance_provider = getattr(coordinator, "panel_node_provenance", None)
     if callable(provenance_provider):
@@ -338,11 +577,19 @@ def _snapshot_with_panel_metadata(
 def _panel_snapshot(coordinator: MeshNetCoordinator) -> dict[str, Any]:
     """Project only fields used by the panel, excluding raw provider state."""
     source = coordinator.snapshot
-    node_items = islice(source.nodes.items(), MAX_PANEL_NODES)
+    node_items = list(islice(source.nodes.items(), MAX_PANEL_NODES))
+    unsafe_node_keys = getattr(
+        coordinator, "_unsafe_meshtastic_node_keys", None
+    )
+    if unsafe_node_keys is None:
+        unsafe_node_keys = meshtastic_unsafe_identity_keys(dict(node_items))
     gateway_items = islice(source.gateways.items(), MAX_PANEL_GATEWAYS)
     return {
         "nodes": {
-            node_key: _panel_node(node)
+            node_key: _panel_node(
+                node,
+                identity_valid=node_key not in unsafe_node_keys,
+            )
             for node_key, node in node_items
         },
         "gateways": {
@@ -365,7 +612,10 @@ def _panel_snapshot(coordinator: MeshNetCoordinator) -> dict[str, Any]:
                 "raw": {
                     "status": status,
                 }
-                if (status := message.raw.get("status")) in {"queued", "sent"}
+                if isinstance(
+                    status := message.raw.get("status"), str
+                )
+                and status in {"blocked", "queued", "sent"}
                 else {},
             }
             for message in source.recent_messages[-100:]
@@ -375,7 +625,7 @@ def _panel_snapshot(coordinator: MeshNetCoordinator) -> dict[str, Any]:
     }
 
 
-def _panel_node(node: Any) -> dict[str, Any]:
+def _panel_node(node: Any, *, identity_valid: bool) -> dict[str, Any]:
     """Return the bounded node shape required by the sidebar."""
     connectivity = {
         key: node.connectivity[key]
@@ -395,6 +645,12 @@ def _panel_node(node: Any) -> dict[str, Any]:
     return {
         "node_key": node.node_key,
         "protocol": node.protocol,
+        "identity_valid": (
+            identity_valid
+            and meshtastic_identity_is_valid(node.node_key, node)
+            if str(node.protocol).strip().casefold() == PROTOCOL_MESHTASTIC
+            else True
+        ),
         "node_id": node.node_id,
         "mac": node.mac,
         "public_key": node.public_key,
@@ -429,6 +685,17 @@ def _safe_panel_provenance(value: Any) -> dict[str, int] | None:
         ):
             return None
         projected[key] = count
+    for key in _OPTIONAL_PANEL_PROVENANCE_KEYS:
+        if key not in value:
+            continue
+        count = value.get(key)
+        if (
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or not 0 <= count <= _MAX_REPORTED_COUNT
+        ):
+            return None
+        projected[key] = count
     return projected
 
 
@@ -437,6 +704,7 @@ def _favorite_nodes(
     config_entry_id: str,
     nodes: Any,
     *,
+    node_aliases: Mapping[str, Any] | None = None,
     telemetry: PanelTelemetry | None = None,
 ) -> tuple[bool, set[str]]:
     """Read favorite flags from one user-owned Home Assistant device label."""
@@ -490,16 +758,31 @@ def _favorite_nodes(
     for node_key in nodes:
         if not isinstance(node_key, str):
             continue
+        candidate_keys = [node_key]
+        if isinstance(node_aliases, Mapping):
+            aliases = node_aliases.get(node_key)
+            if isinstance(aliases, (list, tuple, set, frozenset)):
+                candidate_keys.extend(
+                    alias
+                    for alias in islice(
+                        aliases, _MAX_FAVORITE_ALIASES_PER_NODE
+                    )
+                    if isinstance(alias, str)
+                )
+        candidate_keys = list(dict.fromkeys(candidate_keys))
         try:
-            device = _get_node_device(
-                device_registry,
-                config_entry_id=config_entry_id,
-                node_key=node_key,
-            )
-            is_favorite = (
+            is_favorite = any(
                 device is not None
                 and favorite_label.label_id
                 in (getattr(device, "labels", ()) or ())
+                for device in (
+                    _get_node_device(
+                        device_registry,
+                        config_entry_id=config_entry_id,
+                        node_key=candidate_key,
+                    )
+                    for candidate_key in candidate_keys
+                )
             )
         except Exception as err:
             lookup_failures += 1

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from types import SimpleNamespace
 from typing import Any
 
@@ -269,6 +270,385 @@ def test_configuration_deadline_preempts_individual_gatt_read_timeout() -> None:
     asyncio.run(run())
 
 
+def test_want_config_records_feed_privacy_safe_settings_snapshot() -> None:
+    """Use the pinned SDK protos to exercise the real FromRadio field names."""
+    pytest.importorskip("meshtastic")
+    from meshtastic.protobuf import mesh_pb2
+
+    from custom_components.meshnet.aiomeshtastic.client import (
+        MeshtasticBluetoothClient,
+    )
+
+    client = MeshtasticBluetoothClient(
+        address="AA:BB:CC:DD:EE:FF",
+        device_provider=lambda: None,
+    )
+    client._settings.begin_refresh()
+    client._config_id = 7412
+
+    my_info = mesh_pb2.FromRadio()
+    my_info.my_info.my_node_num = 123
+    client._handle_from_radio(my_info.SerializeToString())
+
+    network = mesh_pb2.FromRadio()
+    network.config.network.wifi_ssid = "private-wifi-name"
+    network.config.network.wifi_psk = "never-project-wifi-password"
+    client._handle_from_radio(network.SerializeToString())
+
+    module = mesh_pb2.FromRadio()
+    module.moduleConfig.mqtt.enabled = True
+    module.moduleConfig.mqtt.username = "never-project-mqtt-user"
+    module.moduleConfig.mqtt.password = "never-project-mqtt-password"
+    client._handle_from_radio(module.SerializeToString())
+
+    channel = mesh_pb2.FromRadio()
+    channel.channel.index = 0
+    channel.channel.settings.name = "Private Channel"
+    channel.channel.settings.psk = b"never-project-channel-psk"
+    client._handle_from_radio(channel.SerializeToString())
+
+    owner = mesh_pb2.FromRadio()
+    owner.node_info.num = 123
+    owner.node_info.user.long_name = "Local Owner"
+    owner.node_info.user.short_name = "HOME"
+    client._handle_from_radio(owner.SerializeToString())
+
+    complete = mesh_pb2.FromRadio()
+    complete.config_complete_id = 7412
+    client._handle_from_radio(complete.SerializeToString())
+
+    snapshot = asyncio.run(client.async_get_settings_snapshot())
+    rendered = repr(snapshot)
+    assert snapshot["available"] is True
+    assert snapshot["complete"] is True
+    assert "never-project-wifi-password" not in rendered
+    assert "never-project-mqtt-user" not in rendered
+    assert "never-project-mqtt-password" not in rendered
+    assert "never-project-channel-psk" not in rendered
+
+
+def _active_settings_client(
+    *,
+    behavior: str,
+    admin_response_timeout: float = 0.03,
+) -> tuple[Any, Any]:
+    """Build an active local client with a protocol-aware fake radio."""
+    pytest.importorskip("meshtastic")
+    from meshtastic.protobuf import admin_pb2, mesh_pb2, portnums_pb2
+
+    from custom_components.meshnet.aiomeshtastic.client import (
+        MeshtasticBluetoothClient,
+    )
+
+    client = MeshtasticBluetoothClient(
+        address="AA:BB:CC:DD:EE:FF",
+        device_provider=lambda: None,
+        admin_response_timeout=admin_response_timeout,
+    )
+
+    class FakeSettingsConnection:
+        is_connected = True
+        owns_endpoint = True
+
+        def __init__(self) -> None:
+            self.admin_packets: list[Any] = []
+            self.operations: list[str] = []
+            self.owner: Any | None = None
+            self.bluetooth: Any | None = None
+            self.reconnect_tasks: set[asyncio.Task[None]] = set()
+
+        @staticmethod
+        def _selected(message: Any) -> str | None:
+            for oneof in message.DESCRIPTOR.oneofs:
+                selected = message.WhichOneof(oneof.name)
+                if selected is not None:
+                    return selected
+            return None
+
+        def _routing_response(
+            self,
+            packet: Any,
+            *,
+            error: int = 0,
+            request_id: int | None = None,
+            source: int = 123,
+            empty: bool = False,
+        ) -> None:
+            routing = mesh_pb2.Routing()
+            if not empty:
+                routing.error_reason = error
+            record = mesh_pb2.FromRadio()
+            setattr(record.packet, "from", source)
+            record.packet.channel = packet.channel
+            record.packet.decoded.portnum = portnums_pb2.ROUTING_APP
+            record.packet.decoded.request_id = (
+                int(packet.id) if request_id is None else request_id
+            )
+            record.packet.decoded.payload = routing.SerializeToString()
+            client._handle_from_radio(record.SerializeToString())
+
+        async def _reconnect_with_owner(self) -> None:
+            await asyncio.sleep(0)
+            client._connection_generation += 1
+            client._settings.begin_refresh()
+            record = mesh_pb2.FromRadio()
+            record.node_info.num = 123
+            if self.owner is not None:
+                record.node_info.user.CopyFrom(self.owner)
+            client._handle_from_radio(record.SerializeToString())
+            if self.bluetooth is not None:
+                record = mesh_pb2.FromRadio()
+                record.config.bluetooth.CopyFrom(self.bluetooth)
+                client._handle_from_radio(record.SerializeToString())
+            client._config_id = 9001
+            complete = mesh_pb2.FromRadio()
+            complete.config_complete_id = 9001
+            client._handle_from_radio(complete.SerializeToString())
+
+        async def async_send(
+            self,
+            payload: bytes,
+            *,
+            force_read: bool = False,
+        ) -> None:
+            assert force_read is False
+            to_radio = mesh_pb2.ToRadio()
+            to_radio.ParseFromString(payload)
+            assert to_radio.HasField("packet")
+            packet = to_radio.packet
+            assert getattr(packet, "from") == 0
+            assert packet.to == 123
+            assert packet.decoded.portnum == portnums_pb2.ADMIN_APP
+            assert packet.decoded.want_response is True
+            assert packet.want_ack is True
+            assert packet.pki_encrypted is True
+
+            admin = admin_pb2.AdminMessage()
+            admin.ParseFromString(bytes(packet.decoded.payload))
+            assert bytes(admin.session_passkey) == b""
+            operation = self._selected(admin)
+            assert operation is not None
+            self.admin_packets.append(packet)
+            self.operations.append(operation)
+            if operation == "set_owner":
+                self.owner = type(admin.set_owner)()
+                self.owner.CopyFrom(admin.set_owner)
+            elif operation == "set_config":
+                section = self._selected(admin.set_config)
+                if section == "bluetooth":
+                    self.bluetooth = type(admin.set_config.bluetooth)()
+                    self.bluetooth.CopyFrom(admin.set_config.bluetooth)
+            if behavior == "secret_logging":
+                logging.getLogger("meshtastic.fake").debug(
+                    "simulated SDK protobuf fixed_pin: 654321"
+                )
+
+            if behavior == "timeout_begin" and operation == "begin_edit_settings":
+                return
+            if behavior == "nak_set" and operation == "set_owner":
+                error_field = mesh_pb2.Routing.DESCRIPTOR.fields_by_name[
+                    "error_reason"
+                ]
+                error = next(
+                    value.number
+                    for value in error_field.enum_type.values
+                    if value.number != 0
+                )
+                self._routing_response(packet, error=error)
+                return
+            if operation == "begin_edit_settings":
+                # None of these records may satisfy the exact pending request.
+                self._routing_response(packet, request_id=int(packet.id) + 1)
+                self._routing_response(packet, source=321)
+                self._routing_response(packet, empty=True)
+            if operation == "commit_edit_settings":
+                task = asyncio.create_task(self._reconnect_with_owner())
+                self.reconnect_tasks.add(task)
+                task.add_done_callback(self.reconnect_tasks.discard)
+                if behavior == "lost_commit_ack":
+                    return
+            self._routing_response(packet)
+
+    connection = FakeSettingsConnection()
+    client._connection = connection  # type: ignore[assignment]
+    client._connected = True
+    client._my_node_num = 123
+    client._connection_generation = 1
+    client._settings_complete_generation = 1
+    client._settings_complete_sequence = 1
+    client._settings.begin_refresh()
+    owner = mesh_pb2.FromRadio()
+    owner.node_info.num = 123
+    owner.node_info.user.long_name = "Original Owner"
+    owner.node_info.user.short_name = "OLD"
+    client._settings.capture_from_radio(owner, my_node_num=123)
+    bluetooth = mesh_pb2.FromRadio()
+    bluetooth.config.bluetooth.enabled = True
+    bluetooth.config.bluetooth.fixed_pin = 123456
+    client._settings.capture_from_radio(bluetooth, my_node_num=123)
+    client._settings.mark_complete()
+    return client, connection
+
+
+@pytest.mark.parametrize("behavior", ["ack", "lost_commit_ack"])
+def test_local_admin_write_is_one_shot_and_requires_reconnect_readback(
+    behavior: str,
+) -> None:
+    async def run() -> None:
+        client, connection = _active_settings_client(behavior=behavior)
+
+        result = await client.async_apply_settings_plan(
+            {"owner.short_name": "HOME"}
+        )
+
+        assert result == {
+            "verified": ["owner.short_name"],
+            "reconnect_required": True,
+            "warning_codes": [],
+        }
+        assert connection.operations == [
+            "begin_edit_settings",
+            "set_owner",
+            "commit_edit_settings",
+        ]
+        assert len({packet.id for packet in connection.admin_packets}) == 3
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("behavior", ["timeout_begin", "nak_set"])
+def test_local_admin_failure_stops_without_retry_or_commit(behavior: str) -> None:
+    async def run() -> None:
+        client, connection = _active_settings_client(
+            behavior=behavior,
+            admin_response_timeout=0.01,
+        )
+
+        with pytest.raises(MeshtasticConfigurationError):
+            await client.async_apply_settings_plan(
+                {"owner.short_name": "HOME"}
+            )
+
+        expected = (
+            ["begin_edit_settings"]
+            if behavior == "timeout_begin"
+            else ["begin_edit_settings", "set_owner"]
+        )
+        assert connection.operations == expected
+        assert "commit_edit_settings" not in connection.operations
+
+    asyncio.run(run())
+
+
+def test_oversized_admin_payload_is_rejected_before_transport_write() -> None:
+    pytest.importorskip("meshtastic")
+    from meshtastic.protobuf import admin_pb2
+
+    async def run() -> None:
+        client, connection = _active_settings_client(behavior="ack")
+        message = admin_pb2.AdminMessage()
+        message.set_owner.public_key = b"x" * 512
+
+        with pytest.raises(MeshtasticConfigurationError, match="payload limit"):
+            async with client._send_lock:
+                await client._async_send_admin_locked(
+                    message,
+                    connection=connection,
+                )
+
+        assert connection.operations == []
+
+    asyncio.run(run())
+
+
+def test_admin_app_payload_is_never_published() -> None:
+    pytest.importorskip("meshtastic")
+    from meshtastic.protobuf import admin_pb2, mesh_pb2, portnums_pb2
+
+    from custom_components.meshnet.aiomeshtastic.client import (
+        MeshtasticBluetoothClient,
+    )
+
+    client = MeshtasticBluetoothClient(
+        address="AA:BB:CC:DD:EE:FF",
+        device_provider=lambda: None,
+    )
+    published: list[dict[str, Any]] = []
+    client.add_packet_callback(published.append)
+    admin = admin_pb2.AdminMessage()
+    admin.session_passkey = b"must-never-leave-the-client"
+    record = mesh_pb2.FromRadio()
+    record.packet.decoded.portnum = portnums_pb2.ADMIN_APP
+    record.packet.decoded.payload = admin.SerializeToString()
+
+    client._handle_from_radio(record.SerializeToString())
+
+    assert published == []
+    assert "must-never-leave-the-client" not in repr(client.diagnostic_snapshot())
+
+
+def test_disconnect_fails_and_clears_admin_response_waiters() -> None:
+    pytest.importorskip("meshtastic")
+    from custom_components.meshnet.aiomeshtastic.client import (
+        _PendingAdminResponse,
+    )
+
+    async def run() -> None:
+        client, _connection = _active_settings_client(behavior="ack")
+        future = asyncio.get_running_loop().create_future()
+        client._pending_admin_responses[77] = _PendingAdminResponse(
+            future=future,
+            source=123,
+            channel=0,
+        )
+        client._internal_admin_request_ids.append(77)
+
+        client._fail_pending_admin_responses()
+
+        with pytest.raises(MeshtasticConnectionError, match="disconnected"):
+            await future
+        assert client._pending_admin_responses == {}
+        assert list(client._internal_admin_request_ids) == []
+
+    asyncio.run(run())
+
+
+def test_secret_admin_write_is_suppressed_and_never_returned(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def run() -> None:
+        client, _connection = _active_settings_client(
+            behavior="secret_logging"
+        )
+        caplog.set_level(10)
+
+        result = await client.async_apply_settings_plan(
+            {
+                "config.bluetooth.fixed_pin": {
+                    "operation": "replace",
+                    "value": "654321",
+                }
+            }
+        )
+        snapshot = await client.async_get_settings_snapshot()
+        fields = {
+            field["path"]: field
+            for category in snapshot["categories"]
+            for field in category["fields"]
+        }
+
+        assert result["verified"] == ["config.bluetooth.fixed_pin"]
+        assert fields["config.bluetooth.fixed_pin"]["writable"] is True
+        assert fields["config.bluetooth.fixed_pin"]["type"] == "secret"
+        assert fields["config.bluetooth.enabled"]["writable"] is False
+        assert "654321" not in caplog.text
+        assert "654321" not in repr(result)
+        assert "654321" not in repr(snapshot)
+        assert "654321" not in repr(client.diagnostic_snapshot())
+
+    asyncio.run(run())
+
+
 def test_write_backend_type_error_is_not_retried() -> None:
     class TypeErrorGattClient(_GattClient):
         def __init__(self) -> None:
@@ -510,8 +890,10 @@ def test_high_level_handshake_callbacks_send_and_stop() -> None:
             gateway_id="bluetooth-test",
         )
         assert normalized_node.mac == "aabbccddeeff"
-        assert normalized_node.node_key == "mac:aabbccddeeff"
-        assert client._resolve_destination(normalized_node.node_key) == 0x12345678
+        assert normalized_node.node_key.startswith("meshtastic-proof:")
+        assert normalized_node.mac == "aabbccddeeff"
+        with pytest.raises(ValueError, match="not a known Meshtastic node"):
+            client._resolve_destination(normalized_node.node_key)
         assert client._resolve_destination("meshtastic:305419896") == 0x12345678
         assert client._resolve_destination("meshtastic:!12345678") == 0x12345678
         assert client._resolve_destination("mac:aabbccddeeff") == 0x12345678
@@ -620,6 +1002,49 @@ def test_destination_resolution_accepts_only_unique_exact_cached_names() -> None
     }
     with pytest.raises(ValueError, match="node name is ambiguous"):
         client._resolve_destination("NODE")
+
+
+def test_node_cache_drops_user_identity_that_conflicts_with_envelope() -> None:
+    pytest.importorskip("meshtastic")
+
+    from custom_components.meshnet.aiomeshtastic.client import (
+        MeshtasticBluetoothClient,
+    )
+
+    client = MeshtasticBluetoothClient(
+        address="AA:BB:CC:DD:EE:FF",
+        device_provider=lambda: SimpleNamespace(),
+    )
+    client._merge_node(
+        0x11111111,
+        {
+            "num": 0x11111111,
+            "user": {
+                "id": "!22222222",
+                "longName": "Wrong node",
+                "macaddr": "22:22:22:22:22:22",
+            },
+        },
+    )
+
+    assert "user" not in client._nodes[0x11111111]
+    with pytest.raises(ValueError, match="not a known Meshtastic node"):
+        client._resolve_destination("Wrong node")
+    with pytest.raises(ValueError, match="unknown or ambiguous"):
+        client._resolve_destination("mac:222222222222")
+
+    client._merge_node(
+        0x11111111,
+        {
+            "user": {
+                "id": "!11111111",
+                "longName": "Right node",
+                "macaddr": "11:11:11:11:11:11",
+            }
+        },
+    )
+    assert client._resolve_destination("Right node") == 0x11111111
+    assert client._resolve_destination("mac:111111111111") == 0x11111111
 
 
 def test_cleanup_never_disconnects_while_session_io_owners_resist_cancellation() -> None:

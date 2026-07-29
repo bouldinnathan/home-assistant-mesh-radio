@@ -1105,6 +1105,15 @@ def test_ble_send_uses_async_transport_without_executor() -> None:
         assert client.status.packets_sent == 1
         assert statuses == [True, True]
         assert hass.executor_calls == 0
+        with pytest.raises(ValueError, match="validated canonical node ID"):
+            await client.async_send_message(
+                target_node="cached name",
+                message="must not reach provider resolution",
+                channel="2",
+                priority="normal",
+                message_type="direct",
+            )
+        assert len(transport.send_calls) == 1
         await client.async_stop()
 
     asyncio.run(run())

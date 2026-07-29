@@ -71,5 +71,11 @@ jobs:
           tests/test_clients.py
           tests/test_coordinator.py
           tests/test_diagnostics.py
+          tests/test_gateway_settings.py
+          tests/test_init.py
+          tests/test_meshcore_settings.py
+          tests/test_meshtastic_settings.py
+          tests/test_sensitive_logging.py
           tests/test_websocket_api.py
+          tests/test_websocket_redaction.py
       - run: python -m pip check

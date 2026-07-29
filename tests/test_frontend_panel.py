@@ -70,6 +70,799 @@ def test_panel_javascript_parses() -> None:
     )
 
 
+def test_gateway_settings_view_is_explicit_and_keeps_drafts_in_memory() -> None:
+    """Expose an admin editor without browser persistence or implicit writes."""
+    source = _source()
+
+    assert 'data-meshnet-view="settings"' in source
+    assert "Gateway settings" in source
+    assert "Administrator gateway controls" in source
+    assert 'type: "meshnet/settings/get"' in source
+    assert 'type: "meshnet/settings/preview"' in source
+    assert 'type: "meshnet/settings/apply"' in source
+    assert "Preview is required before Apply" in source
+    assert 'id="meshnet-settings-critical"' in source
+    assert "confirm_critical" in source
+    assert 'type="password" value=""' in source
+    assert 'autocomplete="new-password"' in source
+    assert "this._settingsDraft = Object.create(null)" in source
+    assert "Treat navigation away from the panel as abandoning the draft" in source
+    assert 'id="meshnet-settings-gateway"${busy ? " disabled" : ""}' in source
+    assert "localStorage" not in source
+    assert "sessionStorage" not in source
+
+
+def test_settings_schema_is_bounded_typed_and_scrubs_secret_values() -> None:
+    """Only the fixed settings contract reaches rendering or in-memory state."""
+    _run_panel_script(
+        r"""
+  const response = panel._validateSettingsResponse({
+    gateways: [{
+      gateway_id: "gateway-1",
+      name: "Living Room <radio>",
+      protocol: "meshtastic",
+      transport: "bluetooth",
+      connected: true,
+      writable: true,
+    }],
+    selected: {
+      schema_version: 1,
+      gateway_id: "gateway-1",
+      name: "Living Room <radio>",
+      protocol: "meshtastic",
+      transport: "bluetooth",
+      connected: true,
+      writable: true,
+      revision: "a".repeat(64),
+      fetched_at: "2026-07-29T12:00:00Z",
+      categories: [{
+        key: "radio",
+        label: "Radio & LoRa",
+        description: "Device-provided fields",
+        fields: [
+          {
+            path: "radio.enabled",
+            label: "Enabled",
+            type: "boolean",
+            value: true,
+            writable: true,
+            critical: false,
+            requires_reconnect: false,
+          },
+          {
+            path: "radio.power",
+            label: "Transmit power",
+            type: "integer",
+            value: 17,
+            min: 0,
+            max: 30,
+            step: 1,
+            unit: "dBm",
+            writable: true,
+            critical: true,
+            requires_reconnect: true,
+          },
+          {
+            path: "radio.region",
+            label: "Region",
+            type: "select",
+            value: "US",
+            options: [
+              { value: "US", label: "United States" },
+              { value: 7, label: "Typed numeric option" },
+            ],
+            writable: true,
+            critical: true,
+            requires_reconnect: true,
+          },
+          {
+            path: "security.key",
+            label: "Private key <never render>",
+            type: "secret",
+            value: "backend-must-not-expose-this",
+            configured: true,
+            allow_clear: true,
+            max_length: 64,
+            writable: true,
+            critical: true,
+            requires_reconnect: true,
+          },
+        ],
+      }],
+      warnings: ["Changing region can disconnect the radio."],
+    },
+  });
+  assert.equal(response.gateways[0].name, "Living Room <radio>");
+  assert.equal(response.selected.categories[0].fields[0].value, true);
+  assert.equal(response.selected.categories[0].fields[1].value, 17);
+  assert.equal(response.selected.categories[0].fields[2].options[1].value, 7);
+  const secret = response.selected.categories[0].fields[3];
+  assert.equal(secret.value, "");
+  assert.equal(secret.allow_clear, true);
+  assert.equal(secret.max_length, 64);
+  const html = panel._settingsField(secret, 3, response.selected);
+  assert.match(html, /type="password" value=""/);
+  assert.match(html, /Configured/);
+  assert.match(html, /Clear the configured secret/);
+  assert.deepEqual(panel._coerceSettingValue(secret, { operation: "clear" }), {
+    operation: "clear",
+  });
+  assert.doesNotMatch(html, /backend-must-not-expose-this/);
+  assert.doesNotMatch(html, /<never render>/);
+  assert.match(html, /&lt;never render&gt;/);
+
+  const duplicatePath = structuredClone({
+    schema_version: 1,
+    gateway_id: "gateway-1",
+    name: "Gateway",
+    protocol: "meshtastic",
+    transport: "bluetooth",
+    connected: true,
+    writable: true,
+    revision: "b".repeat(64),
+    fetched_at: "2026-07-29T12:00:00Z",
+    categories: [{
+      key: "bad",
+      label: "Bad",
+      fields: [
+        { path: "same", label: "One", type: "string", value: "", writable: true },
+        { path: "same", label: "Two", type: "string", value: "", writable: true },
+      ],
+    }],
+  });
+  assert.throws(
+    () => panel._sanitizeSettingsSnapshot(duplicatePath),
+    (error) => error.name === "PanelSchemaError" && error.code === "invalid_format",
+  );
+"""
+    )
+
+
+def test_settings_get_preview_and_confirmed_apply_use_exact_ws_contract() -> None:
+    """A typed draft must be previewed and critical changes confirmed once."""
+    _run_panel_script(
+        r"""
+  panel._safeRender = () => true;
+  panel.querySelectorAll = () => [];
+  const requests = [];
+  const snapshot = {
+    schema_version: 1,
+    gateway_id: "gateway-1",
+    name: "Test gateway",
+    protocol: "meshtastic",
+    transport: "bluetooth",
+    connected: true,
+    writable: true,
+    revision: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    fetched_at: "2026-07-29T12:00:00Z",
+    categories: [{
+      key: "radio",
+      label: "Radio",
+      fields: [
+        {
+          path: "radio.power",
+          label: "Transmit power",
+          type: "integer",
+          value: 17,
+          min: 0,
+          max: 30,
+          writable: true,
+          critical: false,
+          requires_reconnect: false,
+        },
+        {
+          path: "radio.enabled",
+          label: "Enabled",
+          type: "boolean",
+          value: true,
+          writable: true,
+          critical: false,
+          requires_reconnect: false,
+        },
+        {
+          path: "security.key",
+          label: "Channel key",
+          type: "secret",
+          value: "",
+          configured: true,
+          writable: true,
+          critical: true,
+          requires_reconnect: true,
+        },
+      ],
+    }],
+    warnings: [],
+  };
+  panel._hass = {
+    async callWS(payload) {
+      requests.push(structuredClone(payload));
+      if (payload.type === "meshnet/settings/get") {
+        return {
+          gateways: [{
+            gateway_id: "gateway-1",
+            name: "Test gateway",
+            protocol: "meshtastic",
+            transport: "bluetooth",
+            connected: true,
+          }],
+          selected: snapshot,
+        };
+      }
+      if (payload.type === "meshnet/settings/preview") {
+        return {
+          preview_id: "ppppppppppppppppppppppppppppppppppppppppppp",
+          gateway_id: "gateway-1",
+          revision: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          expires_at: "2026-07-29T12:05:00Z",
+          changes: [
+            {
+              path: "radio.enabled",
+              label: "Enabled",
+              before: true,
+              after: false,
+              secret: false,
+              critical: false,
+              requires_reconnect: false,
+            },
+            {
+              path: "radio.power",
+              label: "Transmit power",
+              before: 17,
+              after: 20,
+              secret: false,
+              critical: false,
+              requires_reconnect: false,
+            },
+            {
+              path: "security.key",
+              label: "Channel key",
+              before: "must-be-scrubbed",
+              after: "must-also-be-scrubbed",
+              secret: true,
+              operation: "replace",
+              critical: true,
+              requires_reconnect: true,
+            },
+          ],
+          requires_critical_confirmation: true,
+          warnings: ["The Bluetooth session will reconnect."],
+        };
+      }
+      if (payload.type === "meshnet/settings/apply") {
+        return {
+          status: "verified",
+          gateway_id: "gateway-1",
+          verified: ["radio.power", "radio.enabled", "security.key"],
+          unverified: [],
+          reconnect_required: true,
+          connection_recovery_required: false,
+          warnings: [],
+          snapshot: {
+            ...snapshot,
+            revision: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          },
+        };
+      }
+      throw new Error("unexpected request");
+    },
+  };
+
+  await panel._loadGatewaySettings("gateway-1");
+  assert.deepEqual(requests[0], {
+    type: "meshnet/settings/get",
+    gateway_id: "gateway-1",
+  });
+  assert.equal(panel._settingsSnapshot.revision, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+  panel._settingsDraft["radio.power"] = "20";
+  panel._settingsDraft["radio.enabled"] = false;
+  panel._settingsDraft["security.key"] = "temporary secret";
+
+  await panel._previewGatewaySettings({ preventDefault() {} });
+  assert.deepEqual(requests[1], {
+    type: "meshnet/settings/preview",
+    gateway_id: "gateway-1",
+    revision: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    changes: {
+      "radio.power": 20,
+      "radio.enabled": false,
+      "security.key": { operation: "replace", value: "temporary secret" },
+    },
+  });
+  assert.equal(Object.hasOwn(panel._settingsDraft, "security.key"), false);
+  assert.equal(panel._settingsPreview.changes[2].before, null);
+  assert.equal(panel._settingsPreview.changes[2].after, null);
+  assert.equal(JSON.stringify(panel._settingsPreview).includes("must-be-scrubbed"), false);
+  assert.equal(panel._settingsPreview.requires_critical_confirmation, true);
+
+  await panel._applyGatewaySettings();
+  assert.equal(requests.length, 2);
+  assert.match(panel._settingsStatus.text, /Confirm the critical-setting warning/);
+
+  panel._settingsCriticalConfirmed = true;
+  await panel._applyGatewaySettings();
+  assert.deepEqual(requests[2], {
+    type: "meshnet/settings/apply",
+    gateway_id: "gateway-1",
+    revision: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    preview_id: "ppppppppppppppppppppppppppppppppppppppppppp",
+    confirm_critical: true,
+  });
+  assert.equal(panel._settingsSnapshot.revision, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+  assert.equal(panel._settingsPreview, null);
+  assert.deepEqual(Object.keys(panel._settingsDraft), []);
+  assert.equal(panel._settingsCriticalConfirmed, false);
+  assert.deepEqual(panel._settingsStatus, {
+    kind: "good",
+    text: "Settings applied and verified. The gateway is restarting; wait for it to reconnect.",
+  });
+  const validationPreview = {
+    changes: [{ path: "radio.power" }],
+  };
+  assert.deepEqual(panel._validateSettingsApply({
+    status: "applied_unverified",
+    gateway_id: "gateway-1",
+    verified: [],
+    unverified: ["radio.power"],
+    reconnect_required: false,
+    connection_recovery_required: true,
+    warnings: ["Readback was unavailable."],
+  }, validationPreview, snapshot), {
+    verified_count: 0,
+    unverified_count: 1,
+    reconnect_required: false,
+    connection_recovery_required: true,
+    snapshot: null,
+    warnings: ["Readback was unavailable."],
+  });
+
+  panel._settingsSnapshot = snapshot;
+  panel._settingsPreview = {
+    preview_id: "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+    expires_at: "2026-07-29T12:10:00Z",
+    changes: [{ path: "security.key" }],
+    requires_critical_confirmation: false,
+    warnings: [],
+  };
+  panel._hass = {
+    async callWS() {
+      return {
+        status: "applied_unverified",
+        gateway_id: "gateway-1",
+        verified: [],
+        unverified: ["security.key"],
+        reconnect_required: true,
+        connection_recovery_required: true,
+        warnings: [],
+      };
+    },
+  };
+  await panel._applyGatewaySettings();
+  assert.deepEqual(panel._settingsStatus, {
+    kind: "warn",
+    text: "Settings applied; 1 value(s) could not be verified. Verify or recover the gateway connection before another settings change. Reload live values before making another change.",
+  });
+
+  panel._settingsPreview = {
+    preview_id: "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+    expires_at: "2026-07-29T12:10:00Z",
+    changes: [],
+    requires_critical_confirmation: false,
+    warnings: [],
+  };
+  panel._hass = { async callWS() { throw new Error("uncertain apply outcome"); } };
+  await panel._applyGatewaySettings();
+  assert.equal(panel._settingsPreview, null);
+  assert.match(panel._settingsStatus.text, /outcome could not be confirmed/);
+  assert.match(panel._settingsStatus.text, /Do not repeat the write/);
+"""
+    )
+
+
+def test_settings_draft_invalidates_preview_and_polling_preserves_focus() -> None:
+    """Editing settings must invalidate stale previews without poll rerenders."""
+    _run_panel_script(
+        r"""
+  panel._settingsSnapshot = panel._sanitizeSettingsSnapshot({
+    schema_version: 1,
+    gateway_id: "gateway-1",
+    name: "Gateway",
+    protocol: "meshtastic",
+    transport: "bluetooth",
+    connected: true,
+    writable: true,
+    revision: "c".repeat(64),
+    fetched_at: "2026-07-29T12:00:00Z",
+    categories: [{
+      key: "radio",
+      label: "Radio",
+      fields: [{
+        path: "radio.power",
+        label: "Power",
+        type: "integer",
+        value: 17,
+        min: 0,
+        max: 30,
+        writable: true,
+      }],
+    }],
+  });
+  panel._settingsPreview = {
+    preview_id: "stale-preview",
+    expires_at: "later",
+    changes: [],
+    requires_critical_confirmation: false,
+    warnings: [],
+  };
+  panel.querySelector = () => null;
+  const input = {
+    id: "meshnet-setting-0",
+    type: "number",
+    value: "22",
+    selectionStart: 1,
+    selectionEnd: 2,
+    getAttribute(name) { return name === "data-setting-index" ? "0" : null; },
+    hasAttribute(name) { return name === "data-setting-index"; },
+  };
+  panel._updateSettingsDraft(input);
+  assert.equal(panel._settingsDraft["radio.power"], "22");
+  assert.equal(panel._settingsPreview, null);
+  assert.throws(
+    () => panel._coerceSettingValue(panel._settingsFields()[0], "31"),
+    (error) => error.name === "ValidationError" && error.code === "invalid_format",
+  );
+
+  panel._activeView = "settings";
+  panel.getRootNode = () => ({ activeElement: input });
+  panel.contains = (element) => element === input;
+  assert.deepEqual(panel._settingsFocusState(), {
+    id: "meshnet-setting-0",
+    start: 1,
+    end: 2,
+  });
+  assert.equal(panel._panelInteractionActive(), true);
+  let renders = 0;
+  panel._render = () => { renders += 1; };
+  assert.equal(panel._renderPollSnapshot(), false);
+  assert.equal(panel._pollRenderPending, true);
+  assert.equal(renders, 0);
+"""
+    )
+
+
+def test_settings_preview_filters_coerced_numeric_no_op() -> None:
+    """A restored numeric input must not make a valid preview look incomplete."""
+    _run_panel_script(
+        r"""
+  const snapshot = panel._sanitizeSettingsSnapshot({
+    schema_version: 1,
+    gateway_id: "gateway-1",
+    name: "Gateway",
+    protocol: "meshtastic",
+    transport: "bluetooth",
+    connected: true,
+    writable: true,
+    revision: "d".repeat(64),
+    fetched_at: "2026-07-29T12:00:00Z",
+    categories: [{
+      key: "radio",
+      label: "Radio",
+      fields: [
+        {
+          path: "radio.power",
+          label: "Power",
+          type: "integer",
+          value: 17,
+          min: 0,
+          max: 30,
+          writable: true,
+          critical: false,
+          requires_reconnect: false,
+        },
+        {
+          path: "radio.enabled",
+          label: "Enabled",
+          type: "boolean",
+          value: true,
+          writable: true,
+          critical: false,
+          requires_reconnect: false,
+        },
+      ],
+    }],
+    warnings: [],
+  });
+  panel._settingsSnapshot = snapshot;
+  panel._settingsDraft["radio.power"] = "17";
+  panel._settingsDraft["radio.enabled"] = false;
+
+  const changes = panel._settingsChanges();
+  assert.deepEqual(changes, { "radio.enabled": false });
+  assert.equal(Object.hasOwn(panel._settingsDraft, "radio.power"), false);
+  assert.deepEqual(panel._validateSettingsPreview({
+    preview_id: "p".repeat(43),
+    gateway_id: "gateway-1",
+    revision: "d".repeat(64),
+    expires_at: "2026-07-29T12:05:00Z",
+    changes: [{
+      path: "radio.enabled",
+      label: "Enabled",
+      before: true,
+      after: false,
+      secret: false,
+      critical: false,
+      requires_reconnect: false,
+    }],
+    requires_critical_confirmation: false,
+    warnings: [],
+  }, snapshot, changes).changes.map((change) => change.path), ["radio.enabled"]);
+"""
+    )
+
+
+def test_failed_settings_preview_forgets_submitted_secret() -> None:
+    """A failed preview must not keep credentials in the panel draft."""
+    _run_panel_script(
+        r"""
+  panel._settingsSnapshot = panel._sanitizeSettingsSnapshot({
+    schema_version: 1,
+    gateway_id: "gateway-1",
+    name: "Gateway",
+    protocol: "meshcore",
+    transport: "bluetooth",
+    connected: true,
+    writable: true,
+    revision: "a".repeat(64),
+    fetched_at: "2026-07-29T12:00:00Z",
+    categories: [{
+      key: "security",
+      label: "Security",
+      fields: [{
+        path: "security.pin",
+        label: "Bluetooth PIN",
+        type: "secret",
+        configured: true,
+        allow_clear: true,
+        max_length: 6,
+        writable: true,
+        critical: true,
+        requires_reconnect: true,
+      }],
+    }],
+    warnings: [],
+  });
+  panel._settingsDraft["security.pin"] = "654321";
+  panel._hass = { async callWS() { throw new Error("preview failed"); } };
+  panel._safeRender = () => {};
+
+  await panel._previewGatewaySettings({ preventDefault() {} });
+
+  assert.equal(Object.hasOwn(panel._settingsDraft, "security.pin"), false);
+  assert.equal(panel._settingsPreview, null);
+  assert.match(panel._settingsStatus.text, /could not be prepared/);
+"""
+    )
+
+
+def test_settings_requests_cannot_cross_busy_gateway_change_or_disconnect() -> None:
+    """Late responses must not repopulate an abandoned settings editor."""
+    _run_panel_script(
+        r"""
+  const snapshot = panel._sanitizeSettingsSnapshot({
+    schema_version: 1,
+    gateway_id: "gateway-1",
+    name: "Gateway",
+    protocol: "meshcore",
+    transport: "bluetooth",
+    connected: true,
+    writable: true,
+    revision: "a".repeat(64),
+    fetched_at: "2026-07-29T12:00:00Z",
+    categories: [{
+      key: "identity",
+      label: "Identity",
+      fields: [{
+        path: "identity.name",
+        label: "Name",
+        type: "string",
+        value: "Gateway",
+        max_length: 32,
+        writable: true,
+      }],
+    }],
+    warnings: [],
+  });
+  panel._safeRender = () => {};
+  panel._settingsSnapshot = snapshot;
+  let calls = 0;
+  panel._hass = { async callWS() { calls += 1; return {}; } };
+  panel._settingsBusy = "apply";
+  await panel._loadGatewaySettings("other-gateway");
+  assert.equal(calls, 0);
+  assert.equal(panel._settingsSnapshot, snapshot);
+  assert.equal(panel._settingsBusy, "apply");
+
+  let resolvePreview;
+  panel._settingsBusy = null;
+  panel._settingsDraft["identity.name"] = "Changed";
+  panel._hass = {
+    callWS() {
+      return new Promise((resolve) => { resolvePreview = resolve; });
+    },
+  };
+  const previewTask = panel._previewGatewaySettings({ preventDefault() {} });
+  await Promise.resolve();
+  assert.equal(panel._settingsBusy, "preview");
+  panel.disconnectedCallback();
+  resolvePreview({
+    preview_id: "p".repeat(43),
+    expires_at: "2026-07-29T12:05:00Z",
+    changes: [{
+      path: "identity.name",
+      label: "Name",
+      before: "Gateway",
+      after: "Changed",
+      secret: false,
+      critical: false,
+      requires_reconnect: false,
+    }],
+    requires_critical_confirmation: false,
+    warnings: [],
+  });
+  await previewTask;
+  assert.equal(panel._settingsSnapshot, null);
+  assert.equal(panel._settingsPreview, null);
+  assert.equal(panel._settingsStatus, null);
+  assert.equal(panel._settingsBusy, null);
+
+  let resolveApply;
+  panel._settingsSnapshot = snapshot;
+  panel._settingsPreview = {
+    preview_id: "q".repeat(43),
+    expires_at: "2026-07-29T12:05:00Z",
+    changes: [],
+    requires_critical_confirmation: false,
+    warnings: [],
+  };
+  panel._hass = {
+    callWS() {
+      return new Promise((resolve) => { resolveApply = resolve; });
+    },
+  };
+  const applyTask = panel._applyGatewaySettings();
+  await Promise.resolve();
+  assert.equal(panel._settingsBusy, "apply");
+  panel.disconnectedCallback();
+  resolveApply({
+    status: "verified",
+    verified: ["identity.name"],
+    unverified: [],
+    reconnect_required: false,
+    warnings: [],
+  });
+  await applyTask;
+  assert.equal(panel._settingsSnapshot, null);
+  assert.equal(panel._settingsPreview, null);
+  assert.equal(panel._settingsStatus, null);
+  assert.equal(panel._settingsBusy, null);
+"""
+    )
+
+
+def test_settings_success_responses_fail_closed_on_contract_mismatch() -> None:
+    """Malformed success payloads must never clear or legitimize a preview."""
+    _run_panel_script(
+        r"""
+  const rawSnapshot = {
+    schema_version: 1,
+    gateway_id: "gateway-1",
+    name: "Gateway",
+    protocol: "meshcore",
+    transport: "bluetooth",
+    connected: true,
+    writable: true,
+    revision: "a".repeat(64),
+    fetched_at: "2026-07-29T12:00:00Z",
+    categories: [{
+      key: "identity",
+      label: "Identity",
+      fields: [{
+        path: "identity.name",
+        label: "Name",
+        type: "string",
+        value: "Gateway",
+        max_length: 32,
+        writable: true,
+        critical: false,
+        requires_reconnect: false,
+      }],
+    }],
+    warnings: [],
+  };
+  const snapshot = panel._sanitizeSettingsSnapshot(rawSnapshot);
+  const requested = { "identity.name": "Changed" };
+  const validPreviewResponse = {
+    preview_id: "p".repeat(43),
+    gateway_id: "gateway-1",
+    revision: "a".repeat(64),
+    expires_at: "2026-07-29T12:05:00Z",
+    changes: [{
+      path: "identity.name",
+      label: "Name",
+      before: "Gateway",
+      after: "Changed",
+      secret: false,
+      critical: false,
+      requires_reconnect: false,
+    }],
+    requires_critical_confirmation: false,
+    warnings: [],
+  };
+  const preview = panel._validateSettingsPreview(
+    validPreviewResponse,
+    snapshot,
+    requested,
+  );
+  const validApply = {
+    status: "verified",
+    gateway_id: "gateway-1",
+    verified: ["identity.name"],
+    unverified: [],
+    reconnect_required: false,
+    connection_recovery_required: false,
+    warnings: [],
+  };
+  assert.equal(panel._validateSettingsApply(validApply, preview, snapshot).verified_count, 1);
+
+  for (const invalid of [
+    { ...validApply, status: "anything" },
+    { ...validApply, verified: true },
+    { ...validApply, verified: ["identity.name", "identity.name"] },
+    { ...validApply, verified: [], unverified: [] },
+    { ...validApply, gateway_id: "other-gateway" },
+  ]) {
+    assert.throws(
+      () => panel._validateSettingsApply(invalid, preview, snapshot),
+      (error) => error.name === "PanelSchemaError" && error.code === "invalid_format",
+    );
+  }
+
+  for (const invalid of [
+    { ...validPreviewResponse, gateway_id: "other-gateway" },
+    { ...validPreviewResponse, revision: "b".repeat(64) },
+    { ...validPreviewResponse, changes: [] },
+    {
+      ...validPreviewResponse,
+      changes: [
+        ...validPreviewResponse.changes,
+        ...validPreviewResponse.changes,
+      ],
+    },
+  ]) {
+    assert.throws(
+      () => panel._validateSettingsPreview(invalid, snapshot, requested),
+      (error) => error.name === "PanelSchemaError" && error.code === "invalid_format",
+    );
+  }
+
+  assert.throws(
+    () => panel._sanitizeSettingsSnapshot({ ...rawSnapshot, revision: 1 }),
+    (error) => error.name === "PanelSchemaError" && error.code === "invalid_format",
+  );
+  assert.throws(
+    () => panel._sanitizeSettingsSnapshot({
+      ...rawSnapshot,
+      categories: Array.from({ length: 49 }, (_value, index) => ({
+        key: `category.${index}`,
+        label: "Category",
+        fields: [],
+      })),
+    }),
+    (error) => error.name === "PanelSchemaError" && error.code === "invalid_format",
+  );
+"""
+    )
+
+
 def test_panel_polling_stops_when_element_disconnects() -> None:
     """Navigating away must not leave detached five-second pollers running."""
     _run_panel_script(
@@ -220,7 +1013,110 @@ def test_recipient_choices_and_node_message_shortcut_use_canonical_keys() -> Non
     )
     source = _source()
     assert 'data-message-node="${this._escape(node.node_key)}"' in source
+    assert "unsafeRecipientKeys.has(String(node.node_key))" in source
+    assert "Unsafe node identity; direct messaging is disabled" in source
     assert 'button.getAttribute("data-message-node")' in source
+
+
+def test_unresolved_meshtastic_id_collision_is_not_a_send_target() -> None:
+    """The browser must agree with the server's fail-closed routing rule."""
+    _run_panel_script(
+        r"""
+  const nodes = [
+    {
+      protocol: "meshtastic",
+      node_key: "mac:111111111111",
+      node_id: "!12345678",
+      mac: "111111111111",
+      long_name: "Collision one",
+    },
+    {
+      protocol: "meshtastic",
+      node_key: "mac:222222222222",
+      node_id: "305419896",
+      mac: "222222222222",
+      long_name: "Collision two",
+    },
+  ];
+  panel._snapshot = { nodes: { first: nodes[0], second: nodes[1] } };
+
+  const choices = panel._recipientChoices(nodes);
+  assert.equal(choices.length, 2);
+  assert.equal(choices.every((choice) => choice.ambiguous === true), true);
+  const options = panel._recipientOptions(nodes);
+  assert.equal((options.match(/<option[^>]* disabled>/g) || []).length, 2);
+  assert.match(options, /No unambiguous direct recipients/);
+  assert.match(options, /ambiguous ID — sending disabled/);
+  assert.equal(panel._isKnownRecipient("mac:111111111111"), false);
+  assert.equal(panel._chooseDirectRecipient("mac:222222222222"), false);
+"""
+    )
+
+
+def test_composite_proof_key_collision_is_not_a_send_target() -> None:
+    """Opaque proof-aware keys still participate in exact-ID ambiguity checks."""
+    _run_panel_script(
+        r"""
+  const nodes = [
+    {
+      protocol: "meshtastic",
+      node_key: `meshtastic-proof:${"1".repeat(64)}`,
+      node_id: "!12345678",
+      mac: "111111111111",
+      public_key: "1".repeat(64),
+      identity_valid: true,
+      long_name: "Collision one",
+    },
+    {
+      protocol: "meshtastic",
+      node_key: `meshtastic-proof:${"2".repeat(64)}`,
+      node_id: "305419896",
+      mac: "111111111111",
+      public_key: "2".repeat(64),
+      identity_valid: true,
+      long_name: "Collision two",
+    },
+  ];
+  panel._snapshot = { nodes: { first: nodes[0], second: nodes[1] } };
+
+  assert.equal(panel._meshtasticNodeId(nodes[0]), "!12345678");
+  assert.equal(panel._meshtasticNodeId({
+    ...nodes[0],
+    node_key: "meshtastic-proof:not-a-proof",
+  }), "");
+  const choices = panel._recipientChoices(nodes);
+  assert.equal(choices.length, 2);
+  assert.equal(choices.every((choice) => choice.ambiguous === true), true);
+  assert.equal((panel._recipientOptions(nodes).match(/<option[^>]* disabled>/g) || []).length, 2);
+  assert.equal(panel._isKnownRecipient(nodes[0].node_key), false);
+"""
+    )
+
+
+def test_server_rejected_identity_is_disabled_in_recipient_ui() -> None:
+    """The panel must honor the server's proof validation result."""
+    _run_panel_script(
+        r"""
+  const invalid = {
+    protocol: "meshtastic",
+    node_key: `meshtastic-proof:${"1".repeat(64)}`,
+    node_id: "!12345678",
+    mac: "111111111111",
+    public_key: "2".repeat(64),
+    identity_valid: false,
+    long_name: "Invalid proof",
+  };
+  panel._snapshot = { nodes: { invalid } };
+
+  const choices = panel._recipientChoices([invalid]);
+  assert.equal(choices.length, 1);
+  assert.equal(choices[0].invalidIdentity, true);
+  const options = panel._recipientOptions([invalid]);
+  assert.match(options, /invalid identity — sending disabled/);
+  assert.match(options, /<option[^>]* disabled>/);
+  assert.equal(panel._isKnownRecipient(invalid.node_key), false);
+"""
+    )
 
 
 def test_recipient_name_collisions_receive_exact_disambiguators() -> None:
@@ -1371,8 +2267,14 @@ def test_panel_diagnostics_uses_only_fixed_counts_and_registration_is_idempotent
     _run_panel_script(
         r"""
   const html = panel._panelDiagnostics({
-    total_node_count: 305,
-    analyzed_node_count: 305,
+    total_node_count: 286,
+    retained_node_record_count: 473,
+    collapsed_alias_record_count: 187,
+    resolved_identity_group_count: 172,
+    unresolved_identity_group_count: 2,
+    unresolved_identity_node_count: 4,
+    invalid_identity_record_count: 3,
+    analyzed_node_count: 286,
     omitted_node_count: 0,
     current_session_node_count: 191,
     cached_only_node_count: 114,
@@ -1385,15 +2287,18 @@ def test_panel_diagnostics_uses_only_fixed_counts_and_registration_is_idempotent
     identity_collision_node_count: 4,
     last_snapshot_generated_at: "2026-07-28T12:00:00Z",
     private_metadata: "must-not-render",
-  }, Array.from({ length: 305 }, () => ({})));
-  assert.match(html, /305 total · 24 recent · 175 located/);
+  }, Array.from({ length: 286 }, () => ({})));
+  assert.match(html, /286 distinct · 24 recent · 175 located/);
+  assert.match(html, /187 collapsed · 172 groups · 473 retained records/);
+  assert.match(html, /Original cache records remain stored/);
   assert.match(html, /191 gateway-reported · 114 retained cache only/);
   assert.match(html, /stored node database/);
   assert.match(html, /does not mean they were directly heard this session/);
   assert.match(html, /42 yes · 114 unknown/);
   assert.match(html, /does not mean this MeshNet gateway currently uses MQTT/);
   assert.match(html, /163 not recently seen/);
-  assert.match(html, /2 groups · 4 nodes/);
+  assert.match(html, /Unresolved identity evidence/);
+  assert.match(html, /2 conflicting groups · 4 records · 3 malformed/);
   assert.equal(html.includes("must-not-render"), false);
 
   const cappedHtml = panel._panelDiagnostics({

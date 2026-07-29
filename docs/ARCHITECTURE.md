@@ -31,6 +31,8 @@ Files:
 custom_components/meshnet/meshtastic_client.py
 custom_components/meshnet/meshcore_client.py
 custom_components/meshnet/gateway.py
+custom_components/meshnet/meshtastic_settings.py
+custom_components/meshnet/meshcore_settings.py
 ```
 
 Responsibilities:
@@ -169,6 +171,22 @@ The coordinator owns:
 
 The coordinator uses `always_update=True` so periodic changes such as stale-node marking and health score updates are published to entities.
 
+Meshtastic persistence retains provider records under their original keys, but
+the coordinator publishes a reversible effective-node projection. Only exact,
+valid 32-bit routing IDs with one consistently observed MAC/public-key proof
+bundle are collapsed. A MAC-only observation and a public-key-only observation
+are not combined into proof that no source record supplied. This projection is
+shared by the panel, entities, Map, topology, and health calculations; raw
+SQLite rows are neither rewritten nor deleted. New
+NodeDB and packet callbacks use deterministic proof-aware keys. An observation
+that carries a MAC and/or public key hashes every available proof together with
+its routing ID, so one conflicting proof or ID cannot overwrite another before
+the projection evaluates it. A MAC or public key shared by different routing
+IDs is retained as unresolved evidence, and direct sends through either record
+are blocked. Retained-key redirects preserve favorites and direct-message
+compatibility. Malformed, conflicting, or unbound complementary evidence always
+remains separate.
+
 Config-entry setup opens persistence, restores cached state, and builds gateway
 objects synchronously. Actual radio SDK startup and queued-message replay run in
 a Home Assistant entry-owned background task. This is a deliberate isolation
@@ -188,6 +206,68 @@ interface, and interface close waits behind that work without making Home
 Assistant unload wait indefinitely. Failed entry setup rolls back forwarded
 platforms and closes the coordinator; a failed platform unload leaves the live
 coordinator in place for Home Assistant to retry safely.
+
+## Gateway Settings Boundary
+
+Files:
+
+```text
+custom_components/meshnet/gateway_settings.py
+custom_components/meshnet/meshtastic_settings.py
+custom_components/meshnet/meshcore_settings.py
+custom_components/meshnet/sensitive_logging.py
+```
+
+Gateway settings use a protocol-neutral, typed contract between the admin-only
+panel and provider clients:
+
+```text
+live provider read
+        |
+        v
+sanitized typed schema + revision
+        |
+        v
+browser-memory draft
+        |
+        v
+server validation + single-use redacted preview
+        |
+        v
+serialized one-shot provider writes (critical operations last)
+        |
+        v
+fresh provider read + per-field verification
+```
+
+The coordinator owns one `GatewaySettingsManager`. The manager accepts only an
+exact configured gateway ID, serializes operations per gateway, bounds field
+counts and values, rejects duplicate or unsafe paths, and keeps at most one
+five-minute preview per gateway in process memory. A preview is tied to a
+server revision, expires after use, and is invalidated by a replacement
+preview, coordinator reload, or shutdown. Provider exception text and submitted
+secret values are never part of the public websocket result.
+
+Provider adapters implement `async_get_settings_snapshot()` and
+`async_apply_settings_plan()`. MeshCore local companion operations run under its
+single native-command lock. Meshtastic Bluetooth admin operations share the
+transport send/settings locks and correlate internal ADMIN_APP and routing
+responses without publishing their payloads as mesh packets. Sensitive SDK
+logger namespaces are suppressed for the complete credential-bearing read and
+write scope and restored afterward.
+
+A settings timeout is an unknown device state, not a retry signal. No provider
+write is retried. A successful response is followed by live readback; a result
+distinguishes verified and unverified fields. A MeshCore plan stops before its
+next command as soon as one acknowledged write cannot be verified. When a
+MeshCore Bluetooth PIN is verified, the provider returns a private handoff to
+the coordinator. The coordinator updates only that gateway's connection option
+so a reload can use the new PIN; the handoff is consumed before any public
+response is built.
+
+This boundary addresses accidental and unverified writes, not process
+isolation. Settings are intentionally persistent radio state and cannot be
+rolled back by uninstalling an in-process Home Assistant integration.
 
 ## Persistence
 
@@ -274,8 +354,14 @@ Websocket commands:
 - `meshnet/snapshot`
 - `meshnet/messages`
 - `meshnet/send_message`
+- `meshnet/settings/get`
+- `meshnet/settings/preview`
+- `meshnet/settings/apply`
 
-All MeshNet websocket commands require an authenticated Home Assistant admin user. The sidebar panel is admin-only.
+All MeshNet websocket commands require an authenticated Home Assistant admin
+user. The sidebar panel is admin-only. Settings commands expose a typed,
+sanitized schema and preview token; there is no raw provider-command websocket
+endpoint.
 
 ## Setup Tools
 
@@ -304,7 +390,13 @@ Purpose:
 - Require admin access for UI/API paths that can transmit messages.
 - Restrict Bluetooth pairing to a verified local BlueZ device and a temporary,
   non-default agent.
-- Never persist or log a Bluetooth pairing PIN.
+- Never persist or log a Meshtastic BlueZ pairing PIN. Persist a changed
+  MeshCore connection PIN only after the physically connected radio verifies
+  it, and never return or log its value.
+- Do not expose raw radio commands, remote RF administration, reset, firmware
+  flashing, or private-key import/export through gateway settings.
+- Treat a settings-write timeout as an unknown outcome and never retry it
+  automatically.
 - Treat topology as cached passive evidence: never infer node-to-node links
   from a shared gateway observation.
 - Do not expose automatic traceroute. A future manual testing action would need

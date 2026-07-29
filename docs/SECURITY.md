@@ -6,6 +6,8 @@ MeshNet can transmit radio messages and may expose location, names, telemetry, a
 
 - The MeshNet sidebar panel is admin-only.
 - MeshNet websocket commands require a Home Assistant admin user.
+- Gateway settings require a live, physically connected configured gateway and
+  an explicit server-side preview before Apply.
 - Diagnostics redact common secret fields.
 - `setup.sh` does not edit `configuration.yaml`.
 - `install.sh` defaults to dry-run when `.env` is missing.
@@ -64,6 +66,45 @@ Recommended:
 - Enable multi-factor authentication where possible.
 
 The panel and websocket commands are admin-only, but Home Assistant service calls may still be available to automations and scripts. Review who can edit automations.
+
+## Gateway Settings Authorization and Secrets
+
+The **Gateway settings** tab and all three settings websocket commands require
+a Home Assistant administrator. The API accepts only a configured local
+gateway, typed known fields, and a short-lived single-use preview. It does not
+accept raw provider commands, remote RF administration, reset, firmware
+flashing, or key import/export. Connection-critical fields require separate
+confirmation and are sent after noncritical operations.
+
+Secret settings are write-only. Existing values never leave the provider
+adapter; the UI receives only whether a value is configured. Typed replacements
+are held in browser memory and a bounded in-process preview, and preview output
+states that a secret will change without showing either value. MeshNet
+suppresses provider-library logs for the entire sensitive read/write scope and
+does not place values in diagnostics or public error messages.
+
+Home Assistant can log both decoded incoming WebSocket commands and serialized
+outbound results at debug level. MeshNet redacts message/recipient and settings
+draft fields on the incoming path. Every successful response containing mesh
+state, message history, identities, coordinates, gateway settings, or message
+IDs is server-tagged and the complete outbound log record is replaced with
+fixed text before formatting. Error responses use fixed public messages. The
+identity-free panel-telemetry acknowledgement is the only untagged MeshNet
+success response.
+
+A verified MeshCore Bluetooth PIN change is the narrow exception to purely
+transient submitted values: that PIN is required to reconnect to the same
+gateway, so MeshNet updates the matching Home Assistant config-entry option
+only after the radio's live readback confirms it. It remains masked and is not
+returned through settings, previews, diagnostics, or normal logs. This is
+separate from the Meshtastic BlueZ pairing PIN, which remains transient and is
+never persisted.
+
+Radio settings are external state. A timeout may mean the hardware accepted a
+write even though Home Assistant missed the response, so MeshNet never retries
+it automatically. Reload and inspect live state before deciding on any next
+write. An integration removal or HACS uninstall cannot safely infer or reverse
+an intentional change stored by radio firmware.
 
 ## USB Permissions
 
@@ -271,6 +312,11 @@ all external BlueZ bonds. If address-scoped cleanup is desired, first use
 bond (may disconnect other apps)**, and confirm. The checkbox is off by default,
 and a failed cleanup keeps the gateway. Otherwise, remove the gateway/entry and
 HACS package without changing Bluetooth state.
+
+Settings deliberately applied through **Gateway settings** also remain on the
+radio. Restore any desired values through a verified local connection before
+uninstalling; uninstall has neither the code nor a safe universal backup from
+which to reverse radio firmware state.
 
 `uninstall.sh` removes only an existing component whose path is exactly the
 recorded `<config_dir>/custom_components/meshnet` and whose manifest declares

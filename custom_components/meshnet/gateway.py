@@ -15,6 +15,25 @@ NodeCallback = Callable[[NodeState], Awaitable[None]]
 StatusCallback = Callable[[GatewayStatus], Awaitable[None]]
 
 
+def _safe_error_category(error: Exception | str) -> str:
+    """Classify a failure without returning endpoint or credential text."""
+    lowered = str(error).casefold()
+    categories = (
+        ("authentication", ("auth", "credential", "password", "pin", "token")),
+        ("bluetooth", ("bluetooth", "bluez", "ble", "dbus", "gatt")),
+        ("configuration", ("config", "invalid", "missing", "unsupported")),
+        ("connection", ("connect", "socket", "network", "unreachable")),
+        ("data", ("decode", "json", "parse", "payload", "protobuf")),
+        ("permission", ("permission", "access denied", "read-only")),
+        ("serial", ("serial", "tty", "baud")),
+        ("timeout", ("timeout", "timed out")),
+    )
+    for category, markers in categories:
+        if any(marker in lowered for marker in markers):
+            return category
+    return "other"
+
+
 class GatewayError(RuntimeError):
     """Raised when a gateway operation fails."""
 
@@ -80,6 +99,37 @@ class MeshGateway(ABC):
         """Refresh gateway state if supported."""
         return None
 
+    async def async_get_settings_snapshot(self) -> dict[str, Any]:
+        """Return a privacy-safe live settings schema for this gateway.
+
+        Protocol adapters override this only when they can read settings from
+        the physically connected radio.  Keeping the default read-only makes
+        unsupported transports fail closed instead of exposing a generic raw
+        command surface.
+        """
+        return {
+            "categories": [],
+            "warnings": [],
+            "writable": False,
+            "read_only_reason": (
+                "This gateway transport does not provide a validated local "
+                "settings interface."
+            ),
+        }
+
+    async def async_apply_settings_plan(
+        self, changes: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Apply one already validated local settings plan.
+
+        The protocol-neutral manager validates paths, types, ranges, stale
+        revisions, and critical confirmation before this method can run.
+        Adapters must still enforce their protocol and hardware constraints.
+        """
+        raise GatewayError(
+            "This gateway transport does not support validated settings writes"
+        )
+
     @staticmethod
     def _diagnostic_task_state(task: asyncio.Future[Any] | None) -> str:
         """Return a task state without inspecting or exposing its exception."""
@@ -119,7 +169,11 @@ class MeshGateway(ABC):
         message = str(error)
         self.status.errors.append(message)
         self.status.errors = self.status.errors[-20:]
-        self._logger.warning("Mesh gateway %s error: %s", self.config.gateway_id, message)
+        self._logger.warning(
+            "Mesh gateway adapter %s reported a %s failure",
+            type(self).__name__,
+            _safe_error_category(error),
+        )
         await self._emit_status()
 
     async def _emit_status(self) -> None:

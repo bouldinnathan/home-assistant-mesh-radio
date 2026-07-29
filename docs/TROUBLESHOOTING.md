@@ -130,12 +130,15 @@ logger:
   default: warning
   logs:
     custom_components.meshnet: debug
-    meshtastic: debug
-    meshcore: debug
-    pubsub: debug
 ```
 
 Restart Home Assistant.
+
+Keep `meshtastic`, `meshcore`, and `pubsub` at their normal levels unless a
+maintainer specifically asks for a short private capture. Those third-party
+debug streams are outside MeshNet's normal log projection and may contain
+radio identities, endpoints, topics, packet content, or credentials. Never
+post an unreviewed provider log publicly.
 
 ## Common Failure Modes
 
@@ -639,19 +642,32 @@ cached record for that ID but has not received usable NodeInfo containing a
 long, user, or short name. When both are available, the sidebar displays
 `Long Name · SHORT`; compact graph and RF labels prefer `SHORT`.
 
-If another retained record has the exact same normalized Meshtastic node ID and
-one actual record supplies the complete, unambiguous cached name tuple, the
-sidebar can show that tuple as a marked, display-only hint. A disagreement
-between cached names, IDs, MAC addresses, or public keys fails closed. MeshNet
-never constructs a long/short pair from separate donors. The records, entity
-identities, favorites, measurements, and direct-message targets remain separate
-and unchanged.
+On 0.6.0 and newer, retained records with the exact same valid Meshtastic node
+ID are shown as one effective node only when their MAC and public-key evidence
+forms one consistently observed proof bundle. A separate MAC-only record and
+public-key-only record are not combined unless an observation binds them
+together. MeshNet never groups by name, location, or signal and never
+constructs a long/short pair from separate donors. Conflicting or malformed
+evidence fails closed and remains separate. Original SQLite records are kept;
+the sidebar reports how many aliases were collapsed and how many records remain
+retained for rollback. Old alias entities become unavailable rather than being
+deleted, and an existing favorite label or direct-message alias still resolves
+to the effective node.
+
+If conflicting records share the same routing ID, MeshNet disables direct
+messaging to every record in that unresolved group. Meshtastic ultimately
+routes by the shared ID, so choosing one apparent record could otherwise send
+to the wrong physical node. Resolve the device-ID conflict before sending.
+The same fail-closed rule applies when one MAC or public key is shared by
+different routing IDs. Those records stay visible and cannot be direct-message
+targets until their strong proof agrees.
 
 The phone app can look different because it has its own node database and may
 hide or already have NodeInfo for records that this radio or MeshNet cache does
 not. MeshNet does not request NodeInfo, merge nodes by name or signal, or send
 extra radio traffic to fill these labels. Exact destination IDs remain the
-authoritative direct-message targets.
+authoritative direct-message targets except while an ID has unresolved,
+conflicting identity evidence.
 
 ### Sidebar Data Looks Incomplete or Contains Distant Nodes
 
@@ -665,10 +681,11 @@ the MeshNet integration itself uses MQTT. MeshNet also loads its durable node
 cache at startup; a location for a node that has not been seen recently can
 therefore remain on Home Assistant's native Map.
 
-Open **Panel diagnostics** in the sidebar and compare **Gateway-reported** with
-**Retained cache only**, **Recent**, **Located**, **Nodes marked MQTT**, and
-**Unknown**. A gateway report may come from the radio's stored node database;
-it is not proof of a fresh RF packet. These counts do not trigger radio traffic.
+Open **Panel diagnostics** in the sidebar and compare **Distinct nodes**,
+**Identity aliases**, **Gateway-reported**, **Retained cache only**, **Recent**,
+**Located**, **Nodes marked MQTT**, and **Unknown**. A gateway report may come
+from the radio's stored node database; it is not proof of a fresh RF packet.
+These counts do not trigger radio traffic.
 Download integration diagnostics from the three-dot menu for the corresponding
 privacy-safe aggregates and bounded panel failure history.
 
@@ -678,6 +695,61 @@ logging action, reproduce the problem briefly, then disable debug logging and
 download the resulting log and diagnostics. MeshNet never intentionally logs
 message text, recipients, node or gateway IDs, names, coordinates, Bluetooth
 addresses, serial paths, URLs, credentials, or browser identity.
+
+### Gateway Settings Is Missing or Read-Only
+
+The dedicated **Gateway settings** tab requires MeshNet 0.6.0 and a Home
+Assistant administrator account. Restart Home Assistant after updating and
+hard-refresh the browser once if the older Mesh-only panel is still cached.
+
+Choose an online, physically connected gateway and press **Reload live
+values**. Read-only behavior is expected for:
+
+- Meshtastic MQTT, serial, and TCP settings in 0.6.0;
+- MeshCore MQTT and REST bridges, which have no standardized verified settings
+  contract;
+- a Meshtastic radio in managed mode;
+- firmware/SDK fields for which MeshNet has no typed writer and readback; and
+- identity, repeated-value, key-management, reset, or other intentionally
+  excluded fields.
+
+MeshCore BLE/serial/TCP companion paths and Meshtastic direct Bluetooth expose
+only the writable fields reported by their current live schema. A field-level
+reason explains a capability gap. Do not use a raw console or remote RF admin
+command to bypass that guard; doing so bypasses MeshNet's validation and
+verification boundaries.
+
+### A Gateway Settings Preview Expired or Became Stale
+
+A settings preview is single-use, tied to the live radio revision, and retained
+in server memory for at most five minutes. A newer preview, integration reload,
+gateway replacement, or changed radio value invalidates it. Press **Reload live
+values**, recreate the draft, inspect the new diff, and confirm critical fields
+again. This is a stale-write protection, not a connection failure.
+
+### Apply Timed Out or a Setting Was Not Verified
+
+Do not blindly press Apply again. A timeout means the device state is unknown:
+the radio may have accepted the only transmitted command even if its response
+or reconnect never reached Home Assistant. Let the gateway reconnect, then use
+**Reload live values** and compare the live state with the radio display or an
+official local client. MeshNet deliberately does not retry settings writes.
+
+If a MeshCore Bluetooth PIN was verified, MeshNet updates that gateway's saved
+connection PIN so the entry can reconnect after reload. If the link was lost
+before verification, no new PIN is saved. Determine the PIN currently active
+on the physical radio first, then use **Configure** on the MeshNet integration
+to repair the gateway connection; do not alternate guessed PIN writes.
+
+Secret inputs cannot display the old value. **Configured** means only that the
+radio reported a value. Previews and diagnostics intentionally show no secret.
+
+### Uninstall Did Not Restore a Radio Setting
+
+This is expected. Apply changes radio firmware state, while uninstall removes
+integration code. Restore known-good settings and verify them while local
+access still works, before removing MeshNet. HACS uninstall cannot safely infer
+which prior radio value was intended and does not attempt a rollback.
 
 ## Health Checks
 

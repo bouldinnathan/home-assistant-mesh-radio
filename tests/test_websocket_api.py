@@ -5,13 +5,14 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
 pytest.importorskip("homeassistant")
 
 import voluptuous as vol  # noqa: E402
+from homeassistant.exceptions import Unauthorized  # noqa: E402
 from homeassistant.helpers import device_registry as dr  # noqa: E402
 from homeassistant.helpers import label_registry as lr  # noqa: E402
 
@@ -25,8 +26,15 @@ from custom_components.meshnet.models import (  # noqa: E402
 from custom_components.meshnet.websocket_api import (  # noqa: E402
     _FAVORITE_LABEL_NAME,
     _async_panel_operation,
+    _panel_node,
     _snapshot_with_panel_metadata,
+    websocket_messages,
     websocket_panel_log,
+    websocket_send_message,
+    websocket_settings_apply,
+    websocket_settings_get,
+    websocket_settings_preview,
+    websocket_snapshot,
 )
 
 ENTRY_ID = "entry-id"
@@ -56,9 +64,146 @@ def _assert_panel_metadata(result: dict, *, favorite_configured: bool) -> dict:
     metadata = result["panel_metadata"]
     assert metadata["favorite_label_configured"] is favorite_configured
     assert datetime.fromisoformat(metadata["last_snapshot_generated_at"])
-    assert metadata["projection_schema_version"] == 1
+    assert metadata["projection_schema_version"] == 2
     assert metadata["telemetry"]["schema_version"] == 1
     return metadata
+
+
+def test_panel_identity_safety_handles_legacy_protocol_case() -> None:
+    """Legacy protocol casing cannot bypass Meshtastic identity validation."""
+    node = NodeState(
+        node_key="meshtastic:!11111111",
+        protocol="  Meshtastic  ",
+        node_id="!22222222",
+    )
+
+    assert _panel_node(node, identity_valid=True)["identity_valid"] is False
+
+
+def test_messages_websocket_redacts_legacy_raw_provider_metadata() -> None:
+    async def run() -> None:
+        message = MessageRecord(
+            message_id="visible-message",
+            protocol="meshtastic",
+            gateway_id="visible-gateway",
+            sender="visible-sender",
+            receiver=None,
+            channel="0",
+            text="visible text",
+            raw={
+                "status": "queued",
+                "last_error": "token=private at /dev/private",
+                "provider_id": "private-provider-id",
+                "last_error_code": "send_failed",
+            },
+        )
+        coordinator = _coordinator()
+        coordinator.store = SimpleNamespace(
+            async_recent_messages=AsyncMock(return_value=[message])
+        )
+        hass = SimpleNamespace(data={"meshnet": {ENTRY_ID: coordinator}})
+        connection = SimpleNamespace(send_message=MagicMock())
+        handler = websocket_messages.__wrapped__.__wrapped__
+
+        await handler(
+            hass,
+            connection,
+            {"id": 11, "type": "meshnet/messages", "limit": 100},
+        )
+
+        envelope = connection.send_message.call_args.args[0]
+        assert envelope["id"] == 11
+        assert envelope["type"] == "result"
+        assert envelope["success"] is True
+        payload = envelope["result"]
+        assert payload[0]["raw"] == {
+            "status": "queued",
+            "last_error_code": "send_failed",
+        }
+        serialized = json.dumps(payload)
+        assert "token=private" not in serialized
+        assert "/dev/private" not in serialized
+        assert "private-provider-id" not in serialized
+
+    import asyncio
+
+    asyncio.run(run())
+
+
+def test_sensitive_websocket_handlers_return_fixed_errors_without_leaking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        private_error = (
+            "database /config/private.sqlite for node !12345678 failed"
+        )
+        coordinator = _coordinator()
+        coordinator.store = SimpleNamespace(
+            async_recent_messages=AsyncMock(
+                side_effect=RuntimeError(private_error)
+            )
+        )
+        coordinator.async_send_message = AsyncMock(
+            side_effect=RuntimeError(private_error)
+        )
+        hass = SimpleNamespace(data={"meshnet": {ENTRY_ID: coordinator}})
+        connection = SimpleNamespace(
+            send_message=MagicMock(),
+            send_error=MagicMock(),
+        )
+
+        def failed_snapshot(*_args: object) -> dict:
+            raise RuntimeError(private_error)
+
+        monkeypatch.setattr(
+            websocket_api_module,
+            "_snapshot_with_panel_metadata",
+            failed_snapshot,
+        )
+
+        await websocket_snapshot.__wrapped__.__wrapped__(
+            hass,
+            connection,
+            {"id": 40, "type": "meshnet/snapshot"},
+        )
+        await websocket_messages.__wrapped__.__wrapped__(
+            hass,
+            connection,
+            {"id": 41, "type": "meshnet/messages", "limit": 100},
+        )
+        await websocket_send_message.__wrapped__.__wrapped__(
+            hass,
+            connection,
+            {
+                "id": 42,
+                "type": "meshnet/send_message",
+                "message": "safe caller message",
+                "target_node": "!12345678",
+                "priority": "normal",
+                "message_type": "direct",
+            },
+        )
+
+        assert connection.send_error.call_args_list == [
+            call(40, "snapshot_failed", "MeshNet could not load the panel snapshot"),
+            call(41, "messages_failed", "MeshNet could not load message history"),
+            call(42, "send_failed", "MeshNet could not submit the message"),
+        ]
+        connection.send_message.assert_not_called()
+        serialized = json.dumps(
+            {
+                "errors": connection.send_error.call_args_list,
+                "telemetry": coordinator.panel_telemetry.snapshot(),
+            },
+            default=str,
+        )
+        assert private_error not in serialized
+        assert "/config/private.sqlite" not in serialized
+        assert "!12345678" not in serialized
+
+    import asyncio
+
+    asyncio.run(run())
 
 
 def test_snapshot_marks_every_node_false_when_favorite_label_is_absent(
@@ -139,6 +284,45 @@ def test_snapshot_reads_favorites_with_legacy_device_lookup_without_leaking_ids(
     assert private_label_id not in serialized
     assert private_device_id not in serialized
     assert _FAVORITE_LABEL_NAME not in serialized
+
+
+def test_snapshot_inherits_favorite_from_retained_identity_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A projected node stays favorite when its older HA device was labeled."""
+    favorite_label = SimpleNamespace(label_id="favorite-label")
+    monkeypatch.setattr(
+        lr,
+        "async_get",
+        lambda _hass: SimpleNamespace(
+            async_get_label_by_name=MagicMock(return_value=favorite_label),
+        ),
+    )
+    alias_key = "mac:aabbccddeeff"
+    lookup_calls: list[set[tuple[str, str]]] = []
+
+    class LegacyDeviceRegistry:
+        def async_get_device(self, *, identifiers):
+            lookup_calls.append(identifiers)
+            node_key = next(iter(identifiers))[1]
+            labels = {favorite_label.label_id} if node_key == alias_key else set()
+            return SimpleNamespace(labels=labels)
+
+    monkeypatch.setattr(dr, "async_get", lambda _hass: LegacyDeviceRegistry())
+    coordinator = _coordinator()
+    coordinator.node_alias_keys = lambda node_key: (
+        (node_key, alias_key) if node_key == FAVORITE_NODE else (node_key,)
+    )
+
+    result = _snapshot_with_panel_metadata(object(), coordinator)
+
+    assert result["nodes"][FAVORITE_NODE]["favorite"] is True
+    assert result["nodes"][OTHER_NODE]["favorite"] is False
+    assert lookup_calls == [
+        {("meshnet", FAVORITE_NODE)},
+        {("meshnet", alias_key)},
+        {("meshnet", OTHER_NODE)},
+    ]
 
 
 def test_snapshot_prefers_config_entry_scoped_device_lookup(
@@ -244,6 +428,12 @@ def test_snapshot_includes_only_exact_bounded_node_provenance(
     coordinator.panel_node_provenance = MagicMock(
         return_value={
             "total_node_count": 305,
+            "retained_node_record_count": 473,
+            "collapsed_alias_record_count": 168,
+            "resolved_identity_group_count": 150,
+            "unresolved_identity_group_count": 2,
+            "unresolved_identity_node_count": 4,
+            "invalid_identity_record_count": 3,
             "analyzed_node_count": 305,
             "omitted_node_count": 0,
             "current_session_node_count": 191,
@@ -266,6 +456,12 @@ def test_snapshot_includes_only_exact_bounded_node_provenance(
         key: metadata[key]
         for key in (
             "total_node_count",
+            "retained_node_record_count",
+            "collapsed_alias_record_count",
+            "resolved_identity_group_count",
+            "unresolved_identity_group_count",
+            "unresolved_identity_node_count",
+            "invalid_identity_record_count",
             "analyzed_node_count",
             "omitted_node_count",
             "current_session_node_count",
@@ -280,6 +476,12 @@ def test_snapshot_includes_only_exact_bounded_node_provenance(
         )
     } == {
         "total_node_count": 305,
+        "retained_node_record_count": 473,
+        "collapsed_alias_record_count": 168,
+        "resolved_identity_group_count": 150,
+        "unresolved_identity_group_count": 2,
+        "unresolved_identity_node_count": 4,
+        "invalid_identity_record_count": 3,
         "analyzed_node_count": 305,
         "omitted_node_count": 0,
         "current_session_node_count": 191,
@@ -387,6 +589,10 @@ def test_panel_snapshot_omits_raw_provider_state_and_unused_telemetry(
         "connected": False,
     }
     assert result["recent_messages"][0]["raw"] == {"status": "sent"}
+    coordinator.snapshot.recent_messages[0].raw["status"] = ["sent"]
+    assert _snapshot_with_panel_metadata(object(), coordinator)[
+        "recent_messages"
+    ][0]["raw"] == {}
     serialized = json.dumps(result, sort_keys=True)
     for secret in (
         "raw-node-secret",
@@ -582,6 +788,245 @@ def test_panel_reporting_cancellation_is_counted_and_propagated() -> None:
         assert reporting["request_count"] == 1
         assert reporting["failure_count"] == 1
         assert reporting["error_type_counts"] == {"CancelledError": 1}
+
+    import asyncio
+
+    asyncio.run(run())
+
+
+def test_settings_preview_schema_defers_secret_validation_to_admin_handler() -> None:
+    revision = "a" * 64
+    preview = websocket_settings_preview._ws_schema(
+        {
+            "id": 20,
+            "type": "meshnet/settings/preview",
+            "gateway_id": "gateway-one",
+            "revision": revision,
+            "changes": {
+                "identity.long_name": "New name",
+                "network.password": {
+                    "operation": "replace",
+                    "value": "write-only value",
+                },
+            },
+        }
+    )
+    assert preview["changes"]["identity.long_name"] == "New name"
+
+    apply = websocket_settings_apply._ws_schema(
+        {
+            "id": 21,
+            "type": "meshnet/settings/apply",
+            "gateway_id": "gateway-one",
+            "revision": revision,
+            "preview_id": "p" * 43,
+        }
+    )
+    assert apply["confirm_critical"] is False
+
+    malformed = (
+        {**preview, "revision": "short"},
+        {**preview, "changes": {"__proto__.polluted": True}},
+        {
+            **preview,
+            "changes": {
+                "network.password": {"operation": "retry", "value": "secret"}
+            },
+        },
+        {**preview, "raw_command": "factory_reset"},
+    )
+    for message in malformed:
+        # Home Assistant's generic voluptuous error logger does not know that
+        # nested `changes.<path>.value` is secret. The decorator accepts the
+        # envelope so the authorized handler can reject it with fixed text and
+        # without ever rendering the payload.
+        assert websocket_settings_preview._ws_schema(message) == message
+
+
+def test_settings_preview_handler_rejects_malformed_secret_payload_privately() -> None:
+    async def run() -> None:
+        private_value = "never-render-this-secret"
+        coordinator = _coordinator()
+        coordinator.async_gateway_settings_preview = AsyncMock()
+        hass = SimpleNamespace(data={"meshnet": {ENTRY_ID: coordinator}})
+        connection = SimpleNamespace(send_message=MagicMock(), send_error=MagicMock())
+        handler = websocket_settings_preview.__wrapped__.__wrapped__
+
+        await handler(
+            hass,
+            connection,
+            {
+                "id": 22,
+                "type": "meshnet/settings/preview",
+                "gateway_id": "gateway-one",
+                "revision": "a" * 64,
+                "changes": {
+                    "network.password": {
+                        "operation": "retry",
+                        "value": private_value,
+                    }
+                },
+            },
+        )
+
+        coordinator.async_gateway_settings_preview.assert_not_awaited()
+        connection.send_message.assert_not_called()
+        connection.send_error.assert_called_once_with(
+            22,
+            "settings_invalid",
+            "One or more settings changes are invalid",
+        )
+        serialized = json.dumps(
+            {
+                "errors": connection.send_error.call_args_list,
+                "telemetry": coordinator.panel_telemetry.snapshot(),
+            },
+            default=str,
+        )
+        assert private_value not in serialized
+
+    import asyncio
+
+    asyncio.run(run())
+
+
+def test_settings_websocket_handlers_require_admin_before_gateway_access() -> None:
+    """The real HA decorator must reject non-admins before parsing or I/O."""
+    coordinator = _coordinator()
+    coordinator.async_gateway_settings_get = AsyncMock()
+    coordinator.async_gateway_settings_preview = AsyncMock()
+    coordinator.async_gateway_settings_apply = AsyncMock()
+    hass = SimpleNamespace(data={"meshnet": {ENTRY_ID: coordinator}})
+    connection = SimpleNamespace(
+        user=SimpleNamespace(is_admin=False),
+        send_result=MagicMock(),
+        send_error=MagicMock(),
+    )
+    messages = (
+        (
+            websocket_settings_get,
+            {"id": 23, "type": "meshnet/settings/get"},
+        ),
+        (
+            websocket_settings_preview,
+            {
+                "id": 24,
+                "type": "meshnet/settings/preview",
+                "gateway_id": "gateway-one",
+                "revision": "a" * 64,
+                "changes": {
+                    "security.pin": {
+                        "operation": "retry",
+                        "value": "must-never-reach-the-handler",
+                    }
+                },
+            },
+        ),
+        (
+            websocket_settings_apply,
+            {
+                "id": 25,
+                "type": "meshnet/settings/apply",
+                "gateway_id": "gateway-one",
+                "revision": "a" * 64,
+                "preview_id": "p" * 43,
+                "confirm_critical": True,
+            },
+        ),
+    )
+
+    for handler, message in messages:
+        with pytest.raises(Unauthorized):
+            handler(hass, connection, message)
+
+    coordinator.async_gateway_settings_get.assert_not_awaited()
+    coordinator.async_gateway_settings_preview.assert_not_awaited()
+    coordinator.async_gateway_settings_apply.assert_not_awaited()
+    connection.send_result.assert_not_called()
+    connection.send_error.assert_not_called()
+
+
+def test_settings_websocket_handlers_delegate_without_exposing_provider_errors() -> None:
+    async def run() -> None:
+        from custom_components.meshnet.gateway_settings import (
+            GatewaySettingsUnavailable,
+        )
+
+        coordinator = _coordinator()
+        coordinator.async_gateway_settings_get = AsyncMock(
+            return_value={"gateways": [], "selected": {}}
+        )
+        coordinator.async_gateway_settings_preview = AsyncMock(
+            return_value={"preview_id": "safe-preview"}
+        )
+        coordinator.async_gateway_settings_apply = AsyncMock(
+            side_effect=GatewaySettingsUnavailable(
+                "private password at 41.1234,-87.5678"
+            )
+        )
+        hass = SimpleNamespace(data={"meshnet": {ENTRY_ID: coordinator}})
+        connection = SimpleNamespace(send_message=MagicMock(), send_error=MagicMock())
+
+        get_handler = websocket_settings_get.__wrapped__.__wrapped__
+        await get_handler(
+            hass,
+            connection,
+            {"id": 30, "type": "meshnet/settings/get", "gateway_id": "gateway-one"},
+        )
+        coordinator.async_gateway_settings_get.assert_awaited_once_with("gateway-one")
+        get_envelope = connection.send_message.call_args.args[0]
+        assert get_envelope["id"] == 30
+        assert get_envelope["result"] == {"gateways": [], "selected": {}}
+
+        preview_handler = websocket_settings_preview.__wrapped__.__wrapped__
+        await preview_handler(
+            hass,
+            connection,
+            {
+                "id": 31,
+                "type": "meshnet/settings/preview",
+                "gateway_id": "gateway-one",
+                "revision": "a" * 64,
+                "changes": {"identity.long_name": "New name"},
+            },
+        )
+        coordinator.async_gateway_settings_preview.assert_awaited_once_with(
+            gateway_id="gateway-one",
+            revision="a" * 64,
+            changes={"identity.long_name": "New name"},
+        )
+        preview_envelope = connection.send_message.call_args.args[0]
+        assert preview_envelope["id"] == 31
+        assert preview_envelope["result"] == {"preview_id": "safe-preview"}
+
+        apply_handler = websocket_settings_apply.__wrapped__.__wrapped__
+        await apply_handler(
+            hass,
+            connection,
+            {
+                "id": 32,
+                "type": "meshnet/settings/apply",
+                "gateway_id": "gateway-one",
+                "revision": "a" * 64,
+                "preview_id": "p" * 43,
+                "confirm_critical": True,
+            },
+        )
+        connection.send_error.assert_called_once_with(
+            32,
+            "settings_unavailable",
+            "Live settings are unavailable for this gateway",
+        )
+        serialized = json.dumps(
+            {
+                "result_calls": connection.send_message.call_args_list,
+                "error_calls": connection.send_error.call_args_list,
+                "telemetry": coordinator.panel_telemetry.snapshot(),
+            },
+            default=str,
+        )
+        assert "private password" not in serialized
+        assert "41.1234" not in serialized
 
     import asyncio
 

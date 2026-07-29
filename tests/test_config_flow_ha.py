@@ -69,6 +69,7 @@ from custom_components.meshnet.const import (  # noqa: E402
     CONF_SERIAL_PATH,
     CONF_TRANSPORT,
     DOMAIN,
+    MESSAGE_TYPE_DIRECT,
     PROTOCOL_MESHCORE,
     PROTOCOL_MESHTASTIC,
     TRANSPORT_BLUETOOTH,
@@ -103,7 +104,13 @@ def test_service_schema_normalizes_yaml_node_numbers_without_boolean_coercion() 
     _async_register_services(hass)
     handler, schema = registrations[(DOMAIN, "send_message")]
 
-    validated = schema({"message": "test", "target_node": 123456789})
+    validated = schema(
+        {
+            "message": "test",
+            "target_node": 123456789,
+            "message_type": MESSAGE_TYPE_DIRECT,
+        }
+    )
     assert validated["target_node"] == "123456789"
     assert schema({"message": "test", "target_node": 123456789.0})[
         "target_node"
@@ -119,7 +126,7 @@ def test_service_schema_normalizes_yaml_node_numbers_without_boolean_coercion() 
         message="test",
         channel=None,
         priority="normal",
-        message_type="broadcast",
+        message_type=MESSAGE_TYPE_DIRECT,
         gateway_id=None,
     )
 

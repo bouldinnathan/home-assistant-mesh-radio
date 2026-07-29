@@ -1,6 +1,6 @@
 # MeshNet for Home Assistant
 
-MeshNet turns Home Assistant into one operating surface for Meshtastic and MeshCore radios. It creates gateway and node entities, records telemetry and messages, tracks valid GPS positions, exposes actions and events, and provides an admin-only mesh panel with explicit broadcast/direct messaging, favorites-aware node sorting, native Map access, and passive evidence-only topology.
+MeshNet turns Home Assistant into one operating surface for Meshtastic and MeshCore radios. It creates gateway and node entities, records telemetry and messages, tracks valid GPS positions, exposes actions and events, and provides an admin-only mesh panel with explicit broadcast/direct messaging, favorites-aware node sorting, native Map access, passive evidence-only topology, and validated live gateway settings.
 
 > [!IMPORTANT]
 > The current package is an in-process Home Assistant custom integration. Use it
@@ -89,8 +89,8 @@ MQTT is not a magic replacement for a broker or bridge. Meshtastic MQTT consumes
 ### Direct Meshtastic Bluetooth
 
 > [!NOTE]
-> This describes the version 0.5 behavior. Install a version 0.5 build before
-> expecting these pairing controls in Home Assistant.
+> These pairing controls were introduced in version 0.5. Install version 0.5
+> or newer before expecting them in Home Assistant.
 
 MeshNet provides a Home Assistant pairing wizard for Meshtastic radios on a
 local BlueZ adapter. Choose a discovered radio from the dropdown, or use the
@@ -140,6 +140,44 @@ The radio normally permits only one Bluetooth client, so close the Meshtastic
 phone or web client while Home Assistant owns the connection; use MeshNet's
 local Home Assistant panel for normal operation.
 
+### Distinct Meshtastic nodes
+
+MeshNet shows one effective node for cached MAC, decimal, hexadecimal, and
+packet records that carry the same exact valid Meshtastic `!xxxxxxxx` ID and
+one consistently observed MAC/public-key proof bundle. The projection is used
+consistently by the sidebar, passive graph, Map, and entities. Original SQLite
+records are retained
+for rollback, malformed or conflicting evidence stays separate, and this
+identity work sends no radio traffic. Panel diagnostics report distinct nodes,
+collapsed aliases, retained records, and unresolved evidence separately.
+When conflicting records share one routing ID, direct messaging to that ID is
+disabled because the radio protocol cannot distinguish which record is real.
+Direct messaging is also disabled when one MAC or public key appears under
+different routing IDs; MeshNet will not guess whether that is stale history, a
+clone, or corrupted identity data.
+MAC-only and public-key-only records are likewise not combined unless one
+retained observation actually binds those proofs together.
+
+### Gateway settings
+
+The admin-only MeshNet sidebar has a dedicated **Gateway settings** tab. It
+loads supported values from the physically connected radio, keeps edits in
+memory, requires a server-generated redacted preview, applies only that exact
+preview, and then reads the radio back for verification. Connection-critical
+changes require separate confirmation and run last.
+
+MeshCore BLE/serial/TCP companion connections support validated local writes;
+Meshtastic writes are limited to the direct async Bluetooth transport in 0.6.0.
+Meshtastic serial/TCP and MQTT/REST bridge settings remain read-only. Secret
+values are write-only and are not returned or included in previews or
+diagnostics. See [Gateway Settings](docs/GATEWAY_SETTINGS.md) for the exact
+support matrix, PIN handling, unknown-timeout recovery, and deliberately
+excluded destructive operations.
+
+> [!WARNING]
+> An applied setting persists on the radio. Removing the integration or
+> uninstalling it through HACS cannot restore an intentional hardware change.
+
 ## Container hardware access
 
 Network gateways need to be reachable from inside the Home Assistant container, not just from the Docker host.
@@ -182,9 +220,10 @@ Useful documentation:
 1. [Installation](docs/INSTALL.md)
 2. [Configuration](docs/CONFIGURATION.md)
 3. [Usage](docs/USAGE.md)
-4. [Troubleshooting](docs/TROUBLESHOOTING.md)
-5. [Security](docs/SECURITY.md)
-6. [Architecture](docs/ARCHITECTURE.md)
+4. [Gateway Settings](docs/GATEWAY_SETTINGS.md)
+5. [Troubleshooting](docs/TROUBLESHOOTING.md)
+6. [Security](docs/SECURITY.md)
+7. [Architecture](docs/ARCHITECTURE.md)
 
 ## Development check
 

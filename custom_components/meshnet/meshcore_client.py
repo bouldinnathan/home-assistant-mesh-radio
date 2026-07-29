@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 from collections.abc import Coroutine
 from typing import Any
 
@@ -34,6 +35,11 @@ from .models import (
 _LOGGER = logging.getLogger(__name__)
 _DISCONNECT_WAIT_TIMEOUT = 2.0
 _POLL_TASK_CANCEL_TIMEOUT = 2.0
+_MAX_MESHCORE_IDENTIFIER_BYTES = 512
+_MAX_MESHCORE_LABEL_BYTES = 256
+_MAX_MESHCORE_MESSAGE_BYTES = 4096
+_MAX_MESHCORE_SENSOR_KEY_BYTES = 128
+_MAX_MESHCORE_SENSOR_TEXT_BYTES = 1024
 
 
 class MeshCoreClient(MeshGateway):
@@ -49,6 +55,10 @@ class MeshCoreClient(MeshGateway):
         self._lifecycle_epoch = 0
         self._contacts: dict[str, Any] = {}
         self._native_subscribed_events: set[str] = set()
+        # MeshCore's companion protocol supports one outstanding command.  All
+        # native polling, sends, refreshes, and settings transactions share
+        # this lock so replies cannot be consumed by the wrong waiter.
+        self._native_command_lock = asyncio.Lock()
 
     def diagnostic_snapshot(self) -> dict[str, Any]:
         """Return cached MeshCore lifecycle state without contacts or endpoints."""
@@ -71,6 +81,7 @@ class MeshCoreClient(MeshGateway):
                 "background_task_states": task_states,
                 "contact_count": len(self._contacts),
                 "native_subscription_count": len(self._native_subscribed_events),
+                "native_command_locked": self._native_command_lock.locked(),
             }
         )
         return snapshot
@@ -136,7 +147,10 @@ class MeshCoreClient(MeshGateway):
         try:
             unsubscribe()
         except Exception as err:
-            self._logger.debug("Failed to unsubscribe MeshCore MQTT: %s", err)
+            self._logger.debug(
+                "Failed to unsubscribe MeshCore MQTT (%s)",
+                type(err).__name__,
+            )
 
     async def _async_disconnect_native(self, meshcore: Any) -> None:
         """Start disconnecting one interface without letting it hang unload."""
@@ -170,7 +184,8 @@ class MeshCoreClient(MeshGateway):
                 return
             if error is not None:
                 self._logger.debug(
-                    "Failed to disconnect MeshCore interface: %s", error
+                    "Failed to disconnect MeshCore interface (%s)",
+                    type(error).__name__,
                 )
 
         disconnect_task.add_done_callback(disconnect_done)
@@ -264,7 +279,13 @@ class MeshCoreClient(MeshGateway):
             if command is None:
                 continue
             try:
-                result = await command()
+                async with self._native_command_lock:
+                    if (
+                        not self._lifecycle_is_current(lifecycle_epoch)
+                        or self._meshcore is not meshcore
+                    ):
+                        return
+                    result = await command()
             except asyncio.CancelledError:
                 raise
             except Exception as err:
@@ -286,6 +307,20 @@ class MeshCoreClient(MeshGateway):
                 await self._handle_native_event(
                     result, lifecycle_epoch=lifecycle_epoch
                 )
+
+    async def async_get_settings_snapshot(self) -> dict[str, Any]:
+        """Return a privacy-safe live MeshCore settings schema."""
+        from .meshcore_settings import MeshCoreSettingsAdapter
+
+        return await MeshCoreSettingsAdapter(self).async_get_settings_snapshot()
+
+    async def async_apply_settings_plan(
+        self, changes: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Apply a validated MeshCore settings plan once and verify it."""
+        from .meshcore_settings import MeshCoreSettingsAdapter
+
+        return await MeshCoreSettingsAdapter(self).async_apply_settings_plan(changes)
 
     async def _start_mqtt(self, lifecycle_epoch: int) -> None:
         try:
@@ -574,7 +609,11 @@ class MeshCoreClient(MeshGateway):
             try:
                 subscribe(value, handler)
             except Exception as err:
-                self._logger.debug("Could not subscribe to MeshCore event %s: %s", name, err)
+                self._logger.debug(
+                    "Could not subscribe to MeshCore event %s (%s)",
+                    name,
+                    type(err).__name__,
+                )
             else:
                 self._native_subscribed_events.add(_event_type_name(value))
 
@@ -591,7 +630,13 @@ class MeshCoreClient(MeshGateway):
             if command is None:
                 return
             try:
-                event = await command(timeout=5)
+                async with self._native_command_lock:
+                    if (
+                        not self._lifecycle_is_current(lifecycle_epoch)
+                        or self._meshcore is not meshcore
+                    ):
+                        return
+                    event = await command(timeout=5)
                 if (
                     not self._lifecycle_is_current(lifecycle_epoch)
                     or self._meshcore is not meshcore
@@ -641,16 +686,26 @@ class MeshCoreClient(MeshGateway):
         channel: str | None,
         message_type: str,
     ) -> None:
-        if self._meshcore is None:
+        meshcore = self._meshcore
+        lifecycle_epoch = self._lifecycle_epoch
+        if meshcore is None:
             raise RuntimeError("MeshCore interface is not connected")
-        commands = getattr(self._meshcore, "commands", None)
+        commands = getattr(meshcore, "commands", None)
         if commands is None:
             raise RuntimeError("MeshCore command interface is unavailable")
-        if message_type == MESSAGE_TYPE_DIRECT and target_node:
-            result = await commands.send_msg(self._contacts.get(target_node, target_node), message)
-        else:
-            channel_index = coerce_int(channel) or 0
-            result = await commands.send_chan_msg(channel_index, message)
+        async with self._native_command_lock:
+            if (
+                not self._lifecycle_is_current(lifecycle_epoch)
+                or self._meshcore is not meshcore
+            ):
+                raise RuntimeError("MeshCore interface disconnected before send")
+            if message_type == MESSAGE_TYPE_DIRECT and target_node:
+                result = await commands.send_msg(
+                    self._contacts.get(target_node, target_node), message
+                )
+            else:
+                channel_index = coerce_int(channel) or 0
+                result = await commands.send_chan_msg(channel_index, message)
         if str(getattr(getattr(result, "type", ""), "value", getattr(result, "type", ""))).endswith("error"):
             raise RuntimeError(str(getattr(result, "payload", "MeshCore send failed")))
 
@@ -740,6 +795,11 @@ class MeshCoreClient(MeshGateway):
             await self._set_connected(False, disconnect_event=payload)
             return
         if event_type in {"messages_waiting", "no_more_messages"}:
+            return
+        if event_type in {"self_info", "device_info", "channel_info"}:
+            # These command responses contain the radio public key, Bluetooth
+            # PIN, or channel secret.  They are configuration state, not mesh
+            # packets, and must never enter packet history or diagnostics.
             return
         if isinstance(payload, dict) and event_type == "contacts":
             await self._handle_contacts(
@@ -861,41 +921,112 @@ def meshcore_payload_to_packet(
 ) -> MeshPacket:
     """Normalize MeshCore packet, event, or REST JSON into MeshPacket."""
     payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else raw
-    event_type = raw.get("event_type") or raw.get("type") or raw.get("packet_type")
-    text = (
-        payload.get("text")
-        or payload.get("message")
-        or raw.get("text")
-        or raw.get("message")
+    event_type = _first_bounded_text(
+        raw,
+        "event_type",
+        "type",
+        "packet_type",
+        maximum_bytes=_MAX_MESHCORE_LABEL_BYTES,
     )
+    text = _first_bounded_text(
+        payload,
+        "text",
+        "message",
+        maximum_bytes=_MAX_MESHCORE_MESSAGE_BYTES,
+        strip=False,
+    )
+    if text is None and payload is not raw:
+        text = _first_bounded_text(
+            raw,
+            "text",
+            "message",
+            maximum_bytes=_MAX_MESHCORE_MESSAGE_BYTES,
+            strip=False,
+        )
     timestamp = (
         parse_timestamp(payload.get("timestamp"))
         or parse_timestamp(raw.get("timestamp"))
         or parse_timestamp(payload.get("time"))
         or utcnow()
     )
-    sender = (
-        payload.get("sender")
-        or payload.get("from")
-        or payload.get("from_id")
-        or payload.get("pubkey_prefix")
-        or raw.get("origin")
-        or raw.get("origin_id")
+    sender = _first_bounded_text(
+        payload,
+        "sender",
+        "from",
+        "from_id",
+        "pubkey_prefix",
+        maximum_bytes=_MAX_MESHCORE_IDENTIFIER_BYTES,
+        allow_integer=True,
     )
-    receiver = payload.get("receiver") or payload.get("to") or payload.get("dst") or raw.get("dst")
+    if sender is None and payload is not raw:
+        sender = _first_bounded_text(
+            raw,
+            "origin",
+            "origin_id",
+            maximum_bytes=_MAX_MESHCORE_IDENTIFIER_BYTES,
+            allow_integer=True,
+        )
+    receiver = _first_bounded_text(
+        payload,
+        "receiver",
+        "to",
+        "dst",
+        maximum_bytes=_MAX_MESHCORE_IDENTIFIER_BYTES,
+        allow_integer=True,
+    )
+    if receiver is None and payload is not raw:
+        receiver = _first_bounded_text(
+            raw,
+            "dst",
+            maximum_bytes=_MAX_MESHCORE_IDENTIFIER_BYTES,
+            allow_integer=True,
+        )
+    packet_id = _first_bounded_text(
+        payload,
+        "hash",
+        "id",
+        maximum_bytes=_MAX_MESHCORE_IDENTIFIER_BYTES,
+        allow_integer=True,
+    )
+    if packet_id is None and payload is not raw:
+        packet_id = _first_bounded_text(
+            raw,
+            "hash",
+            "id",
+            maximum_bytes=_MAX_MESHCORE_IDENTIFIER_BYTES,
+            allow_integer=True,
+        )
+    channel = _first_bounded_text(
+        payload,
+        "channel",
+        "channel_index",
+        maximum_bytes=_MAX_MESHCORE_LABEL_BYTES,
+        allow_integer=True,
+    )
+    if channel is None and payload is not raw:
+        channel = _first_bounded_text(
+            raw,
+            "channel",
+            maximum_bytes=_MAX_MESHCORE_LABEL_BYTES,
+            allow_integer=True,
+        )
     route = payload.get("route") or raw.get("route")
     hops = coerce_int(payload.get("hops") or payload.get("path_len") or (len(route) if isinstance(route, list) else None))
     return MeshPacket(
         protocol=PROTOCOL_MESHCORE,
         gateway_id=gateway_id,
-        packet_id=str(payload.get("hash") or payload.get("id") or raw.get("hash") or raw.get("id") or "") or None,
-        sender=str(sender) if sender is not None else None,
-        receiver=str(receiver) if receiver is not None else None,
-        channel=str(payload.get("channel") or payload.get("channel_index") or raw.get("channel") or "") or None,
-        portnum=str(event_type) if event_type is not None else None,
+        packet_id=packet_id,
+        sender=sender,
+        receiver=receiver,
+        channel=channel,
+        portnum=event_type,
         payload=payload.get("data") or payload.get("payload") or raw.get("data"),
         text=text,
-        encrypted=payload.get("encrypted") if "encrypted" in payload else None,
+        encrypted=(
+            payload.get("encrypted")
+            if isinstance(payload.get("encrypted"), bool)
+            else None
+        ),
         rssi=coerce_float(payload.get("rssi") or payload.get("last_rssi")),
         snr=coerce_float(payload.get("snr") or payload.get("last_snr")),
         hops=hops,
@@ -923,7 +1054,15 @@ def meshcore_payload_to_node(
         or payload.get("hash")
         or payload.get("contact")
     )
-    node_id = payload.get("id") or payload.get("node_id") or payload.get("name") or payload.get("adv_name")
+    node_id = _first_bounded_text(
+        payload,
+        "id",
+        "node_id",
+        "name",
+        "adv_name",
+        maximum_bytes=_MAX_MESHCORE_IDENTIFIER_BYTES,
+        allow_integer=True,
+    )
     if packet and not public_key and not node_id:
         node_id = packet.sender
     if not public_key and not node_id:
@@ -937,19 +1076,47 @@ def meshcore_payload_to_node(
     return NodeState(
         node_key=node_key,
         protocol=PROTOCOL_MESHCORE,
-        node_id=str(node_id) if node_id is not None else None,
+        node_id=node_id,
         public_key=public_key,
-        user_name=payload.get("name") or payload.get("adv_name"),
-        long_name=(
-            payload.get("long_name")
-            or payload.get("advert_name")
-            or payload.get("adv_name")
-            or payload.get("name")
+        user_name=_first_bounded_text(
+            payload,
+            "name",
+            "adv_name",
+            maximum_bytes=_MAX_MESHCORE_LABEL_BYTES,
         ),
-        short_name=payload.get("short_name"),
-        hardware_model=payload.get("model") or payload.get("hardware") or payload.get("board"),
-        firmware_version=payload.get("firmware_version") or payload.get("firmware"),
-        role=payload.get("role") or payload.get("node_type") or payload.get("type"),
+        long_name=_first_bounded_text(
+            payload,
+            "long_name",
+            "advert_name",
+            "adv_name",
+            "name",
+            maximum_bytes=_MAX_MESHCORE_LABEL_BYTES,
+        ),
+        short_name=_first_bounded_text(
+            payload,
+            "short_name",
+            maximum_bytes=_MAX_MESHCORE_LABEL_BYTES,
+        ),
+        hardware_model=_first_bounded_text(
+            payload,
+            "model",
+            "hardware",
+            "board",
+            maximum_bytes=_MAX_MESHCORE_LABEL_BYTES,
+        ),
+        firmware_version=_first_bounded_text(
+            payload,
+            "firmware_version",
+            "firmware",
+            maximum_bytes=_MAX_MESHCORE_LABEL_BYTES,
+        ),
+        role=_first_bounded_text(
+            payload,
+            "role",
+            "node_type",
+            "type",
+            maximum_bytes=_MAX_MESHCORE_LABEL_BYTES,
+        ),
         online=True,
         last_heard=timestamp,
         last_gateway_id=gateway_id,
@@ -965,8 +1132,16 @@ def meshcore_payload_to_node(
         power={
             "battery_level": coerce_float(payload.get("battery") or payload.get("battery_level")),
             "voltage": coerce_float(payload.get("voltage") or payload.get("battery_voltage")),
-            "power_source": payload.get("power_source"),
-            "charging": payload.get("charging"),
+            "power_source": _first_bounded_text(
+                payload,
+                "power_source",
+                maximum_bytes=_MAX_MESHCORE_LABEL_BYTES,
+            ),
+            "charging": (
+                payload.get("charging")
+                if isinstance(payload.get("charging"), bool)
+                else None
+            ),
         },
         radio={
             "frequency": coerce_float(payload.get("frequency") or payload.get("freq")),
@@ -992,9 +1167,15 @@ def meshcore_payload_to_node(
 
 
 def _extract_meshcore_sensors(payload: dict[str, Any]) -> dict[str, Any]:
-    sensors = {}
+    sensors: dict[str, str | bool | int | float] = {}
     for key, value in payload.items():
-        normalized = str(key).lower()
+        normalized = _bounded_text(
+            key,
+            maximum_bytes=_MAX_MESHCORE_SENSOR_KEY_BYTES,
+        )
+        if normalized is None:
+            continue
+        normalized = normalized.casefold()
         if normalized in {
             "temperature",
             "humidity",
@@ -1010,13 +1191,14 @@ def _extract_meshcore_sensors(payload: dict[str, Any]) -> dict[str, Any]:
             "pir",
             "water",
         }:
-            sensors[normalized] = value
+            if (safe_value := _safe_sensor_scalar(value)) is not None:
+                sensors[normalized] = safe_value
     nested = payload.get("sensors")
     if isinstance(nested, dict):
-        sensors.update(nested)
+        _merge_safe_sensors(sensors, nested)
     telemetry = payload.get("telemetry")
     if isinstance(telemetry, dict):
-        sensors.update(telemetry)
+        _merge_safe_sensors(sensors, telemetry)
     return sensors
 
 
@@ -1031,7 +1213,84 @@ def _public_key_text(value: Any) -> str | None:
     """Normalize MeshCore public keys used as contact-map keys."""
     if value is None:
         return None
-    if isinstance(value, bytes):
-        return value.hex()
-    text = str(value).strip()
-    return text or None
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raw = bytes(value)
+        return raw.hex() if 1 <= len(raw) <= 128 else None
+    return _bounded_text(
+        value,
+        maximum_bytes=_MAX_MESHCORE_IDENTIFIER_BYTES,
+    )
+
+
+def _bounded_text(
+    value: Any,
+    *,
+    maximum_bytes: int,
+    allow_integer: bool = False,
+    strip: bool = True,
+) -> str | None:
+    """Return one explicitly bounded scalar string without stringifying JSON."""
+    if isinstance(value, bool):
+        return None
+    if allow_integer and isinstance(value, int):
+        text = str(value)
+    elif isinstance(value, str):
+        text = value.strip() if strip else value
+    else:
+        return None
+    if not text or (not strip and not text.strip()):
+        return None
+    try:
+        encoded = text.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    return text if len(encoded) <= maximum_bytes else None
+
+
+def _first_bounded_text(
+    values: dict[str, Any],
+    *keys: str,
+    maximum_bytes: int,
+    allow_integer: bool = False,
+    strip: bool = True,
+) -> str | None:
+    """Return the first valid bounded scalar among named provider fields."""
+    for key in keys:
+        text = _bounded_text(
+            values.get(key),
+            maximum_bytes=maximum_bytes,
+            allow_integer=allow_integer,
+            strip=strip,
+        )
+        if text is not None:
+            return text
+    return None
+
+
+def _safe_sensor_scalar(value: Any) -> str | bool | int | float | None:
+    """Keep only Home Assistant state-safe, finite sensor scalars."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    return _bounded_text(
+        value,
+        maximum_bytes=_MAX_MESHCORE_SENSOR_TEXT_BYTES,
+    )
+
+
+def _merge_safe_sensors(
+    target: dict[str, str | bool | int | float],
+    source: dict[Any, Any],
+) -> None:
+    """Merge bounded scalar sensor values from an untrusted provider mapping."""
+    for raw_key, raw_value in source.items():
+        key = _bounded_text(
+            raw_key,
+            maximum_bytes=_MAX_MESHCORE_SENSOR_KEY_BYTES,
+        )
+        value = _safe_sensor_scalar(raw_value)
+        if key is not None and value is not None:
+            target[key.casefold()] = value

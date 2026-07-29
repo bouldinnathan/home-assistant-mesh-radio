@@ -24,14 +24,19 @@ import math
 import secrets
 import time
 import unicodedata
+from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import suppress
+from dataclasses import dataclass, field
 from typing import Any
 
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.message import DecodeError
-from meshtastic.protobuf import mesh_pb2, portnums_pb2, telemetry_pb2
+from meshtastic.protobuf import admin_pb2, mesh_pb2, portnums_pb2, telemetry_pb2
 
+from ..meshtastic_settings import MeshtasticSettingsState
+from ..node_identity import canonical_meshtastic_node_id
+from ..sensitive_logging import suppress_sensitive_library_logs
 from .bluetooth import BluetoothConnection
 from .errors import (
     MeshtasticAsyncError,
@@ -45,6 +50,8 @@ _BROADCAST_NUM = 0xFFFFFFFF
 _BROADCAST_ID = "^all"
 _NODELESS_WANT_CONFIG_ID = 69420
 _STREAM_END = object()
+_SETTINGS_APPLY_TIMEOUT = 105.0
+_SETTINGS_READBACK_TIMEOUT = 70.0
 _NODE_NAME_FIELDS = (
     "shortName",
     "longName",
@@ -113,6 +120,27 @@ type StateCallback = Callable[[str], Any | Awaitable[Any]]
 type ConnectionFactory = Callable[..., BluetoothConnection]
 
 
+@dataclass(slots=True)
+class _AdminResponse:
+    """Sanitized metadata for one exactly correlated routing response."""
+
+    kind: str
+    error_reason: str | None = None
+
+
+@dataclass(slots=True)
+class _PendingAdminResponse:
+    """A single registered ADMIN_APP request."""
+
+    future: asyncio.Future[_AdminResponse] = field(repr=False)
+    source: int = 0
+    channel: int = 0
+
+
+class _AdminResponseTimeout(MeshtasticConfigurationError):
+    """An ADMIN_APP packet was sent once but its final state is unknown."""
+
+
 class MeshtasticBluetoothClient:
     """Maintain one local Meshtastic Bluetooth protocol session."""
 
@@ -132,6 +160,7 @@ class MeshtasticBluetoothClient:
         reconnect_initial_delay: float = 1.0,
         reconnect_max_delay: float = 30.0,
         heartbeat_interval: float = 300.0,
+        admin_response_timeout: float = 15.0,
         stream_queue_size: int = 128,
         state_callback: StateCallback | None = None,
         logger: logging.Logger | None = None,
@@ -153,6 +182,7 @@ class MeshtasticBluetoothClient:
             reconnect_initial_delay,
             reconnect_max_delay,
             heartbeat_interval,
+            admin_response_timeout,
         ) <= 0:
             raise ValueError("timeouts and reconnect delays must be positive")
         if stream_queue_size < 1:
@@ -173,12 +203,14 @@ class MeshtasticBluetoothClient:
         self._reconnect_initial_delay = reconnect_initial_delay
         self._reconnect_max_delay = reconnect_max_delay
         self._heartbeat_interval = heartbeat_interval
+        self._admin_response_timeout = admin_response_timeout
         self._stream_queue_size = stream_queue_size
         self._state_callback = state_callback
         self._logger = logger or logging.getLogger(__name__)
 
         self._lifecycle_lock = asyncio.Lock()
         self._send_lock = asyncio.Lock()
+        self._settings_lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
         self._active_event = asyncio.Event()
         self._start_result_event = asyncio.Event()
@@ -193,6 +225,13 @@ class MeshtasticBluetoothClient:
         self._connection_callbacks: set[ConnectionCallback] = set()
         self._stream_queues: set[asyncio.Queue[Any]] = set()
         self._nodes: dict[int, dict[str, Any]] = {}
+        self._settings = MeshtasticSettingsState()
+        self._pending_admin_responses: dict[int, _PendingAdminResponse] = {}
+        self._internal_admin_request_ids: deque[int] = deque(maxlen=128)
+        self._connection_generation = 0
+        self._settings_complete_sequence = 0
+        self._settings_complete_generation = 0
+        self._settings_complete_signal = asyncio.Event()
 
         self._state = "bluetooth_idle"
         self._connected = False
@@ -217,6 +256,10 @@ class MeshtasticBluetoothClient:
         self._callback_error_count = 0
         self._dropped_stream_packet_count = 0
         self._sent_text_count = 0
+        self._admin_request_count = 0
+        self._admin_response_count = 0
+        self._admin_timeout_count = 0
+        self._admin_nak_count = 0
         self._last_connected_monotonic: float | None = None
 
     @property
@@ -288,6 +331,7 @@ class MeshtasticBluetoothClient:
             self._set_state("bluetooth_stopping")
             self._stop_event.set()
             self._active_event.clear()
+            self._fail_pending_admin_responses()
             runner = self._runner_task
             if runner is not None and not runner.done():
                 runner.cancel()
@@ -487,6 +531,225 @@ class MeshtasticBluetoothClient:
         """Async compatibility wrapper for callers with an async gateway API."""
         return self.node_snapshot()
 
+    async def async_get_settings_snapshot(self) -> dict[str, Any]:
+        """Return the captured local-radio settings without credential values."""
+        writable = bool(
+            self.connected and self._settings.complete and not self._settings.managed
+        )
+        if self._settings.managed:
+            reason = "managed_mode_rejects_local_admin_changes"
+        elif not self.connected:
+            reason = "local_radio_is_not_connected"
+        elif not self._settings.complete:
+            reason = "local_radio_settings_download_is_incomplete"
+        else:
+            reason = "confirmed_admin_write_and_verification_not_available"
+        return self._settings.public_snapshot(
+            transport="bluetooth",
+            write_supported=writable,
+            apply_reason=reason,
+        )
+
+    async def async_apply_settings_plan(
+        self, changes: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Apply one validated transaction once and verify a fresh reread."""
+        commit_attempted = False
+        async with self._settings_lock:
+            try:
+                async with asyncio.timeout(_SETTINGS_APPLY_TIMEOUT):
+                    if not self.connected or self._connection is None:
+                        raise MeshtasticNotConnectedError(
+                            "Meshtastic Bluetooth is not active"
+                        )
+                    plan = self._settings.build_plan(
+                        changes,
+                        transport="bluetooth",
+                        admin_message_factory=admin_pb2.AdminMessage,
+                    )
+                    if plan.blocked_paths or not plan.operations:
+                        blocked_paths = ", ".join(sorted(plan.blocked_paths))
+                        raise MeshtasticConfigurationError(
+                            "Meshtastic settings contain unsupported paths"
+                            + (f": {blocked_paths}" if blocked_paths else "")
+                        )
+
+                    connection = self._connection
+                    baseline_sequence = self._settings_complete_sequence
+                    baseline_generation = self._connection_generation
+                    async with suppress_sensitive_library_logs("meshtastic"):
+                        async with self._send_lock:
+                            self._require_transaction_connection(connection)
+                            if self._settings.revision != plan.revision:
+                                raise MeshtasticConfigurationError(
+                                    "Meshtastic settings changed before the transaction began"
+                                )
+                            for operation in plan.operations:
+                                self._require_transaction_connection(connection)
+                                is_commit = (
+                                    operation.operation == "commit_edit_settings"
+                                )
+                                if is_commit:
+                                    commit_attempted = True
+                                try:
+                                    await self._async_send_admin_locked(
+                                        operation.message,
+                                        connection=connection,
+                                    )
+                                except (
+                                    _AdminResponseTimeout,
+                                    MeshtasticConnectionError,
+                                    MeshtasticCleanupError,
+                                ):
+                                    # Commit intentionally reboots and disables
+                                    # BLE, so its ACK can be lost. It is never
+                                    # sent again; only a reconnect and exact raw
+                                    # readback can establish success.
+                                    if not is_commit:
+                                        raise
+                                    break
+                        refreshed = await self._async_wait_for_settings_refresh(
+                            baseline_sequence,
+                            baseline_generation,
+                        )
+            except TimeoutError as err:
+                if commit_attempted:
+                    return {
+                        "verified": [],
+                        "reconnect_required": True,
+                        "warning_codes": [
+                            "post_commit_readback_unavailable"
+                        ],
+                    }
+                raise MeshtasticConfigurationError(
+                    "Meshtastic settings operation exceeded its safety timeout"
+                ) from err
+
+            if not refreshed:
+                return {
+                    "verified": [],
+                    "reconnect_required": True,
+                    "warning_codes": ["post_commit_readback_unavailable"],
+                }
+            verified, unverified = self._settings.verify_plan(plan)
+            return {
+                "verified": verified,
+                "reconnect_required": True,
+                "warning_codes": (
+                    ["post_commit_readback_mismatch"] if unverified else []
+                ),
+            }
+
+    def _require_transaction_connection(
+        self, connection: BluetoothConnection
+    ) -> None:
+        """Fail if the settings transaction lost its exact GATT owner."""
+        if (
+            self._connection is not connection
+            or not self.connected
+            or not connection.is_connected
+        ):
+            raise MeshtasticConnectionError(
+                "Meshtastic Bluetooth changed during the settings transaction"
+            )
+
+    async def _async_send_admin_locked(
+        self,
+        admin_message: Any,
+        *,
+        connection: BluetoothConnection,
+    ) -> _AdminResponse:
+        """Send one ADMIN_APP packet once and await its correlated response."""
+        self._require_transaction_connection(connection)
+        if self._my_node_num is None:
+            raise MeshtasticConfigurationError(
+                "Meshtastic local node identity is unavailable"
+            )
+        outgoing = admin_pb2.AdminMessage()
+        outgoing.CopyFrom(admin_message)
+        payload = outgoing.SerializeToString()
+        maximum = int(getattr(mesh_pb2.Constants, "DATA_PAYLOAD_LEN", 237))
+        if len(payload) > maximum:
+            raise MeshtasticConfigurationError(
+                "Meshtastic admin request exceeds the radio payload limit"
+            )
+
+        packet = mesh_pb2.MeshPacket()
+        packet.to = self._my_node_num
+        packet.channel = self._settings.admin_channel_index()
+        packet.decoded.payload = payload
+        packet.decoded.portnum = portnums_pb2.ADMIN_APP
+        packet.decoded.want_response = True
+        packet.id = self._next_packet_id()
+        packet.want_ack = True
+        packet.priority = mesh_pb2.MeshPacket.Priority.RELIABLE
+        packet.pki_encrypted = True
+        packet.hop_limit = self._settings.hop_limit()
+
+        to_radio = mesh_pb2.ToRadio()
+        to_radio.packet.CopyFrom(packet)
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[_AdminResponse] = loop.create_future()
+        request_id = int(packet.id)
+        self._pending_admin_responses[request_id] = _PendingAdminResponse(
+            future=future,
+            source=self._my_node_num,
+            channel=int(packet.channel),
+        )
+        self._internal_admin_request_ids.append(request_id)
+        self._admin_request_count += 1
+        try:
+            # The future is registered before this sole write. A timeout is an
+            # unknown radio state and is deliberately never retried.
+            await connection.async_send(to_radio.SerializeToString())
+            async with asyncio.timeout(self._admin_response_timeout):
+                response = await future
+        except TimeoutError as err:
+            self._admin_timeout_count += 1
+            raise _AdminResponseTimeout(
+                "Meshtastic admin response timed out; radio state is unknown"
+            ) from err
+        finally:
+            pending = self._pending_admin_responses.get(request_id)
+            if pending is not None and pending.future is future:
+                self._pending_admin_responses.pop(request_id, None)
+            if not future.done():
+                future.cancel()
+        if response.error_reason is not None:
+            self._admin_nak_count += 1
+            raise MeshtasticConfigurationError(
+                f"Meshtastic admin request was rejected ({response.error_reason})"
+            )
+        return response
+
+    async def _async_wait_for_settings_refresh(
+        self,
+        baseline_sequence: int,
+        baseline_generation: int,
+    ) -> bool:
+        """Wait for a complete config from a later physical BLE connection."""
+        try:
+            async with asyncio.timeout(_SETTINGS_READBACK_TIMEOUT):
+                while True:
+                    if (
+                        self._settings_complete_sequence > baseline_sequence
+                        and self._settings_complete_generation
+                        > baseline_generation
+                        and self._settings.complete
+                    ):
+                        return True
+                    self._settings_complete_signal.clear()
+                    if (
+                        self._settings_complete_sequence > baseline_sequence
+                        and self._settings_complete_generation
+                        > baseline_generation
+                        and self._settings.complete
+                    ):
+                        return True
+                    await self._settings_complete_signal.wait()
+        except TimeoutError:
+            return False
+
     def add_packet_callback(self, callback: PacketCallback) -> Callable[[], None]:
         """Register a plain-dictionary packet callback and return its remover."""
         self._packet_callbacks.add(callback)
@@ -549,6 +812,14 @@ class MeshtasticBluetoothClient:
             "callback_error_count": self._callback_error_count,
             "dropped_stream_packet_count": self._dropped_stream_packet_count,
             "sent_text_count": self._sent_text_count,
+            "admin_request_count": self._admin_request_count,
+            "admin_response_count": self._admin_response_count,
+            "admin_timeout_count": self._admin_timeout_count,
+            "admin_nak_count": self._admin_nak_count,
+            "admin_response_waiter_count": len(self._pending_admin_responses),
+            "connection_generation": self._connection_generation,
+            "settings_complete_sequence": self._settings_complete_sequence,
+            "settings_complete_generation": self._settings_complete_generation,
             "last_error_type": self._last_error_type,
             "last_failure_phase": self._last_failure_phase,
             "last_transport_before_cleanup": copy.deepcopy(
@@ -571,6 +842,9 @@ class MeshtasticBluetoothClient:
                 "start": self._start_timeout,
                 "stop": self._stop_timeout,
                 "heartbeat_interval": self._heartbeat_interval,
+                "admin_response": self._admin_response_timeout,
+                "settings_apply": _SETTINGS_APPLY_TIMEOUT,
+                "settings_readback": _SETTINGS_READBACK_TIMEOUT,
             },
             "transport": (
                 self._connection_diagnostics(connection)
@@ -610,9 +884,11 @@ class MeshtasticBluetoothClient:
                     self._last_connection_snapshot = None
                     self._last_connection_cleanup_outcome = "not_started"
                     await connection.async_connect()
+                    self._connection_generation += 1
 
                     self._set_state("bluetooth_requesting_configuration")
                     self._config_complete_event.clear()
+                    self._settings.begin_refresh()
                     self._config_id = self._new_config_id()
                     request = mesh_pb2.ToRadio()
                     request.want_config_id = self._config_id
@@ -791,15 +1067,76 @@ class MeshtasticBluetoothClient:
 
         if from_radio.HasField("my_info"):
             self._my_node_num = int(from_radio.my_info.my_node_num)
+        self._settings.capture_from_radio(
+            from_radio,
+            my_node_num=self._my_node_num,
+        )
         if from_radio.HasField("node_info"):
             node = MessageToDict(from_radio.node_info)
             self._merge_node(int(from_radio.node_info.num), node)
         if from_radio.HasField("packet"):
-            packet = self._packet_to_dict(from_radio.packet)
-            self._update_node_from_packet(from_radio.packet, packet)
-            self._publish_packet(packet)
+            if not self._handle_internal_admin_packet(from_radio.packet):
+                packet = self._packet_to_dict(from_radio.packet)
+                self._update_node_from_packet(from_radio.packet, packet)
+                self._publish_packet(packet)
         if self._config_id is not None and from_radio.config_complete_id == self._config_id:
+            self._settings.mark_complete()
+            self._settings_complete_sequence += 1
+            self._settings_complete_generation = self._connection_generation
+            self._settings_complete_signal.set()
             self._config_complete_event.set()
+
+    def _handle_internal_admin_packet(self, packet: Any) -> bool:
+        """Consume correlated admin traffic before any public packet projection."""
+        if not packet.HasField("decoded"):
+            return False
+        decoded = packet.decoded
+        portnum = int(decoded.portnum)
+        request_id = int(decoded.request_id)
+        if portnum == int(portnums_pb2.ADMIN_APP):
+            # ADMIN_APP can contain credentials/session material. Local writes
+            # never need an AdminMessage response, so do not even parse it and
+            # never forward it to callbacks, streams, nodes, or diagnostics.
+            return True
+        if portnum != int(portnums_pb2.ROUTING_APP):
+            return False
+        if request_id not in self._internal_admin_request_ids:
+            return False
+        try:
+            routing = mesh_pb2.Routing()
+            routing.ParseFromString(bytes(decoded.payload))
+        except DecodeError:
+            return True
+        pending = self._pending_admin_responses.get(request_id)
+        if pending is None or pending.future.done():
+            return True
+        if (
+            int(getattr(packet, "from")) != pending.source
+            or int(packet.channel) != pending.channel
+        ):
+            return True
+        selected: str | None = None
+        for oneof in getattr(routing.DESCRIPTOR, "oneofs", ()):
+            selected = routing.WhichOneof(oneof.name)
+            if selected is not None:
+                break
+        if selected != "error_reason":
+            # Empty Routing payloads and route records are not setter ACKs.
+            return True
+        error_value = int(routing.error_reason)
+        if error_value:
+            try:
+                error_reason = mesh_pb2.Routing.Error.Name(error_value)
+            except ValueError:
+                error_reason = f"UNKNOWN_{error_value}"
+            self._admin_response_count += 1
+            pending.future.set_result(
+                _AdminResponse(kind="routing", error_reason=error_reason)
+            )
+        else:
+            self._admin_response_count += 1
+            pending.future.set_result(_AdminResponse(kind="routing"))
+        return True
 
     def _packet_to_dict(self, packet: Any) -> dict[str, Any]:
         result = MessageToDict(packet)
@@ -896,8 +1233,22 @@ class MeshtasticBluetoothClient:
     def _merge_node(self, node_num: int, update: Mapping[str, Any]) -> None:
         if node_num in (0, _BROADCAST_NUM):
             return
+        safe_update: Mapping[str, Any] = update
+        user = update.get("user")
+        if isinstance(user, Mapping):
+            claimed_id = user.get("id")
+            if claimed_id not in (None, "") and (
+                canonical_meshtastic_node_id(claimed_id)
+                != canonical_meshtastic_node_id(node_num)
+            ):
+                # The packet/config envelope owns routing identity. Never let
+                # a contradictory NodeInfo claim seed cached names or a MAC
+                # alias that could later target a different real node.
+                sanitized = dict(update)
+                sanitized.pop("user", None)
+                safe_update = sanitized
         merged = copy.deepcopy(self._nodes.get(node_num, {"num": node_num}))
-        self._deep_merge(merged, update)
+        self._deep_merge(merged, safe_update)
         position = merged.get("position")
         if isinstance(position, dict):
             self._fix_position(position)
@@ -939,9 +1290,11 @@ class MeshtasticBluetoothClient:
     def _invoke_callback(self, callback: Callable[[Any], Any], value: Any) -> None:
         try:
             result = callback(value)
-        except Exception:
+        except Exception as err:
             self._callback_error_count += 1
-            self._logger.exception("Meshtastic callback failed")
+            self._logger.warning(
+                "Meshtastic callback failed (%s)", type(err).__name__
+            )
             return
         if not inspect.isawaitable(result):
             return
@@ -957,9 +1310,11 @@ class MeshtasticBluetoothClient:
             return
         try:
             task.result()
-        except Exception:
+        except Exception as err:
             self._callback_error_count += 1
-            self._logger.exception("Meshtastic async callback failed")
+            self._logger.warning(
+                "Meshtastic async callback failed (%s)", type(err).__name__
+            )
 
     async def _cancel_callback_tasks(self, *, timeout: float) -> bool:
         tasks = tuple(self._callback_tasks)
@@ -977,6 +1332,7 @@ class MeshtasticBluetoothClient:
         heartbeat: asyncio.Task[None] | None,
         connection: BluetoothConnection | None,
     ) -> None:
+        self._fail_pending_admin_responses()
         if connection is not None:
             self._last_connection_snapshot = self._connection_diagnostics(
                 connection
@@ -1044,6 +1400,18 @@ class MeshtasticBluetoothClient:
             self._connection = None
         self._config_complete_event.clear()
         self._config_id = None
+
+    def _fail_pending_admin_responses(self) -> None:
+        """Fail response waiters when their exact GATT owner is gone."""
+        for pending in tuple(self._pending_admin_responses.values()):
+            if not pending.future.done():
+                pending.future.set_exception(
+                    MeshtasticConnectionError(
+                        "Meshtastic Bluetooth disconnected during admin request"
+                    )
+                )
+        self._pending_admin_responses.clear()
+        self._internal_admin_request_ids.clear()
 
     @staticmethod
     def _connection_diagnostics(

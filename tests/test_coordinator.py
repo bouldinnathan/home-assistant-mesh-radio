@@ -2,13 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import logging
 import sys
 import types
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
-from custom_components.meshnet.const import PROTOCOL_MESHTASTIC, TRANSPORT_TCP
+import pytest
+
+from custom_components.meshnet.const import (
+    CONF_GATEWAYS,
+    PROTOCOL_MESHCORE,
+    PROTOCOL_MESHTASTIC,
+    TRANSPORT_BLUETOOTH,
+    TRANSPORT_TCP,
+)
 from custom_components.meshnet.models import (
     GatewayConfig,
     GatewayStatus,
@@ -16,6 +25,9 @@ from custom_components.meshnet.models import (
     MeshSnapshot,
     MessageRecord,
     NodeState,
+)
+from custom_components.meshnet.node_identity import (
+    meshtastic_observation_node_key,
 )
 from custom_components.meshnet.panel_telemetry import PanelTelemetry
 
@@ -184,6 +196,622 @@ def test_cached_nodes_remain_cached_only_until_live_callback(
     asyncio.run(run())
 
 
+def test_cached_meshtastic_aliases_publish_once_without_deleting_raw_records(
+    monkeypatch,
+) -> None:
+    """Exact non-conflicting IDs become one effective node, reversibly."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(
+            monkeypatch
+        )
+        raw_nodes = {
+            "mac:aabbccddeeff": NodeState(
+                node_key="mac:aabbccddeeff",
+                protocol=PROTOCOL_MESHTASTIC,
+                node_id="!12345678",
+                mac="aabbccddeeff",
+                long_name="Hill Repeater",
+            ),
+            "meshtastic:305419896": NodeState(
+                node_key="meshtastic:305419896",
+                protocol=PROTOCOL_MESHTASTIC,
+                node_id="305419896",
+            ),
+            "meshtastic:!12345678": NodeState(
+                node_key="meshtastic:!12345678",
+                protocol=PROTOCOL_MESHTASTIC,
+                node_id="0x12345678",
+            ),
+        }
+
+        class Store:
+            async def async_open(self) -> None:
+                return None
+
+            async def async_load_snapshot(self, *, recent_limit: int):
+                assert recent_limit == 100
+                return MeshSnapshot(nodes=raw_nodes)
+
+        coordinator = object.__new__(coordinator_class)
+        coordinator.store = Store()
+        coordinator.snapshot = MeshSnapshot()
+        coordinator._session_observed_node_keys = set()
+        coordinator._rebuild_gateways = AsyncMock()
+
+        await coordinator._async_setup()
+
+        assert set(coordinator._raw_nodes) == set(raw_nodes)
+        assert set(coordinator.snapshot.nodes) == {
+            "meshtastic:!12345678"
+        }
+        effective = coordinator.snapshot.nodes["meshtastic:!12345678"]
+        assert effective.long_name == "Hill Repeater"
+        assert effective.mac == "aabbccddeeff"
+        assert coordinator.node_alias_keys(effective.node_key) == (
+            "mac:aabbccddeeff",
+            "meshtastic:!12345678",
+            "meshtastic:305419896",
+        )
+        assert coordinator.node_observability_diagnostics()[
+            "identity_projection"
+        ] == {
+            "raw_record_count": 3,
+            "effective_node_count": 1,
+            "collapsed_alias_record_count": 2,
+            "candidate_identity_group_count": 1,
+            "resolved_identity_group_count": 1,
+            "unresolved_identity_group_count": 0,
+            "unresolved_identity_record_count": 0,
+            "invalid_identity_record_count": 0,
+        }
+
+    asyncio.run(run())
+
+
+def test_retained_alias_resolves_to_canonical_meshtastic_send_target(
+    monkeypatch,
+) -> None:
+    coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+    coordinator = object.__new__(coordinator_class)
+    coordinator.snapshot = MeshSnapshot(
+        nodes={
+            "meshtastic:!12345678": NodeState(
+                node_key="meshtastic:!12345678",
+                protocol=PROTOCOL_MESHTASTIC,
+                node_id="!12345678",
+                mac="aabbccddeeff",
+                long_name="Exact Long Name",
+                short_name="ELN",
+            )
+        }
+    )
+    coordinator._node_alias_redirects = {
+        "mac:aabbccddeeff": "meshtastic:!12345678",
+        "meshtastic:!12345678": "meshtastic:!12345678",
+    }
+
+    assert (
+        coordinator._provider_message_target("mac:aabbccddeeff")
+        == "!12345678"
+    )
+    assert (
+        coordinator._provider_message_target("meshtastic:!12345678")
+        == "!12345678"
+    )
+    assert (
+        coordinator._provider_message_target(" exact long name ")
+        == "!12345678"
+    )
+    assert coordinator._provider_message_target("eln") == "!12345678"
+    assert (
+        coordinator._provider_message_target("MAC:AA:BB:CC:DD:EE:FF")
+        == "!12345678"
+    )
+
+
+def test_unresolved_meshtastic_id_collision_cannot_be_direct_messaged(
+    monkeypatch,
+) -> None:
+    coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+    coordinator = object.__new__(coordinator_class)
+    coordinator.snapshot = MeshSnapshot(
+        nodes={
+            "mac:111111111111": NodeState(
+                node_key="mac:111111111111",
+                protocol=PROTOCOL_MESHTASTIC,
+                node_id="!12345678",
+                mac="111111111111",
+                long_name="Alpha relay",
+                short_name="AR",
+            ),
+            "mac:222222222222": NodeState(
+                node_key="mac:222222222222",
+                protocol=PROTOCOL_MESHTASTIC,
+                node_id="305419896",
+                mac="222222222222",
+                long_name="Beta relay",
+                short_name="BR",
+            ),
+        }
+    )
+    coordinator._node_alias_redirects = {
+        key: key for key in coordinator.snapshot.nodes
+    }
+    error_class = coordinator_class._provider_message_target.__globals__[
+        "HomeAssistantError"
+    ]
+
+    for target in (
+        "mac:111111111111",
+        "mac:222222222222",
+        "!12345678",
+        "meshtastic:!12345678",
+        "meshtastic:0x12345678",
+        "meshtastic:305419896",
+        "0x12345678",
+        "305419896",
+        "MAC:11:11:11:11:11:11",
+        "mac:11-11-11-11-11-11",
+        " alpha relay ",
+        "BR",
+    ):
+        with pytest.raises(error_class, match="identity is ambiguous"):
+            coordinator._provider_message_target(target)
+
+    assert coordinator._provider_message_target(None) is None
+
+
+def test_duplicate_meshtastic_name_cannot_be_direct_messaged(
+    monkeypatch,
+) -> None:
+    coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+    coordinator = object.__new__(coordinator_class)
+    nodes = {
+        "meshtastic:!11111111": NodeState(
+            node_key="meshtastic:!11111111",
+            protocol=PROTOCOL_MESHTASTIC,
+            node_id="!11111111",
+            long_name="Shared Relay",
+            short_name="Relay:West",
+        ),
+        "meshtastic:!22222222": NodeState(
+            node_key="meshtastic:!22222222",
+            protocol=PROTOCOL_MESHTASTIC,
+            node_id="!22222222",
+            short_name="shared relay",
+            long_name="relay:west",
+        ),
+    }
+    coordinator.snapshot = MeshSnapshot(nodes=nodes)
+    coordinator._node_alias_redirects = {key: key for key in nodes}
+    error_class = coordinator_class._provider_message_target.__globals__[
+        "HomeAssistantError"
+    ]
+
+    with pytest.raises(error_class, match="identity is ambiguous"):
+        coordinator._provider_message_target("  SHARED RELAY ")
+    with pytest.raises(error_class, match="identity is ambiguous"):
+        coordinator._provider_message_target("RELAY:WEST")
+
+
+@pytest.mark.parametrize("shared_proof", ["mac", "public_key"])
+def test_cross_id_shared_proof_blocks_every_direct_alias(
+    monkeypatch,
+    shared_proof: str,
+) -> None:
+    coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+    shared_mac = "111111111111" if shared_proof == "mac" else None
+    shared_public = "1" * 64 if shared_proof == "public_key" else None
+    left = NodeState(
+        node_key=meshtastic_observation_node_key(
+            "!11111111", shared_mac, shared_public
+        ),
+        protocol=PROTOCOL_MESHTASTIC,
+        node_id="!11111111",
+        mac=shared_mac,
+        public_key=shared_public,
+    )
+    right = NodeState(
+        node_key=meshtastic_observation_node_key(
+            "!22222222", shared_mac, shared_public
+        ),
+        protocol=PROTOCOL_MESHTASTIC,
+        node_id="!22222222",
+        mac=shared_mac,
+        public_key=shared_public,
+    )
+    coordinator = object.__new__(coordinator_class)
+    coordinator.snapshot = MeshSnapshot(
+        nodes={left.node_key: left, right.node_key: right}
+    )
+    coordinator._node_alias_redirects = {
+        left.node_key: left.node_key,
+        right.node_key: right.node_key,
+    }
+    error_class = coordinator_class._provider_message_target.__globals__[
+        "HomeAssistantError"
+    ]
+    targets = [left.node_key, right.node_key, left.node_id, right.node_id]
+    if shared_mac is not None:
+        targets.append(f"MAC:{':'.join(['11'] * 6)}")
+    if shared_public is not None:
+        targets.append(shared_public)
+
+    for target in targets:
+        with pytest.raises(error_class, match="identity is ambiguous"):
+            coordinator._provider_message_target(target)
+
+
+def test_invalid_meshtastic_identity_cannot_be_direct_messaged(
+    monkeypatch,
+) -> None:
+    coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+    coordinator = object.__new__(coordinator_class)
+    invalid = NodeState(
+        node_key=f"meshtastic-proof:{'1' * 64}",
+        protocol=PROTOCOL_MESHTASTIC,
+        node_id="!12345678",
+        mac="111111111111",
+        public_key="2" * 64,
+    )
+    coordinator.snapshot = MeshSnapshot(nodes={invalid.node_key: invalid})
+    coordinator._node_alias_redirects = {invalid.node_key: invalid.node_key}
+    error_class = coordinator_class._provider_message_target.__globals__[
+        "HomeAssistantError"
+    ]
+
+    for target in (
+        invalid.node_key,
+        "!12345678",
+        "meshtastic:0x12345678",
+        "305419896",
+    ):
+        with pytest.raises(
+            error_class, match="malformed or internally inconsistent"
+        ):
+            coordinator._provider_message_target(target)
+
+    missing_id = NodeState(
+        node_key="mac:111111111111",
+        protocol=PROTOCOL_MESHTASTIC,
+        node_id=None,
+        mac="111111111111",
+    )
+    coordinator.snapshot = MeshSnapshot(
+        nodes={missing_id.node_key: missing_id}
+    )
+    coordinator._node_alias_redirects = {
+        missing_id.node_key: missing_id.node_key
+    }
+    with pytest.raises(
+        error_class, match="malformed or internally inconsistent"
+    ):
+        coordinator._provider_message_target(missing_id.node_key)
+
+
+def test_identity_grammars_cannot_fall_through_to_wrong_recipient_names(
+    monkeypatch,
+) -> None:
+    """ID-, MAC-, public-key-, and reserved-looking names fail closed."""
+    coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+    public_key = "a1" * 32
+    proof_name = f"meshtastic-proof:{'b2' * 32}"
+    node = NodeState(
+        node_key="meshtastic:!11111111",
+        protocol=PROTOCOL_MESHTASTIC,
+        node_id="!11111111",
+        user_name=proof_name,
+        long_name="305419896",
+        short_name="Relay:West",
+    )
+    mac_name = NodeState(
+        node_key="meshtastic:!22222222",
+        protocol=PROTOCOL_MESHTASTIC,
+        node_id="!22222222",
+        long_name="aa:bb:cc:dd:ee:ff",
+        short_name=public_key,
+    )
+    pub_name = NodeState(
+        node_key="meshtastic:!33333333",
+        protocol=PROTOCOL_MESHTASTIC,
+        node_id="!33333333",
+        long_name=f"pub:{public_key}",
+    )
+    malformed_names = NodeState(
+        node_key="meshtastic:!44444444",
+        protocol=PROTOCOL_MESHTASTIC,
+        node_id="!44444444",
+        short_name="!12345g78",
+        long_name="0xzzzz",
+    )
+    malformed_mac_names = NodeState(
+        node_key="meshtastic:!55555555",
+        protocol=PROTOCOL_MESHTASTIC,
+        node_id="!55555555",
+        short_name="aa:bb:cc:dd:ee:gg",
+        long_name="aabbccddeezz",
+    )
+    malformed_number_and_key_names = NodeState(
+        node_key="meshtastic:!66666666",
+        protocol=PROTOCOL_MESHTASTIC,
+        node_id="!66666666",
+        short_name="12345678901234567890",
+        long_name=f"{'ab' * 31}ag",
+    )
+    compatibility_identity_names = NodeState(
+        node_key="meshtastic:!77777777",
+        protocol=PROTOCOL_MESHTASTIC,
+        node_id="!77777777",
+        short_name="！12345g78",
+        long_name="０xzzzz",
+    )
+    compatibility_prefix_names = NodeState(
+        node_key="meshtastic:!88888888",
+        protocol=PROTOCOL_MESHTASTIC,
+        node_id="!88888888",
+        short_name="ｍａｃ:AA:BB:CC:DD:EE:FF",
+        long_name=f"ｐｕｂ:{public_key}",
+    )
+    compatibility_protocol_name = NodeState(
+        node_key="meshtastic:!99999999",
+        protocol=PROTOCOL_MESHTASTIC,
+        node_id="!99999999",
+        long_name="ｍｅｓｈｔａｓｔｉｃ:!12345678",
+    )
+    nodes = {
+        candidate.node_key: candidate
+        for candidate in (
+            node,
+            mac_name,
+            pub_name,
+            malformed_names,
+            malformed_mac_names,
+            malformed_number_and_key_names,
+            compatibility_identity_names,
+            compatibility_prefix_names,
+            compatibility_protocol_name,
+        )
+    }
+    coordinator = object.__new__(coordinator_class)
+    coordinator.snapshot = MeshSnapshot(nodes=nodes)
+    coordinator._node_alias_redirects = {key: key for key in nodes}
+    error_class = coordinator_class._provider_message_target.__globals__[
+        "HomeAssistantError"
+    ]
+
+    # The decimal grammar identifies !12345678 even though a different node
+    # advertises that exact text as its long name.
+    assert coordinator._provider_message_target("305419896") == "!12345678"
+    for identity_shaped_name in (
+        "aa:bb:cc:dd:ee:ff",
+        public_key,
+        f"pub:{public_key}",
+        proof_name,
+        "!12345g78",
+        "0xzzzz",
+        "aa:bb:cc:dd:ee:gg",
+        "aabbccddeezz",
+        "12345678901234567890",
+        f"{'ab' * 31}ag",
+        "！12345g78",
+        "０xzzzz",
+        "ｍａｃ:AA:BB:CC:DD:EE:FF",
+        f"ｐｕｂ:{public_key}",
+    ):
+        with pytest.raises(
+            error_class, match="malformed or internally inconsistent"
+        ):
+            coordinator._provider_message_target(identity_shaped_name)
+
+    # A compatibility-spelled reserved protocol prefix is still identity
+    # syntax and must never select the node advertising that same-looking name.
+    assert (
+        coordinator._provider_message_target(
+            "ｍｅｓｈｔａｓｔｉｃ:!12345678"
+        )
+        == "!12345678"
+    )
+
+    # A colon remains legal in a genuine name when its prefix is not reserved.
+    assert coordinator._provider_message_target("relay:west") == "!11111111"
+
+
+def test_strong_identity_inputs_resolve_safely_with_legacy_protocol_case(
+    monkeypatch,
+) -> None:
+    coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+    public_key = "ab" * 32
+    mac = "aabbccddeeff"
+    node = NodeState(
+        node_key=meshtastic_observation_node_key(
+            "!12345678", mac, public_key
+        ),
+        protocol="Meshtastic",
+        node_id="!12345678",
+        mac=mac,
+        public_key=public_key,
+    )
+    coordinator = object.__new__(coordinator_class)
+    coordinator.snapshot = MeshSnapshot(nodes={node.node_key: node})
+    coordinator._node_alias_redirects = {node.node_key: node.node_key}
+
+    for target in (
+        node.node_key.upper(),
+        "MAC:AA:BB:CC:DD:EE:FF",
+        "AA-BB-CC-DD-EE-FF",
+        f"pub:{public_key.upper()}",
+        public_key.upper(),
+    ):
+        assert coordinator._provider_message_target(target) == "!12345678"
+
+
+def test_public_identity_shared_across_protocols_is_ambiguous(monkeypatch) -> None:
+    coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+    public_key = "cd" * 32
+    meshtastic = NodeState(
+        node_key=meshtastic_observation_node_key(
+            "!12345678", None, public_key
+        ),
+        protocol=PROTOCOL_MESHTASTIC,
+        node_id="!12345678",
+        public_key=public_key,
+    )
+    meshcore = NodeState(
+        node_key=f"pub:{public_key}",
+        protocol=PROTOCOL_MESHCORE,
+        public_key=public_key,
+    )
+    coordinator = object.__new__(coordinator_class)
+    coordinator.snapshot = MeshSnapshot(
+        nodes={
+            meshtastic.node_key: meshtastic,
+            meshcore.node_key: meshcore,
+        }
+    )
+    coordinator._node_alias_redirects = {
+        key: key for key in coordinator.snapshot.nodes
+    }
+    error_class = coordinator_class._provider_message_target.__globals__[
+        "HomeAssistantError"
+    ]
+
+    for target in (public_key, f"pub:{public_key}"):
+        with pytest.raises(error_class, match="identity is ambiguous"):
+            coordinator._provider_message_target(target)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"target_node": None},
+        {"target_node": "!12345678", "message_type": "broadcast"},
+        {"target_node": "!12345678", "message_type": "group"},
+        {"target_node": "!12345678", "message_type": "emergency"},
+        {"message_type": "DIRECT"},
+        {"message_type": "unsupported"},
+        {"target_node": "   "},
+        {"target_node": "x" * 129},
+        {"message": 123},
+        {"message": "   "},
+        {"message": "x" * 238},
+        {"message": "😀" * 60},
+        {"message": "\ud800"},
+        {"channel": True},
+        {"channel": 1.5},
+        {"channel": " 1"},
+        {"channel": "00"},
+        {"channel": "9" * 5000},
+        {"channel": "8"},
+        {"priority": "Normal"},
+        {"priority": "urgent"},
+        {"priority": []},
+        {"gateway_id": ""},
+        {"gateway_id": " gateway"},
+        {"gateway_id": "g" * 129},
+        {"gateway_id": []},
+    ],
+)
+def test_message_envelope_rejects_unsafe_fields_before_routing(
+    monkeypatch,
+    overrides: dict,
+) -> None:
+    coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+    validator = coordinator_class._async_send_message.__globals__[
+        "validated_message_envelope"
+    ]
+    error_class = coordinator_class._async_send_message.__globals__[
+        "HomeAssistantError"
+    ]
+    fields = {
+        "target_node": "!12345678",
+        "message": "safe",
+        "channel": None,
+        "priority": "normal",
+        "message_type": "direct",
+        "gateway_id": None,
+    }
+    fields.update(overrides)
+
+    with pytest.raises(error_class):
+        validator(**fields)
+
+
+def test_message_envelope_normalizes_valid_channel_and_utf8_boundary(
+    monkeypatch,
+) -> None:
+    coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+    validator = coordinator_class._async_send_message.__globals__[
+        "validated_message_envelope"
+    ]
+
+    envelope = validator(
+        target_node=" !12345678 ",
+        message="😀" * 59,
+        channel=7.0,
+        priority="high",
+        message_type="direct",
+        gateway_id="gateway-1",
+    )
+
+    assert envelope.target_node == "!12345678"
+    assert envelope.channel == "7"
+    assert envelope.message == "😀" * 59
+    assert envelope.gateway_id == "gateway-1"
+
+
+def test_message_api_projection_ignores_unhashable_provider_metadata(
+    monkeypatch,
+) -> None:
+    """Malformed provider raw values cannot break event serialization."""
+    coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+    project = coordinator_class._handle_packet.__globals__["message_api_dict"]
+    message = MessageRecord(
+        message_id="malformed-provider-raw",
+        protocol=PROTOCOL_MESHTASTIC,
+        gateway_id="gateway-1",
+        sender="radio",
+        receiver=None,
+        channel=None,
+        text="safe content",
+        raw={"status": [], "last_error_code": {}},
+    )
+
+    assert project(message)["raw"] == {}
+
+
+def test_unknown_gateway_is_rejected_before_message_persistence(monkeypatch) -> None:
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(
+            monkeypatch
+        )
+        coordinator = object.__new__(coordinator_class)
+        coordinator._gateway_generation = 0
+        coordinator._shutting_down = False
+        coordinator._reconnect_suspended = False
+        coordinator._active_send_message_ids = set()
+        coordinator.snapshot = MeshSnapshot()
+        coordinator.gateways = {}
+        coordinator.store = SimpleNamespace(async_add_message=AsyncMock())
+        error_class = coordinator_class._async_send_message.__globals__[
+            "HomeAssistantError"
+        ]
+
+        with pytest.raises(error_class, match="Unknown MeshNet gateway"):
+            await coordinator._async_send_message(
+                target_node=None,
+                message="safe",
+                channel=None,
+                priority="normal",
+                message_type="broadcast",
+                gateway_id="missing-gateway",
+            )
+
+        coordinator.store.async_add_message.assert_not_awaited()
+
+    asyncio.run(run())
+
+
 def test_node_observability_is_aggregate_only_and_privacy_safe(monkeypatch) -> None:
     """Provenance diagnostics expose counts, never compared identity aliases."""
     coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
@@ -284,6 +912,12 @@ def test_node_observability_is_aggregate_only_and_privacy_safe(monkeypatch) -> N
     }
     assert coordinator.panel_node_provenance() == {
         "total_node_count": 7,
+        "retained_node_record_count": 7,
+        "collapsed_alias_record_count": 0,
+        "resolved_identity_group_count": 0,
+        "unresolved_identity_group_count": 1,
+        "unresolved_identity_node_count": 2,
+        "invalid_identity_record_count": 0,
         "analyzed_node_count": 7,
         "omitted_node_count": 0,
         "current_session_node_count": 2,
@@ -982,8 +1616,14 @@ def test_flush_outbox_ignores_reentrant_gateway_status_flush(monkeypatch) -> Non
         )
 
         class Store:
-            async def async_pending_outbox(self, *, limit: int) -> list[MessageRecord]:
+            async def async_pending_outbox(
+                self,
+                *,
+                limit: int,
+                after: tuple[str, str] | None = None,
+            ) -> list[MessageRecord]:
                 assert limit == 100
+                assert after is None
                 return [record] if record.raw["status"] == "queued" else []
 
             async def async_add_message(self, message: MessageRecord) -> None:
@@ -1048,6 +1688,1209 @@ def test_flush_outbox_ignores_reentrant_gateway_status_flush(monkeypatch) -> Non
             "gateway_id": "gateway-1",
             "provider_id": "provider-message",
         }
+
+    asyncio.run(run())
+
+
+def test_meshtastic_target_never_falls_back_to_connected_meshcore(
+    monkeypatch,
+) -> None:
+    """An offline target protocol queues instead of crossing providers."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(
+            monkeypatch
+        )
+
+        class Gateway:
+            def __init__(
+                self, gateway_id: str, protocol: str, connected: bool
+            ) -> None:
+                self.config = GatewayConfig(
+                    gateway_id=gateway_id,
+                    name=gateway_id,
+                    protocol=protocol,
+                    transport=TRANSPORT_TCP,
+                )
+                self.status = GatewayStatus(
+                    gateway_id=gateway_id,
+                    name=gateway_id,
+                    protocol=protocol,
+                    transport=TRANSPORT_TCP,
+                    connected=connected,
+                )
+                self.async_send_message = AsyncMock()
+
+        meshtastic = Gateway("meshtastic-offline", PROTOCOL_MESHTASTIC, False)
+        meshcore = Gateway("meshcore-online", PROTOCOL_MESHCORE, True)
+        node = NodeState(
+            node_key="meshtastic:!12345678",
+            protocol=PROTOCOL_MESHTASTIC,
+            node_id="!12345678",
+        )
+        coordinator = object.__new__(coordinator_class)
+        coordinator._gateway_generation = 0
+        coordinator._shutting_down = False
+        coordinator._reconnect_suspended = False
+        coordinator._active_send_message_ids = set()
+        coordinator.snapshot = MeshSnapshot(nodes={node.node_key: node})
+        coordinator._node_alias_redirects = {node.node_key: node.node_key}
+        coordinator.gateways = {
+            meshtastic.config.gateway_id: meshtastic,
+            meshcore.config.gateway_id: meshcore,
+        }
+        coordinator.store = SimpleNamespace(
+            async_add_message=AsyncMock(),
+            async_recent_messages=AsyncMock(return_value=[]),
+        )
+        coordinator.async_set_updated_data = Mock()
+
+        await coordinator._async_send_message(
+            target_node=node.node_key,
+            message="queue locally",
+            channel=None,
+            priority="normal",
+            message_type="direct",
+            gateway_id=None,
+        )
+
+        meshcore.async_send_message.assert_not_awaited()
+        queued = coordinator.store.async_add_message.await_args.args[0]
+        assert queued.protocol == PROTOCOL_MESHTASTIC
+        assert queued.gateway_id == "queued"
+        assert {
+            key: value
+            for key, value in queued.raw.items()
+            if key != "target_binding"
+        } == {
+            "status": "queued",
+            "target_node": "!12345678",
+            "gateway_id": None,
+        }
+        assert queued.raw["target_binding"].startswith("node:")
+
+    asyncio.run(run())
+
+
+def test_explicit_cross_protocol_gateway_is_rejected_before_persistence(
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(
+            monkeypatch
+        )
+        gateway = SimpleNamespace(
+            config=GatewayConfig(
+                gateway_id="meshcore-online",
+                name="MeshCore",
+                protocol=PROTOCOL_MESHCORE,
+                transport=TRANSPORT_TCP,
+            ),
+            status=GatewayStatus(
+                gateway_id="meshcore-online",
+                name="MeshCore",
+                protocol=PROTOCOL_MESHCORE,
+                transport=TRANSPORT_TCP,
+                connected=True,
+            ),
+            async_send_message=AsyncMock(),
+        )
+        coordinator = object.__new__(coordinator_class)
+        coordinator._gateway_generation = 0
+        coordinator._shutting_down = False
+        coordinator._reconnect_suspended = False
+        coordinator._active_send_message_ids = set()
+        coordinator.snapshot = MeshSnapshot()
+        coordinator._node_alias_redirects = {}
+        coordinator.gateways = {gateway.config.gateway_id: gateway}
+        coordinator.store = SimpleNamespace(async_add_message=AsyncMock())
+        error_class = coordinator_class._async_send_message.__globals__[
+            "HomeAssistantError"
+        ]
+
+        with pytest.raises(error_class, match="different mesh protocols"):
+            await coordinator._async_send_message(
+                target_node="!12345678",
+                message="must not cross",
+                channel=None,
+                priority="normal",
+                message_type="direct",
+                gateway_id=gateway.config.gateway_id,
+            )
+
+        coordinator.store.async_add_message.assert_not_awaited()
+        gateway.async_send_message.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+def test_known_meshcore_public_key_routes_only_to_meshcore(monkeypatch) -> None:
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(
+            monkeypatch
+        )
+        public_key = "ef" * 32
+        node = NodeState(
+            node_key=f"pub:{public_key}",
+            protocol=PROTOCOL_MESHCORE,
+            public_key=public_key,
+        )
+        gateway = SimpleNamespace(
+            config=GatewayConfig(
+                gateway_id="meshcore-online",
+                name="MeshCore",
+                protocol=PROTOCOL_MESHCORE,
+                transport=TRANSPORT_TCP,
+            ),
+            status=GatewayStatus(
+                gateway_id="meshcore-online",
+                name="MeshCore",
+                protocol=PROTOCOL_MESHCORE,
+                transport=TRANSPORT_TCP,
+                connected=True,
+            ),
+            async_send_message=AsyncMock(return_value="provider-id"),
+        )
+        coordinator = object.__new__(coordinator_class)
+        coordinator._gateway_generation = 0
+        coordinator._shutting_down = False
+        coordinator._reconnect_suspended = False
+        coordinator._active_send_message_ids = set()
+        coordinator.snapshot = MeshSnapshot(nodes={node.node_key: node})
+        coordinator._node_alias_redirects = {node.node_key: node.node_key}
+        coordinator.gateways = {gateway.config.gateway_id: gateway}
+        coordinator.store = SimpleNamespace(
+            async_add_message=AsyncMock(),
+            async_recent_messages=AsyncMock(return_value=[]),
+        )
+        coordinator.tx_limiter = SimpleNamespace(acquire=AsyncMock())
+        coordinator.hass = SimpleNamespace(
+            bus=SimpleNamespace(async_fire=lambda *_args: None)
+        )
+        coordinator.async_set_updated_data = Mock()
+        await coordinator._async_send_message(
+            target_node=node.node_key,
+            message="meshcore only",
+            channel=None,
+            priority="normal",
+            message_type="direct",
+            gateway_id=None,
+        )
+
+        gateway.async_send_message.assert_awaited_once_with(
+            target_node=node.node_key,
+            message="meshcore only",
+            channel=None,
+            priority="normal",
+            message_type="direct",
+        )
+
+    asyncio.run(run())
+
+
+def test_ambiguous_outbox_record_does_not_starve_following_broadcast(
+    monkeypatch,
+) -> None:
+    """An unsafe direct queue item is blocked once while later work continues."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(
+            monkeypatch
+        )
+        direct = MessageRecord(
+            message_id="ambiguous-direct",
+            protocol=PROTOCOL_MESHTASTIC,
+            gateway_id="gateway-1",
+            sender="homeassistant",
+            receiver="!12345678",
+            channel=None,
+            text="do not send",
+            message_type="direct",
+            direction="tx",
+            raw={"status": "queued", "gateway_id": "gateway-1"},
+        )
+        broadcast = MessageRecord(
+            message_id="safe-broadcast",
+            protocol=PROTOCOL_MESHTASTIC,
+            gateway_id="gateway-1",
+            sender="homeassistant",
+            receiver=None,
+            channel=None,
+            text="safe",
+            direction="tx",
+            raw={"status": "queued", "gateway_id": "gateway-1"},
+        )
+        persisted: list[tuple[str, dict]] = []
+
+        class Store:
+            async def async_pending_outbox(
+                self,
+                *,
+                limit: int,
+                after: tuple[str, str] | None = None,
+            ) -> list[MessageRecord]:
+                assert limit == 100
+                assert after is None
+                return [direct, broadcast]
+
+            async def async_add_message(
+                self, message: MessageRecord
+            ) -> None:
+                persisted.append((message.message_id, dict(message.raw)))
+
+            async def async_recent_messages(
+                self, limit: int
+            ) -> list[MessageRecord]:
+                assert limit == 100
+                return [direct, broadcast]
+
+        class Limiter:
+            calls = 0
+
+            async def acquire(self) -> None:
+                self.calls += 1
+
+        class Gateway:
+            config = GatewayConfig(
+                gateway_id="gateway-1",
+                name="Gateway",
+                protocol=PROTOCOL_MESHTASTIC,
+                transport=TRANSPORT_TCP,
+            )
+            status = GatewayStatus(
+                gateway_id="gateway-1",
+                name="Gateway",
+                protocol=PROTOCOL_MESHTASTIC,
+                transport=TRANSPORT_TCP,
+                connected=True,
+            )
+
+            def __init__(self) -> None:
+                self.calls: list[dict] = []
+
+            async def async_send_message(self, **kwargs) -> str:
+                self.calls.append(kwargs)
+                return "provider-broadcast"
+
+        left = NodeState(
+            node_key="mac:111111111111",
+            protocol=PROTOCOL_MESHTASTIC,
+            node_id="!12345678",
+            mac="111111111111",
+        )
+        right = NodeState(
+            node_key="mac:222222222222",
+            protocol=PROTOCOL_MESHTASTIC,
+            node_id="305419896",
+            mac="222222222222",
+        )
+        gateway = Gateway()
+        coordinator = object.__new__(coordinator_class)
+        coordinator._gateway_generation = 0
+        coordinator._shutting_down = False
+        coordinator._reconnect_suspended = False
+        coordinator._outbox_lock = asyncio.Lock()
+        coordinator._outbox_flush_owner = None
+        coordinator._active_send_message_ids = set()
+        coordinator._node_alias_redirects = {
+            left.node_key: left.node_key,
+            right.node_key: right.node_key,
+        }
+        coordinator.snapshot = MeshSnapshot(
+            nodes={left.node_key: left, right.node_key: right}
+        )
+        coordinator.store = Store()
+        coordinator.tx_limiter = Limiter()
+        coordinator.gateways = {gateway.config.gateway_id: gateway}
+        coordinator.hass = SimpleNamespace(
+            bus=SimpleNamespace(async_fire=lambda *_args: None)
+        )
+        coordinator.async_set_updated_data = Mock()
+        await coordinator._flush_outbox()
+
+        assert direct.raw == {
+            "status": "blocked",
+            "gateway_id": "gateway-1",
+            "last_error_code": "unsafe_identity",
+        }
+        assert gateway.calls == [
+            {
+                "target_node": None,
+                "message": "safe",
+                "channel": None,
+                "priority": "normal",
+                "message_type": "broadcast",
+            }
+        ]
+        assert coordinator.tx_limiter.calls == 1
+        assert persisted[0] == ("ambiguous-direct", dict(direct.raw))
+        assert persisted[-1][0] == "safe-broadcast"
+        assert broadcast.raw["status"] == "sent"
+        coordinator.async_set_updated_data.assert_called_once_with(
+            coordinator.snapshot
+        )
+
+    asyncio.run(run())
+
+
+def test_outbox_waits_for_matching_protocol_instead_of_crossing_callback(
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(
+            monkeypatch
+        )
+        node = NodeState(
+            node_key="meshtastic:!12345678",
+            protocol="Meshtastic",
+            node_id="!12345678",
+        )
+        record = MessageRecord(
+            message_id="queued-direct",
+            protocol="Meshtastic",
+            gateway_id="queued",
+            sender="homeassistant",
+            receiver="!12345678",
+            channel=None,
+            text="wait for the right radio",
+            message_type="direct",
+            direction="tx",
+            raw={"status": "queued", "gateway_id": None},
+        )
+
+        class Store:
+            def __init__(self) -> None:
+                self.saved: list[MessageRecord] = []
+
+            async def async_pending_outbox(
+                self,
+                *,
+                limit: int,
+                after: tuple[str, str] | None = None,
+            ) -> list[MessageRecord]:
+                assert limit == 100
+                assert after is None
+                return [record] if record.raw["status"] == "queued" else []
+
+            async def async_add_message(self, message: MessageRecord) -> None:
+                self.saved.append(message)
+
+            async def async_recent_messages(
+                self, limit: int
+            ) -> list[MessageRecord]:
+                assert limit == 100
+                return [record]
+
+        class Gateway:
+            def __init__(
+                self, gateway_id: str, protocol: str, connected: bool
+            ) -> None:
+                self.config = GatewayConfig(
+                    gateway_id=gateway_id,
+                    name=gateway_id,
+                    protocol=protocol,
+                    transport=TRANSPORT_TCP,
+                )
+                self.status = GatewayStatus(
+                    gateway_id=gateway_id,
+                    name=gateway_id,
+                    protocol=protocol,
+                    transport=TRANSPORT_TCP,
+                    connected=connected,
+                )
+                self.async_send_message = AsyncMock(
+                    return_value=f"{gateway_id}-provider"
+                )
+
+        meshcore = Gateway("meshcore", PROTOCOL_MESHCORE, True)
+        meshtastic = Gateway("meshtastic", "Meshtastic", False)
+        coordinator = object.__new__(coordinator_class)
+        coordinator._gateway_generation = 0
+        coordinator._shutting_down = False
+        coordinator._reconnect_suspended = False
+        coordinator._outbox_lock = asyncio.Lock()
+        coordinator._outbox_flush_owner = None
+        coordinator._active_send_message_ids = set()
+        coordinator.snapshot = MeshSnapshot(nodes={node.node_key: node})
+        coordinator._node_alias_redirects = {node.node_key: node.node_key}
+        coordinator.gateways = {
+            meshcore.config.gateway_id: meshcore,
+            meshtastic.config.gateway_id: meshtastic,
+        }
+        coordinator.store = Store()
+        coordinator.tx_limiter = SimpleNamespace(acquire=AsyncMock())
+        coordinator.hass = SimpleNamespace(
+            bus=SimpleNamespace(async_fire=lambda *_args: None)
+        )
+        coordinator.async_set_updated_data = Mock()
+        record.raw["target_binding"] = coordinator._resolve_message_target(
+            node.node_key
+        ).binding
+
+        await coordinator._flush_outbox(gateway_id="meshcore")
+
+        assert {
+            key: value
+            for key, value in record.raw.items()
+            if key != "target_binding"
+        } == {"status": "queued", "gateway_id": None}
+        assert record.raw["target_binding"].startswith("node:")
+        meshcore.async_send_message.assert_not_awaited()
+        meshtastic.async_send_message.assert_not_awaited()
+
+        meshtastic.status.connected = True
+        await coordinator._flush_outbox(gateway_id="meshtastic")
+
+        meshtastic.async_send_message.assert_awaited_once()
+        meshcore.async_send_message.assert_not_awaited()
+        assert record.raw["status"] == "sent"
+
+    asyncio.run(run())
+
+
+def test_outbox_honors_persisted_gateway_and_blocks_protocol_mismatch(
+    monkeypatch,
+) -> None:
+    """A None raw gateway cannot erase the resolved record gateway."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(
+            monkeypatch
+        )
+        mismatched = MessageRecord(
+            message_id="wrong-protocol",
+            protocol=PROTOCOL_MESHTASTIC,
+            gateway_id="meshcore",
+            sender="homeassistant",
+            receiver="!12345678",
+            channel=None,
+            text="must block",
+            message_type="direct",
+            direction="tx",
+            raw={"status": "queued", "gateway_id": None},
+        )
+        following = MessageRecord(
+            message_id="following",
+            protocol=PROTOCOL_MESHCORE,
+            gateway_id="meshcore",
+            sender="homeassistant",
+            receiver=None,
+            channel="0",
+            text="may send",
+            message_type="broadcast",
+            direction="tx",
+            raw={"status": "queued", "gateway_id": None},
+        )
+
+        class Store:
+            async def async_pending_outbox(
+                self,
+                *,
+                limit: int,
+                after: tuple[str, str] | None = None,
+            ) -> list[MessageRecord]:
+                assert limit == 100
+                assert after is None
+                return [mismatched, following]
+
+            async def async_add_message(self, _message: MessageRecord) -> None:
+                return None
+
+            async def async_recent_messages(
+                self, limit: int
+            ) -> list[MessageRecord]:
+                assert limit == 100
+                return [mismatched, following]
+
+        gateway = SimpleNamespace(
+            config=GatewayConfig(
+                gateway_id="meshcore",
+                name="MeshCore",
+                protocol=PROTOCOL_MESHCORE,
+                transport=TRANSPORT_TCP,
+            ),
+            status=GatewayStatus(
+                gateway_id="meshcore",
+                name="MeshCore",
+                protocol=PROTOCOL_MESHCORE,
+                transport=TRANSPORT_TCP,
+                connected=True,
+            ),
+            async_send_message=AsyncMock(return_value="provider"),
+        )
+        coordinator = object.__new__(coordinator_class)
+        coordinator._gateway_generation = 0
+        coordinator._shutting_down = False
+        coordinator._reconnect_suspended = False
+        coordinator._outbox_lock = asyncio.Lock()
+        coordinator._outbox_flush_owner = None
+        coordinator._active_send_message_ids = set()
+        coordinator.snapshot = MeshSnapshot()
+        coordinator._node_alias_redirects = {}
+        coordinator.gateways = {gateway.config.gateway_id: gateway}
+        coordinator.store = Store()
+        coordinator.tx_limiter = SimpleNamespace(acquire=AsyncMock())
+        coordinator.hass = SimpleNamespace(
+            bus=SimpleNamespace(async_fire=lambda *_args: None)
+        )
+        coordinator.async_set_updated_data = Mock()
+        mismatched.raw["target_binding"] = (
+            coordinator._canonical_target_binding(
+                "!12345678", PROTOCOL_MESHTASTIC
+            )
+        )
+
+        await coordinator._flush_outbox(gateway_id="meshcore")
+
+        assert {
+            key: value
+            for key, value in mismatched.raw.items()
+            if key != "target_binding"
+        } == {
+            "status": "blocked",
+            "gateway_id": None,
+            "last_error_code": "unsafe_route",
+        }
+        gateway.async_send_message.assert_awaited_once_with(
+            target_node=None,
+            message="may send",
+            channel="0",
+            priority="normal",
+            message_type="broadcast",
+        )
+        assert following.raw["status"] == "sent"
+
+    asyncio.run(run())
+
+
+def test_invalid_legacy_outbox_envelopes_block_without_starving_valid_work(
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(
+            monkeypatch
+        )
+        invalid = [
+            MessageRecord(
+                message_id="direct-without-target",
+                protocol=PROTOCOL_MESHCORE,
+                gateway_id="meshcore",
+                sender="homeassistant",
+                receiver=None,
+                channel=None,
+                text="invalid",
+                message_type="direct",
+                direction="tx",
+                raw={"status": "queued", "gateway_id": "meshcore"},
+            ),
+            MessageRecord(
+                message_id="broadcast-with-target",
+                protocol=PROTOCOL_MESHCORE,
+                gateway_id="meshcore",
+                sender="homeassistant",
+                receiver="pub:deadbeef",
+                channel=None,
+                text="invalid",
+                message_type="broadcast",
+                direction="tx",
+                raw={"status": "queued", "gateway_id": "meshcore"},
+            ),
+            MessageRecord(
+                message_id="bad-channel",
+                protocol=PROTOCOL_MESHCORE,
+                gateway_id="meshcore",
+                sender="homeassistant",
+                receiver=None,
+                channel="9",
+                text="invalid",
+                direction="tx",
+                raw={"status": "queued", "gateway_id": "meshcore"},
+            ),
+            MessageRecord(
+                message_id="poison-gateway",
+                protocol=PROTOCOL_MESHCORE,
+                gateway_id="meshcore",
+                sender="homeassistant",
+                receiver=None,
+                channel=None,
+                text="invalid",
+                direction="tx",
+                raw={"status": "queued", "gateway_id": []},
+            ),
+        ]
+        valid = MessageRecord(
+            message_id="valid",
+            protocol=PROTOCOL_MESHCORE,
+            gateway_id="meshcore",
+            sender="homeassistant",
+            receiver=None,
+            channel=0,
+            text="valid",
+            direction="tx",
+            raw={"status": "queued", "gateway_id": "meshcore"},
+        )
+
+        class Store:
+            async def async_pending_outbox(
+                self,
+                *,
+                limit: int,
+                after: tuple[str, str] | None = None,
+            ) -> list[MessageRecord]:
+                assert limit == 100
+                assert after is None
+                return [*invalid, valid]
+
+            async def async_add_message(self, _message: MessageRecord) -> None:
+                return None
+
+            async def async_recent_messages(
+                self, limit: int
+            ) -> list[MessageRecord]:
+                assert limit == 100
+                return [*invalid, valid]
+
+        gateway = SimpleNamespace(
+            config=GatewayConfig(
+                gateway_id="meshcore",
+                name="MeshCore",
+                protocol=PROTOCOL_MESHCORE,
+                transport=TRANSPORT_TCP,
+            ),
+            status=GatewayStatus(
+                gateway_id="meshcore",
+                name="MeshCore",
+                protocol=PROTOCOL_MESHCORE,
+                transport=TRANSPORT_TCP,
+                connected=True,
+            ),
+            async_send_message=AsyncMock(return_value="provider"),
+        )
+        coordinator = object.__new__(coordinator_class)
+        coordinator._gateway_generation = 0
+        coordinator._shutting_down = False
+        coordinator._reconnect_suspended = False
+        coordinator._outbox_lock = asyncio.Lock()
+        coordinator._outbox_flush_owner = None
+        coordinator._active_send_message_ids = set()
+        coordinator.snapshot = MeshSnapshot()
+        coordinator._node_alias_redirects = {}
+        coordinator.gateways = {gateway.config.gateway_id: gateway}
+        coordinator.store = Store()
+        coordinator.tx_limiter = SimpleNamespace(acquire=AsyncMock())
+        coordinator.hass = SimpleNamespace(
+            bus=SimpleNamespace(async_fire=lambda *_args: None)
+        )
+        coordinator.async_set_updated_data = Mock()
+
+        await coordinator._flush_outbox()
+
+        assert all(record.raw["status"] == "blocked" for record in invalid)
+        assert all(
+            record.raw["last_error_code"] == "invalid_message"
+            for record in invalid
+        )
+        gateway.async_send_message.assert_awaited_once()
+        assert valid.channel == "0"
+        assert valid.raw["status"] == "sent"
+
+    asyncio.run(run())
+
+
+def test_outbox_keyset_scan_passes_nonterminal_oldest_page(monkeypatch) -> None:
+    """One disconnected head row cannot hide work after the first 100."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(
+            monkeypatch
+        )
+        base = datetime(2026, 7, 29, tzinfo=UTC)
+        stuck = MessageRecord(
+            message_id="000-stuck",
+            protocol=PROTOCOL_MESHCORE,
+            gateway_id="offline",
+            sender="homeassistant",
+            receiver=None,
+            channel=None,
+            text="wait",
+            timestamp=base,
+            direction="tx",
+            raw={"status": "queued", "gateway_id": "offline"},
+        )
+        invalid = [
+            MessageRecord(
+                message_id=f"{index:03d}-invalid",
+                protocol=PROTOCOL_MESHCORE,
+                gateway_id="online",
+                sender="homeassistant",
+                receiver=None,
+                channel=None,
+                text="invalid",
+                message_type="direct",
+                timestamp=base + timedelta(seconds=index),
+                direction="tx",
+                raw={"status": "queued", "gateway_id": "online"},
+            )
+            for index in range(1, 100)
+        ]
+        later = MessageRecord(
+            message_id="100-later",
+            protocol=PROTOCOL_MESHCORE,
+            gateway_id="online",
+            sender="homeassistant",
+            receiver=None,
+            channel=None,
+            text="deliver later page",
+            timestamp=base + timedelta(seconds=100),
+            direction="tx",
+            raw={"status": "queued", "gateway_id": "online"},
+        )
+        first_page = [stuck, *invalid]
+        expected_cursor = (
+            first_page[-1].timestamp.isoformat(),
+            first_page[-1].message_id,
+        )
+
+        class Store:
+            def __init__(self) -> None:
+                self.cursors: list[tuple[str, str] | None] = []
+
+            async def async_pending_outbox(
+                self,
+                *,
+                limit: int,
+                after: tuple[str, str] | None = None,
+            ) -> list[MessageRecord]:
+                assert limit == 100
+                self.cursors.append(after)
+                if after is None:
+                    return first_page
+                if after == expected_cursor:
+                    return [later]
+                return []
+
+            async def async_add_message(self, _message: MessageRecord) -> None:
+                return None
+
+            async def async_recent_messages(
+                self, limit: int
+            ) -> list[MessageRecord]:
+                assert limit == 100
+                return [later]
+
+        def gateway(gateway_id: str, connected: bool) -> SimpleNamespace:
+            return SimpleNamespace(
+                config=GatewayConfig(
+                    gateway_id=gateway_id,
+                    name=gateway_id,
+                    protocol=PROTOCOL_MESHCORE,
+                    transport=TRANSPORT_TCP,
+                ),
+                status=GatewayStatus(
+                    gateway_id=gateway_id,
+                    name=gateway_id,
+                    protocol=PROTOCOL_MESHCORE,
+                    transport=TRANSPORT_TCP,
+                    connected=connected,
+                ),
+                async_send_message=AsyncMock(return_value="provider"),
+            )
+
+        offline = gateway("offline", False)
+        online = gateway("online", True)
+        coordinator = object.__new__(coordinator_class)
+        coordinator._gateway_generation = 0
+        coordinator._shutting_down = False
+        coordinator._reconnect_suspended = False
+        coordinator._outbox_lock = asyncio.Lock()
+        coordinator._outbox_flush_owner = None
+        coordinator._active_send_message_ids = set()
+        coordinator.snapshot = MeshSnapshot()
+        coordinator._node_alias_redirects = {}
+        coordinator.gateways = {"offline": offline, "online": online}
+        coordinator.store = Store()
+        coordinator.tx_limiter = SimpleNamespace(acquire=AsyncMock())
+        coordinator.hass = SimpleNamespace(
+            bus=SimpleNamespace(async_fire=lambda *_args: None)
+        )
+        coordinator.async_set_updated_data = Mock()
+
+        await coordinator._flush_outbox()
+
+        assert coordinator.store.cursors == [None, expected_cursor]
+        assert stuck.raw["status"] == "queued"
+        assert all(record.raw["status"] == "blocked" for record in invalid)
+        assert later.raw["status"] == "sent"
+        online.async_send_message.assert_awaited_once()
+        offline.async_send_message.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+def test_direct_send_revalidates_identity_after_rate_limiter(
+    monkeypatch,
+) -> None:
+    """A conflict arriving while throttled must block the provider send."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(
+            monkeypatch
+        )
+        left = NodeState(
+            node_key="mac:111111111111",
+            protocol=PROTOCOL_MESHTASTIC,
+            node_id="!12345678",
+            mac="111111111111",
+        )
+        right = NodeState(
+            node_key="mac:222222222222",
+            protocol=PROTOCOL_MESHTASTIC,
+            node_id="!12345678",
+            mac="222222222222",
+        )
+        persisted: list[dict] = []
+
+        class Store:
+            async def async_add_message(
+                self, message: MessageRecord
+            ) -> None:
+                persisted.append(dict(message.raw))
+
+            async def async_recent_messages(
+                self, limit: int
+            ) -> list[MessageRecord]:
+                assert limit == 100
+                return []
+
+        class Limiter:
+            async def acquire(self) -> None:
+                coordinator.snapshot.nodes[right.node_key] = right
+
+        class Gateway:
+            config = GatewayConfig(
+                gateway_id="gateway-1",
+                name="Gateway",
+                protocol=PROTOCOL_MESHTASTIC,
+                transport=TRANSPORT_TCP,
+            )
+            status = GatewayStatus(
+                gateway_id="gateway-1",
+                name="Gateway",
+                protocol=PROTOCOL_MESHTASTIC,
+                transport=TRANSPORT_TCP,
+                connected=True,
+            )
+
+            def __init__(self) -> None:
+                self.send_count = 0
+
+            async def async_send_message(self, **_kwargs) -> str:
+                self.send_count += 1
+                return "must-not-send"
+
+        gateway = Gateway()
+        coordinator = object.__new__(coordinator_class)
+        coordinator._gateway_generation = 0
+        coordinator._shutting_down = False
+        coordinator._reconnect_suspended = False
+        coordinator._active_send_message_ids = set()
+        coordinator._node_alias_redirects = {
+            left.node_key: left.node_key
+        }
+        coordinator.snapshot = MeshSnapshot(nodes={left.node_key: left})
+        coordinator.store = Store()
+        coordinator.tx_limiter = Limiter()
+        coordinator.gateways = {gateway.config.gateway_id: gateway}
+        coordinator.hass = SimpleNamespace(
+            bus=SimpleNamespace(async_fire=lambda *_args: None)
+        )
+        coordinator.async_set_updated_data = Mock()
+        error_class = coordinator_class._provider_message_target.__globals__[
+            "HomeAssistantError"
+        ]
+
+        with pytest.raises(error_class, match="identity is ambiguous"):
+            await coordinator._async_send_message(
+                target_node=left.node_key,
+                message="do not send",
+                channel=None,
+                priority="normal",
+                message_type="direct",
+                gateway_id="gateway-1",
+            )
+
+        assert gateway.send_count == 0
+        assert persisted[0]["status"] == "queued"
+        assert {
+            key: value
+            for key, value in persisted[-1].items()
+            if key != "target_binding"
+        } == {
+            "status": "blocked",
+            "target_node": "!12345678",
+            "gateway_id": "gateway-1",
+            "last_error_code": "unsafe_identity",
+        }
+        assert persisted[-1]["target_binding"].startswith("node:")
+        coordinator.async_set_updated_data.assert_called_once_with(
+            coordinator.snapshot
+        )
+
+    asyncio.run(run())
+
+
+def test_known_proof_target_replacement_is_blocked_after_rate_limiter(
+    monkeypatch,
+) -> None:
+    """A proof/name selection cannot degrade to an ID-only replacement."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(
+            monkeypatch
+        )
+        original = NodeState(
+            node_key="meshtastic:!12345678",
+            protocol=PROTOCOL_MESHTASTIC,
+            node_id="!12345678",
+            mac="aabbccddeeff",
+            long_name="Original relay",
+        )
+        replacement = NodeState(
+            node_key="meshtastic:!12345678",
+            protocol=PROTOCOL_MESHTASTIC,
+            node_id="!12345678",
+        )
+        saved: list[dict] = []
+
+        class Limiter:
+            async def acquire(self) -> None:
+                coordinator.snapshot.nodes = {
+                    replacement.node_key: replacement
+                }
+
+        gateway = SimpleNamespace(
+            config=GatewayConfig(
+                gateway_id="gateway-1",
+                name="Gateway",
+                protocol=PROTOCOL_MESHTASTIC,
+                transport=TRANSPORT_TCP,
+            ),
+            status=GatewayStatus(
+                gateway_id="gateway-1",
+                name="Gateway",
+                protocol=PROTOCOL_MESHTASTIC,
+                transport=TRANSPORT_TCP,
+                connected=True,
+            ),
+            async_send_message=AsyncMock(),
+        )
+        coordinator = object.__new__(coordinator_class)
+        coordinator._gateway_generation = 0
+        coordinator._shutting_down = False
+        coordinator._reconnect_suspended = False
+        coordinator._active_send_message_ids = set()
+        coordinator.snapshot = MeshSnapshot(
+            nodes={original.node_key: original}
+        )
+        coordinator._node_alias_redirects = {
+            original.node_key: original.node_key
+        }
+        coordinator.gateways = {gateway.config.gateway_id: gateway}
+        coordinator.store = SimpleNamespace(
+            async_add_message=lambda record: _append_async(
+                saved, dict(record.raw)
+            ),
+            async_recent_messages=AsyncMock(return_value=[]),
+        )
+        coordinator.tx_limiter = Limiter()
+        coordinator.hass = SimpleNamespace(
+            bus=SimpleNamespace(async_fire=lambda *_args: None)
+        )
+        coordinator.async_set_updated_data = Mock()
+        error_class = coordinator_class._async_send_message.__globals__[
+            "HomeAssistantError"
+        ]
+
+        with pytest.raises(error_class, match="identity changed"):
+            await coordinator._async_send_message(
+                target_node=original.node_key,
+                message="do not redirect",
+                channel=None,
+                priority="normal",
+                message_type="direct",
+                gateway_id=gateway.config.gateway_id,
+            )
+
+        gateway.async_send_message.assert_not_awaited()
+        assert saved[-1]["status"] == "blocked"
+        assert saved[-1]["last_error_code"] == "unsafe_identity"
+        assert saved[-1]["target_binding"].startswith("node:")
+
+    async def _append_async(items: list[dict], item: dict) -> None:
+        items.append(item)
+
+    asyncio.run(run())
+
+
+def test_queued_proof_binding_blocks_id_only_replacement_after_restart(
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(
+            monkeypatch
+        )
+        original = NodeState(
+            node_key="meshtastic:!12345678",
+            protocol=PROTOCOL_MESHTASTIC,
+            node_id="!12345678",
+            public_key="ab" * 32,
+            short_name="OLD",
+        )
+        replacement = NodeState(
+            node_key="meshtastic:!12345678",
+            protocol=PROTOCOL_MESHTASTIC,
+            node_id="!12345678",
+        )
+        coordinator = object.__new__(coordinator_class)
+        coordinator.snapshot = MeshSnapshot(
+            nodes={original.node_key: original}
+        )
+        coordinator._node_alias_redirects = {
+            original.node_key: original.node_key
+        }
+        binding = coordinator._resolve_message_target(
+            original.node_key
+        ).binding
+        record = MessageRecord(
+            message_id="queued-bound-direct",
+            protocol=PROTOCOL_MESHTASTIC,
+            gateway_id="gateway-1",
+            sender="homeassistant",
+            receiver="!12345678",
+            channel=None,
+            text="do not redirect",
+            message_type="direct",
+            direction="tx",
+            raw={
+                "status": "queued",
+                "gateway_id": "gateway-1",
+                "target_binding": binding,
+            },
+        )
+
+        class Store:
+            async def async_pending_outbox(
+                self,
+                *,
+                limit: int,
+                after: tuple[str, str] | None = None,
+            ) -> list[MessageRecord]:
+                assert limit == 100
+                assert after is None
+                return [record]
+
+            async def async_add_message(self, _record: MessageRecord) -> None:
+                return None
+
+            async def async_recent_messages(
+                self, limit: int
+            ) -> list[MessageRecord]:
+                assert limit == 100
+                return [record]
+
+        gateway = SimpleNamespace(
+            config=GatewayConfig(
+                gateway_id="gateway-1",
+                name="Gateway",
+                protocol=PROTOCOL_MESHTASTIC,
+                transport=TRANSPORT_TCP,
+            ),
+            status=GatewayStatus(
+                gateway_id="gateway-1",
+                name="Gateway",
+                protocol=PROTOCOL_MESHTASTIC,
+                transport=TRANSPORT_TCP,
+                connected=True,
+            ),
+            async_send_message=AsyncMock(),
+        )
+        coordinator._gateway_generation = 0
+        coordinator._shutting_down = False
+        coordinator._reconnect_suspended = False
+        coordinator._outbox_lock = asyncio.Lock()
+        coordinator._outbox_flush_owner = None
+        coordinator._active_send_message_ids = set()
+        coordinator.snapshot.nodes = {replacement.node_key: replacement}
+        coordinator.gateways = {gateway.config.gateway_id: gateway}
+        coordinator.store = Store()
+        coordinator.tx_limiter = SimpleNamespace(acquire=AsyncMock())
+        coordinator.hass = SimpleNamespace(
+            bus=SimpleNamespace(async_fire=lambda *_args: None)
+        )
+        coordinator.async_set_updated_data = Mock()
+
+        await coordinator._flush_outbox()
+
+        gateway.async_send_message.assert_not_awaited()
+        assert record.raw["status"] == "blocked"
+        assert record.raw["last_error_code"] == "unsafe_identity"
+
+    asyncio.run(run())
+
+
+def test_meshtastic_gateway_rejects_unknown_provider_alias_before_queue(
+    monkeypatch,
+) -> None:
+    """Unknown names cannot fall through to a provider's private node cache."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(
+            monkeypatch
+        )
+
+        class Gateway:
+            config = GatewayConfig(
+                gateway_id="gateway-1",
+                name="Gateway",
+                protocol=PROTOCOL_MESHTASTIC,
+                transport=TRANSPORT_TCP,
+            )
+            status = GatewayStatus(
+                gateway_id="gateway-1",
+                name="Gateway",
+                protocol=PROTOCOL_MESHTASTIC,
+                transport=TRANSPORT_TCP,
+                connected=True,
+            )
+            async_send_message = AsyncMock()
+
+        coordinator = object.__new__(coordinator_class)
+        coordinator._gateway_generation = 0
+        coordinator._shutting_down = False
+        coordinator._reconnect_suspended = False
+        coordinator._active_send_message_ids = set()
+        coordinator._node_alias_redirects = {}
+        coordinator.snapshot = MeshSnapshot()
+        coordinator.store = SimpleNamespace(async_add_message=AsyncMock())
+        coordinator.gateways = {"gateway-1": Gateway()}
+        error_class = coordinator_class._provider_message_target.__globals__[
+            "HomeAssistantError"
+        ]
+
+        with pytest.raises(error_class, match="not a known node"):
+            await coordinator._async_send_message(
+                target_node="unknown cached name",
+                message="do not queue",
+                channel=None,
+                priority="normal",
+                message_type="direct",
+                gateway_id="gateway-1",
+            )
+
+        coordinator.store.async_add_message.assert_not_awaited()
+        coordinator.gateways[
+            "gateway-1"
+        ].async_send_message.assert_not_awaited()
 
     asyncio.run(run())
 
@@ -1529,6 +3372,212 @@ def test_gateway_issue_ids_do_not_expose_gateway_identity(monkeypatch) -> None:
 
     assert issue_id == "gateway_start_gateway_001"
     assert "private-gateway-id" not in issue_id
+
+
+def test_gateway_start_repair_placeholder_redacts_identity_and_raw_error(
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(
+            monkeypatch
+        )
+        private_error = (
+            "connection to AA:BB:CC:DD:EE:FF at /dev/tty-private failed"
+        )
+        config = GatewayConfig(
+            gateway_id="private-kitchen-radio",
+            name="Private Kitchen Radio",
+            protocol=PROTOCOL_MESHTASTIC,
+            transport=TRANSPORT_TCP,
+        )
+        gateway = SimpleNamespace(
+            config=config,
+            async_start=AsyncMock(side_effect=RuntimeError(private_error)),
+        )
+        coordinator = object.__new__(coordinator_class)
+        coordinator.hass = object()
+        coordinator._gateway_configs = [config]
+        coordinator.gateways = {config.gateway_id: gateway}
+        coordinator._schedule_reconnect = Mock()
+        issue_registry_module = coordinator_class._start_gateways.__globals__[
+            "ir"
+        ]
+        created: list[dict] = []
+        monkeypatch.setattr(
+            issue_registry_module,
+            "async_delete_issue",
+            lambda *_args, **_kwargs: None,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            issue_registry_module,
+            "async_create_issue",
+            lambda *_args, **kwargs: created.append(kwargs),
+            raising=False,
+        )
+
+        await coordinator._start_gateways()
+
+        placeholder = created[0]["translation_placeholders"]["message"]
+        assert "Gateway adapter 001" in placeholder
+        assert "connection" in placeholder
+        assert "RuntimeError" in placeholder
+        for private in (
+            config.gateway_id,
+            config.name,
+            "AA:BB:CC:DD:EE:FF",
+            "/dev/tty-private",
+        ):
+            assert private not in placeholder
+
+    asyncio.run(run())
+
+
+def test_send_failure_record_and_repair_do_not_retain_raw_error(
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(
+            monkeypatch
+        )
+        private_error = (
+            "connection to AA:BB:CC:DD:EE:FF at /dev/tty-private failed"
+        )
+        config = GatewayConfig(
+            gateway_id="private-kitchen-radio",
+            name="Private Kitchen Radio",
+            protocol=PROTOCOL_MESHTASTIC,
+            transport=TRANSPORT_TCP,
+        )
+        gateway = SimpleNamespace(
+            config=config,
+            status=GatewayStatus(
+                gateway_id=config.gateway_id,
+                name=config.name,
+                protocol=config.protocol,
+                transport=config.transport,
+                connected=True,
+            ),
+            async_send_message=AsyncMock(
+                side_effect=RuntimeError(private_error)
+            ),
+        )
+        saved: list[MessageRecord] = []
+
+        async def save(record: MessageRecord) -> None:
+            saved.append(record)
+
+        coordinator = object.__new__(coordinator_class)
+        coordinator._gateway_generation = 0
+        coordinator._shutting_down = False
+        coordinator._reconnect_suspended = False
+        coordinator._active_send_message_ids = set()
+        coordinator._gateway_configs = [config]
+        coordinator.snapshot = MeshSnapshot()
+        coordinator._node_alias_redirects = {}
+        coordinator.gateways = {config.gateway_id: gateway}
+        coordinator.store = SimpleNamespace(
+            async_add_message=save,
+            async_recent_messages=AsyncMock(return_value=[]),
+        )
+        coordinator.tx_limiter = SimpleNamespace(acquire=AsyncMock())
+        coordinator.hass = SimpleNamespace(
+            bus=SimpleNamespace(async_fire=lambda *_args: None)
+        )
+        coordinator.async_set_updated_data = Mock()
+        issue_registry_module = coordinator_class._async_send_message.__globals__[
+            "ir"
+        ]
+        created: list[dict] = []
+        monkeypatch.setattr(
+            issue_registry_module,
+            "async_create_issue",
+            lambda *_args, **kwargs: created.append(kwargs),
+            raising=False,
+        )
+
+        await coordinator._async_send_message(
+            target_node=None,
+            message="safe visible message",
+            channel=None,
+            priority="normal",
+            message_type="broadcast",
+            gateway_id=config.gateway_id,
+        )
+
+        assert saved[-1].raw == {
+            "status": "queued",
+            "target_node": None,
+            "gateway_id": config.gateway_id,
+            "last_error_code": "send_failed",
+        }
+        assert private_error not in repr(saved[-1].raw)
+        placeholder = created[0]["translation_placeholders"]["message"]
+        for private in (
+            config.gateway_id,
+            config.name,
+            "AA:BB:CC:DD:EE:FF",
+            "/dev/tty-private",
+        ):
+            assert private not in placeholder
+
+    asyncio.run(run())
+
+
+def test_gateway_stop_debug_log_uses_only_safe_ordinal_and_categories(
+    monkeypatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(
+            monkeypatch
+        )
+        private_error = (
+            "connection to AA:BB:CC:DD:EE:FF at /dev/tty-private failed"
+        )
+        config = GatewayConfig(
+            gateway_id="private-kitchen-radio",
+            name="Private Kitchen Radio",
+            protocol=PROTOCOL_MESHTASTIC,
+            transport=TRANSPORT_TCP,
+        )
+
+        async def fail_stop() -> None:
+            raise RuntimeError(private_error)
+
+        coordinator = object.__new__(coordinator_class)
+        coordinator._shutting_down = False
+        coordinator._reconnect_suspended = False
+        coordinator._gateway_startup_task = None
+        coordinator._reconnect_tasks = {}
+        coordinator._outbox_flush_owner = None
+        coordinator._send_tasks = set()
+        coordinator._gateway_configs = [config]
+        coordinator.gateways = {
+            config.gateway_id: SimpleNamespace(
+                config=config, async_stop=fail_stop
+            )
+        }
+        coordinator.store = SimpleNamespace(async_close=AsyncMock())
+
+        with caplog.at_level(
+            logging.DEBUG, logger="custom_components.meshnet.coordinator"
+        ):
+            await coordinator.async_shutdown()
+
+        rendered = caplog.text
+        assert "gateway adapter 001" in rendered
+        assert "connection" in rendered
+        assert "RuntimeError" in rendered
+        for private in (
+            config.gateway_id,
+            config.name,
+            "AA:BB:CC:DD:EE:FF",
+            "/dev/tty-private",
+        ):
+            assert private not in rendered
+
+    asyncio.run(run())
 
 
 def test_gateway_start_repairs_follow_current_outcomes(monkeypatch) -> None:
@@ -2020,5 +4069,301 @@ def test_shutdown_cancels_reconnect_before_transport_restart(monkeypatch) -> Non
         assert reconnect_task.cancelled()
         assert coordinator._reconnect_tasks == {}
         assert gateway.calls == []
+
+    asyncio.run(run())
+
+
+def test_verified_meshcore_pin_update_is_saved_without_losing_entry_options(
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+
+        def assert_marker_armed(_entry, *, options):
+            assert coordinator._connection_update_reload_options == options
+            asyncio.get_running_loop().call_soon(
+                coordinator.consume_connection_update_reload,
+                options,
+            )
+            return True
+
+        update_entry = Mock(side_effect=assert_marker_armed)
+        gateway_config = GatewayConfig(
+            gateway_id="gateway-1",
+            name="Local radio",
+            protocol=PROTOCOL_MESHCORE,
+            transport=TRANSPORT_BLUETOOTH,
+            options={"existing": "preserved"},
+        )
+        coordinator = object.__new__(coordinator_class)
+        coordinator.entry = SimpleNamespace(
+            options={
+                "unrelated": 7,
+                CONF_GATEWAYS: [
+                    {
+                        "gateway_id": "gateway-1",
+                        "name": "Local radio",
+                        "protocol": PROTOCOL_MESHCORE,
+                        "transport": TRANSPORT_BLUETOOTH,
+                        "options": {"existing": "preserved", "pin": "123456"},
+                    },
+                    {
+                        "gateway_id": "gateway-2",
+                        "protocol": PROTOCOL_MESHTASTIC,
+                        "transport": TRANSPORT_TCP,
+                    },
+                ],
+            },
+            data={"untouched": True},
+        )
+        coordinator.hass = SimpleNamespace(
+            config_entries=SimpleNamespace(async_update_entry=update_entry)
+        )
+        coordinator.gateways = {
+            "gateway-1": SimpleNamespace(config=gateway_config)
+        }
+
+        await coordinator.async_persist_gateway_connection_updates(
+            "gateway-1", {"pin": "654321"}
+        )
+
+        update_entry.assert_called_once()
+        args, kwargs = update_entry.call_args
+        assert args == (coordinator.entry,)
+        assert kwargs["options"]["unrelated"] == 7
+        saved = kwargs["options"][CONF_GATEWAYS]
+        assert saved[0]["options"] == {
+            "existing": "preserved",
+            "pin": "654321",
+        }
+        assert saved[1]["gateway_id"] == "gateway-2"
+        assert gateway_config.options == {
+            "existing": "preserved",
+            "pin": "654321",
+        }
+        assert coordinator._connection_update_reload_options is None
+        assert coordinator._connection_update_reload_waiter is None
+        assert not coordinator.consume_connection_update_reload(
+            kwargs["options"]
+        )
+
+    asyncio.run(run())
+
+
+def test_meshcore_pin_clear_uses_data_fallback_and_rejects_bad_updates(
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+        update_entry = Mock(return_value=False)
+        gateway_config = GatewayConfig(
+            gateway_id="gateway-1",
+            name="Local radio",
+            protocol=PROTOCOL_MESHCORE,
+            transport=TRANSPORT_BLUETOOTH,
+            options={"pin": "123456"},
+        )
+        coordinator = object.__new__(coordinator_class)
+        coordinator.entry = SimpleNamespace(
+            options={"unrelated": True},
+            data={
+                CONF_GATEWAYS: [
+                    {
+                        "gateway_id": "gateway-1",
+                        "protocol": PROTOCOL_MESHCORE,
+                        "transport": TRANSPORT_BLUETOOTH,
+                        "options": {"pin": "123456"},
+                    }
+                ]
+            },
+        )
+        coordinator.hass = SimpleNamespace(
+            config_entries=SimpleNamespace(async_update_entry=update_entry)
+        )
+        coordinator.gateways = {
+            "gateway-1": SimpleNamespace(config=gateway_config)
+        }
+
+        await coordinator.async_persist_gateway_connection_updates(
+            "gateway-1", {"pin": None}
+        )
+        saved = update_entry.call_args.kwargs["options"]
+        assert saved["unrelated"] is True
+        assert "options" not in saved[CONF_GATEWAYS][0]
+        assert "pin" not in gateway_config.options
+        assert coordinator._connection_update_reload_options is None
+
+        for invalid in ({"pin": "12345"}, {"password": "654321"}):
+            try:
+                await coordinator.async_persist_gateway_connection_updates(
+                    "gateway-1", invalid
+                )
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("unsafe connection update was accepted")
+        assert update_entry.call_count == 1
+
+    asyncio.run(run())
+
+
+def test_connection_update_reload_marker_is_invalidated_by_mismatch(
+    monkeypatch,
+) -> None:
+    coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+    coordinator = object.__new__(coordinator_class)
+    coordinator._connection_update_reload_options = {
+        "unrelated": 7,
+        CONF_GATEWAYS: [{"gateway_id": "gateway-1"}],
+    }
+
+    assert not coordinator.consume_connection_update_reload(
+        {
+            "unrelated": 8,
+            CONF_GATEWAYS: [{"gateway_id": "gateway-1"}],
+        }
+    )
+    assert coordinator._connection_update_reload_options is None
+    assert not coordinator.consume_connection_update_reload(
+        {
+            "unrelated": 7,
+            CONF_GATEWAYS: [{"gateway_id": "gateway-1"}],
+        }
+    )
+
+
+def test_concurrent_connection_updates_wait_for_each_listener_ack(
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+        coordinator = object.__new__(coordinator_class)
+        gateways = [
+            {
+                "gateway_id": gateway_id,
+                "protocol": PROTOCOL_MESHCORE,
+                "transport": TRANSPORT_BLUETOOTH,
+                "options": {"pin": "123456"},
+            }
+            for gateway_id in ("gateway-1", "gateway-2")
+        ]
+        coordinator.entry = SimpleNamespace(
+            options={CONF_GATEWAYS: gateways},
+            data={},
+        )
+        configs = {
+            gateway_id: GatewayConfig(
+                gateway_id=gateway_id,
+                name=gateway_id,
+                protocol=PROTOCOL_MESHCORE,
+                transport=TRANSPORT_BLUETOOTH,
+                options={"pin": "123456"},
+            )
+            for gateway_id in ("gateway-1", "gateway-2")
+        }
+        coordinator.gateways = {
+            key: SimpleNamespace(config=value) for key, value in configs.items()
+        }
+        pending_options: list[dict] = []
+        second_update = asyncio.Event()
+
+        def update_entry(entry, *, options):
+            entry.options = options
+            pending_options.append(options)
+            if len(pending_options) == 2:
+                second_update.set()
+            return True
+
+        coordinator.hass = SimpleNamespace(
+            config_entries=SimpleNamespace(async_update_entry=update_entry)
+        )
+
+        first = asyncio.create_task(
+            coordinator.async_persist_gateway_connection_updates(
+                "gateway-1", {"pin": "654321"}
+            )
+        )
+        await asyncio.sleep(0)
+        second = asyncio.create_task(
+            coordinator.async_persist_gateway_connection_updates(
+                "gateway-2", {"pin": "765432"}
+            )
+        )
+        await asyncio.sleep(0)
+        assert len(pending_options) == 1
+
+        assert coordinator.consume_connection_update_reload(
+            pending_options[0]
+        )
+        await asyncio.wait_for(second_update.wait(), timeout=1)
+        assert len(pending_options) == 2
+        assert coordinator.consume_connection_update_reload(
+            pending_options[1]
+        )
+        await asyncio.gather(first, second)
+
+        saved = {
+            item["gateway_id"]: item["options"]["pin"]
+            for item in coordinator.entry.options[CONF_GATEWAYS]
+        }
+        assert saved == {
+            "gateway-1": "654321",
+            "gateway-2": "765432",
+        }
+        assert configs["gateway-1"].options["pin"] == "654321"
+        assert configs["gateway-2"].options["pin"] == "765432"
+
+    asyncio.run(run())
+
+
+def test_connection_update_failure_clears_reload_marker(monkeypatch) -> None:
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+
+        def fail_update_entry(_entry, **_values):
+            raise RuntimeError("config entry update failed")
+
+        gateway_config = GatewayConfig(
+            gateway_id="gateway-1",
+            name="Local radio",
+            protocol=PROTOCOL_MESHCORE,
+            transport=TRANSPORT_BLUETOOTH,
+            options={"pin": "123456"},
+        )
+        coordinator = object.__new__(coordinator_class)
+        coordinator.entry = SimpleNamespace(
+            options={
+                CONF_GATEWAYS: [
+                    {
+                        "gateway_id": "gateway-1",
+                        "protocol": PROTOCOL_MESHCORE,
+                        "transport": TRANSPORT_BLUETOOTH,
+                        "options": {"pin": "123456"},
+                    }
+                ]
+            },
+            data={},
+        )
+        coordinator.hass = SimpleNamespace(
+            config_entries=SimpleNamespace(
+                async_update_entry=fail_update_entry
+            )
+        )
+        coordinator.gateways = {
+            "gateway-1": SimpleNamespace(config=gateway_config)
+        }
+
+        try:
+            await coordinator.async_persist_gateway_connection_updates(
+                "gateway-1", {"pin": "654321"}
+            )
+        except RuntimeError as err:
+            assert str(err) == "config entry update failed"
+        else:
+            raise AssertionError("config entry failure was suppressed")
+
+        assert coordinator._connection_update_reload_options is None
+        assert coordinator._connection_update_reload_waiter is None
+        assert gateway_config.options["pin"] == "123456"
 
     asyncio.run(run())

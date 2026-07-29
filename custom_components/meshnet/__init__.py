@@ -24,6 +24,9 @@ from .const import (
     CONF_GATEWAYS,
     DOMAIN,
     MESSAGE_TYPE_BROADCAST,
+    MESSAGE_TYPE_DIRECT,
+    MESSAGE_TYPE_EMERGENCY,
+    MESSAGE_TYPE_GROUP,
     PLATFORMS,
     VERSION,
 )
@@ -36,6 +39,13 @@ SERVICE_SCHEDULE_MESSAGE = "schedule_message"
 SERVICE_REFRESH_GATEWAY = "refresh_gateway"
 _SCHEDULED_CANCELS_ATTR = "_meshnet_scheduled_message_cancels"
 _SCHEDULED_UNLOAD_REGISTERED_ATTR = "_meshnet_scheduled_unload_registered"
+_MESSAGE_TYPES = (
+    MESSAGE_TYPE_DIRECT,
+    MESSAGE_TYPE_GROUP,
+    MESSAGE_TYPE_BROADCAST,
+    MESSAGE_TYPE_EMERGENCY,
+)
+_PRIORITIES = ("normal", "high", "emergency")
 
 
 async def async_setup(hass, config: dict[str, Any]) -> bool:
@@ -43,7 +53,12 @@ async def async_setup(hass, config: dict[str, Any]) -> bool:
     from homeassistant import config_entries
 
     from .websocket_api import async_register_websocket_api
+    from .websocket_redaction import install_websocket_secret_redaction
 
+    # Home Assistant can debug-log decoded websocket commands before handler
+    # dispatch. Install the narrow MeshNet command redactor before the panel can
+    # submit a write-only PIN, channel key, private message, or node identity.
+    install_websocket_secret_redaction()
     hass.data.setdefault(DOMAIN, {})
     await async_register_websocket_api(hass)
     await _async_register_panel(hass)
@@ -86,16 +101,16 @@ async def async_setup_entry(hass, entry) -> bool:
                 await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
             except BaseException as err:
                 _LOGGER.warning(
-                    "Failed to roll back MeshNet platforms after setup error: %s",
-                    err,
+                    "Failed to roll back MeshNet platforms after setup error (%s)",
+                    type(err).__name__,
                 )
         _cancel_scheduled_messages(coordinator)
         try:
             await coordinator.async_shutdown()
         except BaseException as err:
             _LOGGER.warning(
-                "Failed to finish MeshNet coordinator rollback after setup error: %s",
-                err,
+                "Failed to finish MeshNet coordinator rollback after setup error (%s)",
+                type(err).__name__,
             )
         domain_data = hass.data.get(DOMAIN)
         if (
@@ -109,11 +124,32 @@ async def async_setup_entry(hass, entry) -> bool:
 
 async def async_unload_entry(hass, entry) -> bool:
     """Unload MeshNet."""
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    if not unload_ok:
-        return False
     domain_data = hass.data.get(DOMAIN, {})
     coordinator = domain_data.get(entry.entry_id)
+    settings_manager = getattr(coordinator, "gateway_settings", None)
+    settings_fenced = False
+    if settings_manager is not None:
+        settings_fenced = await settings_manager.async_quiesce()
+        if not settings_fenced:
+            _LOGGER.warning(
+                "MeshNet unload deferred because gateway settings work did "
+                "not stop promptly"
+            )
+            return False
+    try:
+        unload_ok = await hass.config_entries.async_unload_platforms(
+            entry, PLATFORMS
+        )
+    except BaseException:
+        if settings_fenced:
+            settings_manager.resume()
+        raise
+    if not unload_ok:
+        if settings_fenced and not settings_manager.resume():
+            _LOGGER.warning(
+                "MeshNet settings remain fenced after a failed platform unload"
+            )
+        return False
     if coordinator is not None:
         _cancel_scheduled_messages(coordinator)
         await coordinator.async_shutdown()
@@ -136,6 +172,14 @@ async def async_remove_entry(hass, entry) -> None:
 
 async def _async_update_listener(hass, entry) -> None:
     """Reload on options changes."""
+    coordinator = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    consume_connection_update = getattr(
+        coordinator, "consume_connection_update_reload", None
+    )
+    if callable(consume_connection_update) and consume_connection_update(
+        entry.options
+    ):
+        return
     await hass.config_entries.async_reload(entry.entry_id)
 
 
@@ -154,8 +198,10 @@ def _async_register_services(hass) -> None:
             vol.Optional(ATTR_TARGET_NODE): _coerce_target_node,
             vol.Optional(ATTR_GATEWAY_ID): cv.string,
             vol.Optional(ATTR_CHANNEL): cv.string,
-            vol.Optional(ATTR_PRIORITY, default="normal"): cv.string,
-            vol.Optional(ATTR_MESSAGE_TYPE, default=MESSAGE_TYPE_BROADCAST): cv.string,
+            vol.Optional(ATTR_PRIORITY, default="normal"): vol.In(_PRIORITIES),
+            vol.Optional(
+                ATTR_MESSAGE_TYPE, default=MESSAGE_TYPE_BROADCAST
+            ): vol.In(_MESSAGE_TYPES),
         }
     )
     service_schedule_schema = vol.Schema(
@@ -165,8 +211,10 @@ def _async_register_services(hass) -> None:
             vol.Optional(ATTR_TARGET_NODE): _coerce_target_node,
             vol.Optional(ATTR_GATEWAY_ID): cv.string,
             vol.Optional(ATTR_CHANNEL): cv.string,
-            vol.Optional(ATTR_PRIORITY, default="normal"): cv.string,
-            vol.Optional(ATTR_MESSAGE_TYPE, default=MESSAGE_TYPE_BROADCAST): cv.string,
+            vol.Optional(ATTR_PRIORITY, default="normal"): vol.In(_PRIORITIES),
+            vol.Optional(
+                ATTR_MESSAGE_TYPE, default=MESSAGE_TYPE_BROADCAST
+            ): vol.In(_MESSAGE_TYPES),
         }
     )
     service_refresh_schema = vol.Schema({vol.Optional(ATTR_GATEWAY_ID): cv.string})
@@ -274,6 +322,8 @@ def _schedule_message_call(
     from homeassistant.helpers.event import async_call_later
 
     when = _parse_when(data.pop(ATTR_WHEN))
+    # Normalize and reject invalid schedules before a timer can retain them.
+    fields = service_fields(data)
     delay = max(0.0, (when - datetime.now(when.tzinfo)).total_seconds())
     callbacks = _scheduled_message_cancels(coordinator)
     active = True
@@ -286,7 +336,7 @@ def _schedule_message_call(
         callbacks.discard(cancel)
         coordinator.entry.async_create_background_task(
             hass,
-            coordinator.async_send_message(**service_fields(data)),
+            coordinator.async_send_message(**fields),
             "MeshNet scheduled message",
         )
 

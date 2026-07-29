@@ -75,11 +75,11 @@ Supported combinations:
 
 Invalid combinations are rejected by the config flow.
 
-## Direct Meshtastic Bluetooth (version 0.5)
+## Direct Meshtastic Bluetooth (introduced in version 0.5)
 
 > [!NOTE]
-> This section describes the version 0.5 behavior. Install a version 0.5 build
-> before expecting these controls in Home Assistant.
+> Install version 0.5 or newer before expecting these controls in Home
+> Assistant.
 
 Meshtastic Bluetooth setup uses a local Linux BlueZ adapter. Home Assistant
 Bluetooth proxies are not supported for pairing or for the subsequent direct
@@ -362,9 +362,18 @@ data:
 For Meshtastic direct Bluetooth, `target_node` accepts a full `!` node ID, an
 integer node number, or one exact unique cached short/long name. Numeric names
 must be quoted in YAML. Partial, fuzzy, unknown, and ambiguous name matches are
-rejected. Specify the matching `gateway_id` when manually using a name with a
-multi-gateway entry. The MeshNet sidebar composer avoids manual identifiers by
-listing cached nodes in a dropdown.
+rejected. ID-, MAC-, public-key-, and reserved identity-shaped input is always
+interpreted as identity syntax and can never fall through to a same-looking
+node name. Other names may contain a colon. The MeshNet sidebar composer avoids
+manual identifiers by listing cached nodes in a dropdown.
+
+`direct` requires exactly one cached or canonical target. `broadcast`, `group`,
+and `emergency` reject a target. Messages must contain 1–237 UTF-8 bytes,
+channels are `0` through `7`, and priorities are exactly `normal`, `high`, or
+`emergency`. A supplied `gateway_id` must exactly name a configured gateway and
+must use the target's protocol; a known disconnected matching gateway queues
+the message locally. These rules are checked before persistence and again when
+replaying the outbox.
 
 ## Entity Model
 
