@@ -260,7 +260,7 @@
   "services": {
     "send_message": {
       "name": "Send mesh message",
-      "description": "Sends a text message through a connected MeshNet gateway.",
+      "description": "Sends or durably queues a text message and can return a versioned correlation ID and submission status.",
       "fields": {
         "target_node": {
           "name": "Target node",
@@ -290,7 +290,7 @@
     },
     "broadcast_message": {
       "name": "Broadcast mesh message",
-      "description": "Broadcasts a text message through a connected MeshNet gateway.",
+      "description": "Broadcasts or durably queues a text message and can return a versioned correlation ID and submission status.",
       "fields": {
         "gateway_id": {
           "name": "Gateway ID",

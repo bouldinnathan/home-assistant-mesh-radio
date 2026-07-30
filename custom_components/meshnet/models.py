@@ -220,6 +220,9 @@ class GatewayStatus:
     packets_received: int = 0
     packets_sent: int = 0
     duplicate_packets: int = 0
+    failure_count: int = 0
+    last_failure_category: str | None = None
+    last_failure_at: datetime | None = None
     errors: list[str] = field(default_factory=list)
     detail: JsonDict = field(default_factory=dict)
 
@@ -236,6 +239,9 @@ class GatewayStatus:
             "packets_received": self.packets_received,
             "packets_sent": self.packets_sent,
             "duplicate_packets": self.duplicate_packets,
+            "failure_count": self.failure_count,
+            "last_failure_category": self.last_failure_category,
+            "last_failure_at": timestamp_to_json(self.last_failure_at),
             "errors": list(self.errors[-10:]),
             "detail": dict(self.detail),
         }

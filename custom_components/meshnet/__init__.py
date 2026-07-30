@@ -126,11 +126,25 @@ async def async_unload_entry(hass, entry) -> bool:
     """Unload MeshNet."""
     domain_data = hass.data.get(DOMAIN, {})
     coordinator = domain_data.get(entry.entry_id)
+    radio_quiesce = getattr(
+        coordinator, "async_quiesce_radio_operations", None
+    )
+    radio_fenced = False
+    if callable(radio_quiesce):
+        radio_fenced = await radio_quiesce()
+        if not radio_fenced:
+            _LOGGER.warning(
+                "MeshNet unload deferred because remote administration or "
+                "traceroute work did not stop promptly"
+            )
+            return False
     settings_manager = getattr(coordinator, "gateway_settings", None)
     settings_fenced = False
     if settings_manager is not None:
         settings_fenced = await settings_manager.async_quiesce()
         if not settings_fenced:
+            if radio_fenced:
+                coordinator.resume_radio_operations()
             _LOGGER.warning(
                 "MeshNet unload deferred because gateway settings work did "
                 "not stop promptly"
@@ -143,11 +157,18 @@ async def async_unload_entry(hass, entry) -> bool:
     except BaseException:
         if settings_fenced:
             settings_manager.resume()
+        if radio_fenced:
+            coordinator.resume_radio_operations()
         raise
     if not unload_ok:
         if settings_fenced and not settings_manager.resume():
             _LOGGER.warning(
                 "MeshNet settings remain fenced after a failed platform unload"
+            )
+        if radio_fenced and not coordinator.resume_radio_operations():
+            _LOGGER.warning(
+                "MeshNet manual radio operations remain fenced after a failed "
+                "platform unload"
             )
         return False
     if coordinator is not None:
@@ -184,10 +205,37 @@ async def _async_update_listener(hass, entry) -> None:
 
 
 def _async_register_services(hass) -> None:
-    import homeassistant.helpers.config_validation as cv
+    import importlib
+
     import voluptuous as vol
 
-    from .coordinator import service_fields
+    cv = importlib.import_module("homeassistant.helpers.config_validation")
+
+    try:
+        from .coordinator import service_fields
+    except ModuleNotFoundError as err:
+        if err.name != "homeassistant":
+            raise
+
+        def service_fields(call_data: dict[str, Any]) -> dict[str, Any]:
+            """Support dependency-light registration contract tests."""
+            return {
+                "target_node": call_data.get(ATTR_TARGET_NODE),
+                "message": call_data[ATTR_MESSAGE],
+                "channel": call_data.get(ATTR_CHANNEL),
+                "priority": call_data.get(ATTR_PRIORITY, "normal"),
+                "message_type": call_data.get(
+                    ATTR_MESSAGE_TYPE, MESSAGE_TYPE_BROADCAST
+                ),
+                "gateway_id": call_data.get(ATTR_GATEWAY_ID),
+            }
+
+    try:
+        from homeassistant.core import SupportsResponse
+
+        response_mode: Any = SupportsResponse.OPTIONAL
+    except (AttributeError, ImportError):
+        response_mode = "optional"
 
     if hass.services.has_service(DOMAIN, SERVICE_SEND_MESSAGE):
         return
@@ -219,16 +267,20 @@ def _async_register_services(hass) -> None:
     )
     service_refresh_schema = vol.Schema({vol.Optional(ATTR_GATEWAY_ID): cv.string})
 
-    async def send_message(call) -> None:
+    async def send_message(call) -> dict[str, Any] | None:
         coordinator = _get_coordinator(hass)
-        await coordinator.async_send_message(**service_fields(dict(call.data)))
+        response = await coordinator.async_send_message(
+            **service_fields(dict(call.data))
+        )
+        return response if getattr(call, "return_response", True) else None
 
-    async def broadcast_message(call) -> None:
+    async def broadcast_message(call) -> dict[str, Any] | None:
         coordinator = _get_coordinator(hass)
         data = dict(call.data)
         data[ATTR_TARGET_NODE] = None
         data[ATTR_MESSAGE_TYPE] = data.get(ATTR_MESSAGE_TYPE, MESSAGE_TYPE_BROADCAST)
-        await coordinator.async_send_message(**service_fields(data))
+        response = await coordinator.async_send_message(**service_fields(data))
+        return response if getattr(call, "return_response", True) else None
 
     async def schedule_message(call) -> None:
         coordinator = _get_coordinator(hass)
@@ -244,13 +296,18 @@ def _async_register_services(hass) -> None:
         await coordinator.async_gateway_refresh(call.data.get(ATTR_GATEWAY_ID))
 
     hass.services.async_register(
-        DOMAIN, SERVICE_SEND_MESSAGE, send_message, schema=service_message_schema
+        DOMAIN,
+        SERVICE_SEND_MESSAGE,
+        send_message,
+        schema=service_message_schema,
+        supports_response=response_mode,
     )
     hass.services.async_register(
         DOMAIN,
         SERVICE_BROADCAST_MESSAGE,
         broadcast_message,
         schema=service_message_schema,
+        supports_response=response_mode,
     )
     hass.services.async_register(
         DOMAIN,
@@ -370,10 +427,10 @@ def _schedule_message_call(
 
 
 def _get_coordinator(hass):
-    from homeassistant.exceptions import HomeAssistantError
-
     entries = hass.data.get(DOMAIN, {})
     if not entries:
+        from homeassistant.exceptions import HomeAssistantError
+
         raise HomeAssistantError("MeshNet is not configured")
     return next(iter(entries.values()))
 

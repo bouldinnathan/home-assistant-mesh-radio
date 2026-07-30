@@ -39,6 +39,7 @@ from .models import (
     coerce_float,
     coerce_int,
     parse_timestamp,
+    timestamp_to_json,
     utcnow,
 )
 from .node_identity import (
@@ -49,6 +50,55 @@ from .node_identity import (
 _LOGGER = logging.getLogger(__name__)
 
 _STOP_WAIT_TIMEOUT = 2.0
+_MAX_MESHTASTIC_TEXT_BYTES = 237
+_MAX_MESHTASTIC_NEIGHBORS = 64
+_MAX_MESHTASTIC_SENSORS = 64
+_MESHTASTIC_SENSOR_KEYS = frozenset(
+    {
+        "temperature",
+        "humidity",
+        "relative_humidity",
+        "pressure",
+        "barometric_pressure",
+        "gas_resistance",
+        "co2",
+        "iaq",
+        "air_quality",
+        "voltage",
+        "current",
+        "distance",
+        "lux",
+        "white_lux",
+        "wind_direction",
+        "wind_speed",
+        "wind_gust",
+        "wind_lull",
+        "weight",
+        "radiation",
+        "rainfall_1h",
+        "rainfall_24h",
+        "soil_moisture",
+        "soil_temperature",
+        "pm10_standard",
+        "pm25_standard",
+        "pm100_standard",
+        "pm10_environmental",
+        "pm25_environmental",
+        "pm100_environmental",
+        "particles_03um",
+        "particles_05um",
+        "particles_10um",
+        "particles_25um",
+        "particles_50um",
+        "particles_100um",
+        "ch1_voltage",
+        "ch1_current",
+        "ch2_voltage",
+        "ch2_current",
+        "ch3_voltage",
+        "ch3_current",
+    }
+)
 _BLUEZ_ADAPTER_INTERFACE = "org.bluez.Adapter1"
 _LOCAL_ADAPTER_RE = re.compile(r"hci[0-9]+\Z")
 _BLUETOOTH_ADDRESS_RE = re.compile(r"[0-9A-F]{2}(?::[0-9A-F]{2}){5}\Z")
@@ -85,6 +135,10 @@ _BLUETOOTH_FAILURE_DIAGNOSTIC_FIELDS = frozenset(
         "admin_timeout_count",
         "admin_nak_count",
         "admin_response_waiter_count",
+        "traceroute_request_count",
+        "traceroute_response_count",
+        "traceroute_timeout_count",
+        "traceroute_waiter_count",
         "connection_generation",
         "settings_complete_sequence",
         "settings_complete_generation",
@@ -147,9 +201,7 @@ _BLUETOOTH_FAILURE_TIMEOUT_FIELDS = frozenset(
         "settings_readback",
     }
 )
-_NATIVE_ENDPOINT_LOCKS: WeakKeyDictionary[
-    Any, dict[tuple[str, str], asyncio.Lock]
-] = WeakKeyDictionary()
+_NATIVE_ENDPOINT_LOCKS: WeakKeyDictionary[Any, dict[tuple[str, str], asyncio.Lock]] = WeakKeyDictionary()
 
 
 def _safe_diagnostic_scalar(value: Any) -> str | bool | int | float | None:
@@ -160,8 +212,10 @@ def _safe_diagnostic_scalar(value: Any) -> str | bool | int | float | None:
         return value
     if isinstance(value, float):
         return value if math.isfinite(value) else None
-    if isinstance(value, str) and 0 < len(value) <= 128 and all(
-        character.isalnum() or character in "_.-" for character in value
+    if (
+        isinstance(value, str)
+        and 0 < len(value) <= 128
+        and all(character.isalnum() or character in "_.-" for character in value)
     ):
         return value
     return None
@@ -230,20 +284,14 @@ async def _async_get_local_bluetooth_adapter_details() -> dict[str, Any]:
     try:
         from bluetooth_adapters import get_bluetooth_adapter_details
     except ImportError as err:
-        raise RuntimeError(
-            "The local Bluetooth adapter service is unavailable"
-        ) from err
+        raise RuntimeError("The local Bluetooth adapter service is unavailable") from err
 
     try:
         details = await get_bluetooth_adapter_details()
     except Exception as err:
-        raise RuntimeError(
-            "Home Assistant could not verify the local Bluetooth adapters"
-        ) from err
+        raise RuntimeError("Home Assistant could not verify the local Bluetooth adapters") from err
     if not isinstance(details, dict):
-        raise RuntimeError(
-            "Home Assistant returned invalid local Bluetooth adapter data"
-        )
+        raise RuntimeError("Home Assistant returned invalid local Bluetooth adapter data")
     return details
 
 
@@ -262,12 +310,9 @@ async def _async_validate_ble_adapter(
         or _LOCAL_ADAPTER_RE.fullmatch(saved_adapter) is None
         or not isinstance(saved_adapter_address, str)
         or _BLUETOOTH_ADDRESS_RE.fullmatch(saved_adapter_address.upper()) is None
-        or saved_adapter_address.upper()
-        in {"00:00:00:00:00:00", "FF:FF:FF:FF:FF:FF"}
+        or saved_adapter_address.upper() in {"00:00:00:00:00:00", "FF:FF:FF:FF:FF:FF"}
     ):
-        raise RuntimeError(
-            "Bluetooth setup has no verified local adapter; reconfigure this gateway"
-        )
+        raise RuntimeError("Bluetooth setup has no verified local adapter; reconfigure this gateway")
 
     details = await _async_get_local_bluetooth_adapter_details()
     saved_adapter_address = saved_adapter_address.upper()
@@ -289,23 +334,16 @@ async def _async_validate_ble_adapter(
         if (
             not isinstance(adapter_address, str)
             or _BLUETOOTH_ADDRESS_RE.fullmatch(adapter_address.upper()) is None
-            or adapter_address.upper()
-            in {"00:00:00:00:00:00", "FF:FF:FF:FF:FF:FF"}
+            or adapter_address.upper() in {"00:00:00:00:00:00", "FF:FF:FF:FF:FF:FF"}
         ):
             raise RuntimeError("Bluetooth adapter data is incomplete or invalid")
         if powered:
             powered_adapters.add((adapter, adapter_address.upper()))
 
-    selected_adapters = [
-        adapter
-        for adapter, address in powered_adapters
-        if address == saved_adapter_address
-    ]
+    selected_adapters = [adapter for adapter, address in powered_adapters if address == saved_adapter_address]
     saved_adapter_is_powered = len(selected_adapters) == 1
     if not saved_adapter_is_powered:
-        raise RuntimeError(
-            "The paired Bluetooth adapter is not available and powered"
-        )
+        raise RuntimeError("The paired Bluetooth adapter is not available and powered")
     return (
         {
             "adapter_count": len(details),
@@ -365,11 +403,7 @@ class MeshtasticClient(MeshGateway):
         self._last_bluetooth_failure: dict[str, Any] | None = None
         self._active_bluetooth_failure: dict[str, Any] | None = None
         self._bluetooth_adapter_validation: dict[str, Any] = {
-            "status": (
-                "not_started"
-                if self.config.transport == TRANSPORT_BLUETOOTH
-                else "not_applicable"
-            )
+            "status": ("not_started" if self.config.transport == TRANSPORT_BLUETOOTH else "not_applicable")
         }
         self._pub = None
         self._receive_handler = None
@@ -385,6 +419,15 @@ class MeshtasticClient(MeshGateway):
         """Return whether this client already has a transport start in flight."""
         return self._start_task is not None and not self._start_task.done()
 
+    @property
+    def local_node_id(self) -> str | None:
+        """Return the exact BLE controller node ID without exposing NodeDB data."""
+        if self.config.transport != TRANSPORT_BLUETOOTH:
+            return None
+        client = getattr(self._ble_transport, "_client", None)
+        value = getattr(client, "local_node_id", None)
+        return canonical_meshtastic_node_id(value)
+
     def diagnostic_snapshot(self) -> dict[str, Any]:
         """Return cached Meshtastic lifecycle state without SDK or endpoint data."""
         snapshot = super().diagnostic_snapshot()
@@ -394,33 +437,19 @@ class MeshtasticClient(MeshGateway):
         now = time.monotonic()
         snapshot.update(
             {
-                "interface_active": (
-                    self._interface is not None or self._ble_transport is not None
-                ),
+                "interface_active": (self._interface is not None or self._ble_transport is not None),
                 "mqtt_subscription_active": self._unsub_mqtt is not None,
                 "stopping": self._stopping,
                 "start_task": self._diagnostic_task_state(self._start_task),
                 "stop_task": self._diagnostic_task_state(self._stop_task),
-                "native_endpoint_lock_held": (
-                    self._native_lock is not None and self._native_lock.locked()
-                ),
-                "native_constructor_state": self._diagnostic_task_state(
-                    constructor
-                ),
+                "native_endpoint_lock_held": (self._native_lock is not None and self._native_lock.locked()),
+                "native_constructor_state": self._diagnostic_task_state(constructor),
                 "native_constructor_pending": constructor_pending,
                 "native_constructor_abandoned": self._native_constructor_abandoned,
-                "native_constructor_abandonment_count": (
-                    self._native_constructor_abandonment_count
-                ),
-                "native_constructor_cleanup": self._diagnostic_task_state(
-                    self._native_constructor_cleanup_task
-                ),
+                "native_constructor_abandonment_count": (self._native_constructor_abandonment_count),
+                "native_constructor_cleanup": self._diagnostic_task_state(self._native_constructor_cleanup_task),
                 "native_executor_operation_count": (
-                    int(constructor_pending)
-                    + sum(
-                        len(tasks)
-                        for tasks in self._native_executor_tasks.values()
-                    )
+                    int(constructor_pending) + sum(len(tasks) for tasks in self._native_executor_tasks.values())
                 ),
                 "native_interface_executor_count": len(self._native_executor_tasks),
                 "bluetooth_operation_count": len(self._ble_operation_tasks),
@@ -429,9 +458,7 @@ class MeshtasticClient(MeshGateway):
                     and self._ble_packet_unsubscribe is not None
                     and self._ble_connection_unsubscribe is not None
                 ),
-                "bluetooth_deferred_cleanup": self._diagnostic_task_state(
-                    self._ble_deferred_cleanup_task
-                ),
+                "bluetooth_deferred_cleanup": self._diagnostic_task_state(self._ble_deferred_cleanup_task),
                 "native_subscription_count": sum(
                     handler is not None
                     for handler in (
@@ -443,14 +470,12 @@ class MeshtasticClient(MeshGateway):
                 "startup_phase": self._startup_phase,
                 "startup_elapsed_seconds": (
                     round(now - self._startup_started_monotonic, 3)
-                    if startup_pending
-                    and self._startup_started_monotonic is not None
+                    if startup_pending and self._startup_started_monotonic is not None
                     else None
                 ),
                 "startup_phase_elapsed_seconds": (
                     round(now - self._startup_phase_started_monotonic, 3)
-                    if startup_pending
-                    and self._startup_phase_started_monotonic is not None
+                    if startup_pending and self._startup_phase_started_monotonic is not None
                     else None
                 ),
                 "last_start_duration_seconds": self._last_start_duration_seconds,
@@ -458,20 +483,14 @@ class MeshtasticClient(MeshGateway):
                 "last_start_exception_type": self._last_start_exception_type,
                 "last_start_error_subtype": self._last_start_error_subtype,
                 "last_start_failed_phase": self._last_start_failed_phase,
-                "last_bluetooth_failure": copy.deepcopy(
-                    self._last_bluetooth_failure
-                ),
-                "bluetooth_adapter_validation": dict(
-                    self._bluetooth_adapter_validation
-                ),
+                "last_bluetooth_failure": copy.deepcopy(self._last_bluetooth_failure),
+                "bluetooth_adapter_validation": dict(self._bluetooth_adapter_validation),
                 "bluetooth_transport": (
                     self._safe_bluetooth_diagnostics(self._ble_transport)
                     if self._ble_transport is not None
                     else {
                         "implementation": "not_created",
-                        "state": "not_applicable"
-                        if self.config.transport != TRANSPORT_BLUETOOTH
-                        else "not_created",
+                        "state": "not_applicable" if self.config.transport != TRANSPORT_BLUETOOTH else "not_created",
                     }
                 ),
             }
@@ -573,9 +592,7 @@ class MeshtasticClient(MeshGateway):
             # current transport after an older cancellation-resistant operation
             # yields. Reporting a restart now would let it tear down the newly
             # reported session underneath the caller.
-            raise RuntimeError(
-                "Meshtastic Bluetooth cleanup is still pending; retry startup later"
-            )
+            raise RuntimeError("Meshtastic Bluetooth cleanup is still pending; retry startup later")
 
         # An explicit start after a completed stop may safely adopt a still-
         # running constructor. It must never enqueue a second constructor.
@@ -632,14 +649,8 @@ class MeshtasticClient(MeshGateway):
             if isinstance(active_bluetooth_failure, dict):
                 failure_phase = active_bluetooth_failure.get("phase")
                 error_subtype = active_bluetooth_failure.get("error_subtype")
-                self._last_start_failed_phase = (
-                    failure_phase
-                    if isinstance(failure_phase, str)
-                    else self._startup_phase
-                )
-                self._last_start_error_subtype = (
-                    error_subtype if isinstance(error_subtype, str) else None
-                )
+                self._last_start_failed_phase = failure_phase if isinstance(failure_phase, str) else self._startup_phase
+                self._last_start_error_subtype = error_subtype if isinstance(error_subtype, str) else None
             else:
                 self._last_start_failed_phase = self._startup_phase
             self._set_startup_phase("failed")
@@ -710,8 +721,7 @@ class MeshtasticClient(MeshGateway):
                     )
                 except TimeoutError:
                     self._logger.debug(
-                        "Meshtastic start did not finish within %.1f seconds; "
-                        "continuing bounded shutdown",
+                        "Meshtastic start did not finish within %.1f seconds; continuing bounded shutdown",
                         _STOP_WAIT_TIMEOUT,
                     )
                     if self.config.transport == TRANSPORT_BLUETOOTH:
@@ -734,17 +744,11 @@ class MeshtasticClient(MeshGateway):
         finally:
             if start_drained:
                 await self._async_cleanup_transport(emit_status=True)
-            self._set_startup_phase(
-                "stopping_waiting_for_start"
-                if self.start_pending
-                else "stopped"
-            )
+            self._set_startup_phase("stopping_waiting_for_start" if self.start_pending else "stopped")
         if not start_drained:
             # _start_done owns the deferred cleanup once the cancellation-
             # resistant start finally yields. Keep the endpoint lease meanwhile.
-            raise RuntimeError(
-                "Meshtastic Bluetooth startup did not stop within the cleanup bound"
-            )
+            raise RuntimeError("Meshtastic Bluetooth startup did not stop within the cleanup bound")
 
     async def _async_cleanup_transport(self, *, emit_status: bool) -> None:
         """Detach transport state and close its interface idempotently."""
@@ -759,9 +763,7 @@ class MeshtasticClient(MeshGateway):
                 timeout=_STOP_WAIT_TIMEOUT,
             )
             if deferred_cleanup not in done:
-                raise RuntimeError(
-                    "Meshtastic Bluetooth cleanup is waiting for an active operation"
-                )
+                raise RuntimeError("Meshtastic Bluetooth cleanup is waiting for an active operation")
         if self._unsub_mqtt:
             unsubscribe = self._unsub_mqtt
             self._unsub_mqtt = None
@@ -782,9 +784,7 @@ class MeshtasticClient(MeshGateway):
                     transport,
                     pending_operations,
                 )
-                raise RuntimeError(
-                    "Meshtastic Bluetooth operations did not stop within the cleanup bound"
-                )
+                raise RuntimeError("Meshtastic Bluetooth operations did not stop within the cleanup bound")
             self._interface = None
             try:
                 await transport.async_stop()
@@ -816,6 +816,7 @@ class MeshtasticClient(MeshGateway):
         release_native_lock: bool = False,
     ) -> None:
         """Close an interface without allowing a stuck close to hang unload."""
+
         async def close_interface() -> None:
             pending = set(self._native_executor_tasks.get(id(interface), set()))
             if pending:
@@ -854,8 +855,7 @@ class MeshtasticClient(MeshGateway):
             )
         except TimeoutError:
             self._logger.debug(
-                "Meshtastic interface close exceeded %.1f seconds; "
-                "continuing bounded shutdown",
+                "Meshtastic interface close exceeded %.1f seconds; continuing bounded shutdown",
                 _STOP_WAIT_TIMEOUT,
             )
 
@@ -993,27 +993,17 @@ class MeshtasticClient(MeshGateway):
         try:
             add_packet_callback = getattr(transport, "add_packet_callback", None)
             if not callable(add_packet_callback):
-                raise RuntimeError(
-                    "Meshtastic Bluetooth transport has no packet callback API"
-                )
+                raise RuntimeError("Meshtastic Bluetooth transport has no packet callback API")
             packet_unsubscribe = add_packet_callback(packet_handler)
             if not callable(packet_unsubscribe):
-                raise RuntimeError(
-                    "Meshtastic Bluetooth packet callback has no remover"
-                )
+                raise RuntimeError("Meshtastic Bluetooth packet callback has no remover")
             self._ble_packet_unsubscribe = packet_unsubscribe
-            add_connection_callback = getattr(
-                transport, "add_connection_callback", None
-            )
+            add_connection_callback = getattr(transport, "add_connection_callback", None)
             if not callable(add_connection_callback):
-                raise RuntimeError(
-                    "Meshtastic Bluetooth transport has no connection callback API"
-                )
+                raise RuntimeError("Meshtastic Bluetooth transport has no connection callback API")
             connection_unsubscribe = add_connection_callback(connection_handler)
             if not callable(connection_unsubscribe):
-                raise RuntimeError(
-                    "Meshtastic Bluetooth connection callback has no remover"
-                )
+                raise RuntimeError("Meshtastic Bluetooth connection callback has no remover")
             self._ble_connection_unsubscribe = connection_unsubscribe
             self._ble_callback_transport = transport
         except BaseException:
@@ -1025,11 +1015,7 @@ class MeshtasticClient(MeshGateway):
     ) -> set[asyncio.Task[Any]]:
         """Cancel BLE operations without allowing an OS await to hang unload."""
         current = asyncio.current_task()
-        tasks = {
-            task
-            for task in self._ble_operation_tasks
-            if task is not current and not task.done()
-        }
+        tasks = {task for task in self._ble_operation_tasks if task is not current and not task.done()}
         for task in tasks:
             task.cancel()
         if not tasks:
@@ -1107,9 +1093,7 @@ class MeshtasticClient(MeshGateway):
         if target_node is not None:
             canonical_target = canonical_meshtastic_node_id(target_node)
             if canonical_target is None:
-                raise ValueError(
-                    "Meshtastic direct sends require a validated canonical node ID"
-                )
+                raise ValueError("Meshtastic direct sends require a validated canonical node ID")
             target_node = canonical_target
         message_id = hashlib.sha256(
             f"{self.config.gateway_id}:{target_node}:{channel}:{message}:{utcnow().timestamp()}".encode()
@@ -1163,9 +1147,7 @@ class MeshtasticClient(MeshGateway):
             transport = self._ble_transport
             if transport is None:
                 return
-            nodes = await self._async_run_bluetooth_operation(
-                transport.async_node_snapshot()
-            )
+            nodes = await self._async_run_bluetooth_operation(transport.async_node_snapshot())
             for node_id, node in nodes.items():
                 normalized = meshtastic_node_to_state(
                     node,
@@ -1229,9 +1211,60 @@ class MeshtasticClient(MeshGateway):
                 apply_reason=reason,
             )
 
-    async def async_apply_settings_plan(
-        self, changes: dict[str, Any]
+    async def async_get_remote_settings_snapshot(self, target_node: str) -> dict[str, Any]:
+        """Delegate an explicit remote read only to the owned BLE client."""
+        from .aiomeshtastic.errors import MeshtasticRemoteAdminError
+
+        if self.config.transport != TRANSPORT_BLUETOOTH:
+            raise MeshtasticRemoteAdminError(
+                "remote_admin_requires_bluetooth",
+                "Remote administration requires a Meshtastic Bluetooth gateway",
+            )
+        transport = self._ble_transport
+        client = getattr(transport, "_client", None)
+        getter = getattr(client, "async_get_remote_settings_snapshot", None)
+        if not callable(getter):
+            raise MeshtasticRemoteAdminError(
+                "remote_admin_unavailable",
+                "Remote administration is unavailable",
+            )
+        return await self._async_run_bluetooth_operation(getter(target_node))
+
+    async def async_manual_traceroute(self, target_node: str) -> dict[str, Any]:
+        """Delegate one explicit RouteDiscovery request to the owned BLE client."""
+        if self.config.transport != TRANSPORT_BLUETOOTH:
+            raise RuntimeError("Manual traceroute requires a Meshtastic Bluetooth gateway")
+        transport = self._ble_transport
+        client = getattr(transport, "_client", None)
+        traceroute = getattr(client, "async_manual_traceroute", None)
+        if not callable(traceroute):
+            raise RuntimeError("Manual traceroute is unavailable")
+        return await self._async_run_bluetooth_operation(traceroute(target_node))
+
+    async def async_apply_remote_settings_plan(
+        self,
+        target_node: str,
+        changes: dict[str, Any],
     ) -> dict[str, Any]:
+        """Delegate one explicit reviewed remote write only over BLE."""
+        from .aiomeshtastic.errors import MeshtasticRemoteAdminError
+
+        if self.config.transport != TRANSPORT_BLUETOOTH:
+            raise MeshtasticRemoteAdminError(
+                "remote_admin_requires_bluetooth",
+                "Remote administration requires a Meshtastic Bluetooth gateway",
+            )
+        transport = self._ble_transport
+        client = getattr(transport, "_client", None)
+        apply_plan = getattr(client, "async_apply_remote_settings_plan", None)
+        if not callable(apply_plan):
+            raise MeshtasticRemoteAdminError(
+                "remote_admin_unavailable",
+                "Remote administration is unavailable",
+            )
+        return await self._async_run_bluetooth_operation(apply_plan(target_node, changes))
+
+    async def async_apply_settings_plan(self, changes: dict[str, Any]) -> dict[str, Any]:
         """Apply through the verified BLE backend or reject unsupported transports.
 
         Official SDK write helpers log full AdminMessages at DEBUG and do not
@@ -1249,9 +1282,7 @@ class MeshtasticClient(MeshGateway):
                     "applied_paths": [],
                     "verified": False,
                     "blocked_paths": {
-                        path: "mqtt_is_not_a_local_admin_transport"
-                        for path in changes
-                        if isinstance(path, str)
+                        path: "mqtt_is_not_a_local_admin_transport" for path in changes if isinstance(path, str)
                     },
                     "connection_critical_paths": [],
                 }
@@ -1273,9 +1304,7 @@ class MeshtasticClient(MeshGateway):
                         },
                         "connection_critical_paths": [],
                     }
-                return await self._async_run_bluetooth_operation(
-                    apply_plan(changes)
-                )
+                return await self._async_run_bluetooth_operation(apply_plan(changes))
 
             interface = self._interface
             if interface is None:
@@ -1286,9 +1315,7 @@ class MeshtasticClient(MeshGateway):
                     "applied_paths": [],
                     "verified": False,
                     "blocked_paths": {
-                        path: "local_radio_is_not_connected"
-                        for path in changes
-                        if isinstance(path, str)
+                        path: "local_radio_is_not_connected" for path in changes if isinstance(path, str)
                     },
                     "connection_critical_paths": [],
                 }
@@ -1311,9 +1338,7 @@ class MeshtasticClient(MeshGateway):
             self._set_startup_phase("validating_bluetooth_adapter")
             self._bluetooth_adapter_validation = {"status": "pending"}
             try:
-                adapter_summary, adapter = await _async_validate_ble_adapter(
-                    self.config
-                )
+                adapter_summary, adapter = await _async_validate_ble_adapter(self.config)
             except Exception as err:
                 self._bluetooth_adapter_validation = {
                     "status": "failed",
@@ -1338,31 +1363,23 @@ class MeshtasticClient(MeshGateway):
         try:
             from pubsub import pub
         except ImportError as err:
-            await self._emit_error(
-                "pypubsub is unavailable; Home Assistant must install meshtastic requirements"
-            )
+            await self._emit_error("pypubsub is unavailable; Home Assistant must install meshtastic requirements")
             raise err
 
         def receive_handler(packet: dict[str, Any], interface: Any = None) -> None:
             if not self._owns_interface(interface):
                 return
-            self.hass.loop.call_soon_threadsafe(
-                lambda: self.hass.async_create_task(self._handle_native_packet(packet))
-            )
+            self.hass.loop.call_soon_threadsafe(lambda: self.hass.async_create_task(self._handle_native_packet(packet)))
 
         def connect_handler(interface: Any, topic: Any = None) -> None:
             if not self._owns_interface(interface):
                 return
-            self.hass.loop.call_soon_threadsafe(
-                lambda: self.hass.async_create_task(self._set_connected(True))
-            )
+            self.hass.loop.call_soon_threadsafe(lambda: self.hass.async_create_task(self._set_connected(True)))
 
         def disconnect_handler(interface: Any, topic: Any = None) -> None:
             if not self._owns_interface(interface):
                 return
-            self.hass.loop.call_soon_threadsafe(
-                lambda: self.hass.async_create_task(self._set_connected(False))
-            )
+            self.hass.loop.call_soon_threadsafe(lambda: self.hass.async_create_task(self._set_connected(False)))
 
         self._set_startup_phase("waiting_for_endpoint_lock")
         native_lock = _native_endpoint_lock(self._native_endpoint())
@@ -1374,9 +1391,7 @@ class MeshtasticClient(MeshGateway):
 
         self._set_startup_phase("constructing_interface")
         self._native_constructor_abandoned = False
-        constructor = asyncio.ensure_future(
-            self.hass.async_add_executor_job(self._make_native_interface)
-        )
+        constructor = asyncio.ensure_future(self.hass.async_add_executor_job(self._make_native_interface))
         if isinstance(constructor, asyncio.Task):
             constructor.set_name("MeshNet Meshtastic native interface constructor")
         self._native_constructor_future = constructor
@@ -1469,21 +1484,11 @@ class MeshtasticClient(MeshGateway):
         except BaseException as start_error:
             failure_snapshot = self._safe_bluetooth_diagnostics(transport)
             reported_failure_phase = failure_snapshot.get("last_failure_phase")
-            failed_phase = (
-                reported_failure_phase
-                if isinstance(reported_failure_phase, str)
-                else self._startup_phase
-            )
+            failed_phase = reported_failure_phase if isinstance(reported_failure_phase, str) else self._startup_phase
             cleanup_outcome = "pending"
             cleanup_exception_type: str | None = None
-            last_transport = failure_snapshot.get(
-                "last_transport_before_cleanup"
-            )
-            error_subtype = (
-                last_transport.get("last_error_type")
-                if isinstance(last_transport, dict)
-                else None
-            )
+            last_transport = failure_snapshot.get("last_transport_before_cleanup")
+            error_subtype = last_transport.get("last_error_type") if isinstance(last_transport, dict) else None
             if not isinstance(error_subtype, str):
                 error_subtype = failure_snapshot.get("last_error_type")
             if not isinstance(error_subtype, str):
@@ -1524,9 +1529,7 @@ class MeshtasticClient(MeshGateway):
         """Rejoin or restart the existing persistent BLE transport safely."""
         deferred_cleanup = self._ble_deferred_cleanup_task
         if deferred_cleanup is not None and not deferred_cleanup.done():
-            raise RuntimeError(
-                "Meshtastic Bluetooth cleanup is still pending; retry startup later"
-            )
+            raise RuntimeError("Meshtastic Bluetooth cleanup is still pending; retry startup later")
         transport = self._ble_transport
         if transport is None:
             raise RuntimeError("Meshtastic Bluetooth transport is unavailable")
@@ -1575,9 +1578,7 @@ class MeshtasticClient(MeshGateway):
                 return meshtastic.tcp_interface.TCPInterface(host, portNumber=self.config.port)
             return meshtastic.tcp_interface.TCPInterface(host)
         if self.config.transport == TRANSPORT_BLUETOOTH:
-            raise RuntimeError(
-                "Bluetooth uses MeshNet's bounded asynchronous transport"
-            )
+            raise RuntimeError("Bluetooth uses MeshNet's bounded asynchronous transport")
         raise RuntimeError(f"Unsupported Meshtastic transport: {self.config.transport}")
 
     async def _start_mqtt(self) -> None:
@@ -1631,8 +1632,7 @@ class MeshtasticClient(MeshGateway):
         publish_topic = str(self.config.options.get("publish_topic") or "").strip()
         if not publish_topic:
             raise RuntimeError(
-                "Meshtastic MQTT sending requires options.publish_topic "
-                "(for example msh/US/2/json/mqtt/)"
+                "Meshtastic MQTT sending requires options.publish_topic (for example msh/US/2/json/mqtt/)"
             )
         if "#" in publish_topic or "+" in publish_topic:
             raise RuntimeError("Meshtastic MQTT publish_topic cannot contain wildcards")
@@ -1684,14 +1684,61 @@ def _first_nonnegative_int(raw: dict[str, Any], *keys: str) -> int | None:
         value = raw[key]
         if isinstance(value, bool):
             continue
-        if isinstance(value, float) and (
-            not math.isfinite(value) or not value.is_integer()
-        ):
+        if isinstance(value, float) and (not math.isfinite(value) or not value.is_integer()):
             continue
         parsed = coerce_int(value)
         if parsed is not None and parsed >= 0:
             return parsed
     return None
+
+
+def _first_present_value(raw: dict[str, Any], *keys: str) -> Any:
+    """Return the first non-null, non-empty value without dropping zero."""
+    for key in keys:
+        if key not in raw:
+            continue
+        value = raw[key]
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _meshtastic_receiver(value: Any) -> str | None:
+    """Normalize only Meshtastic's documented broadcast destination aliases."""
+    if value is None or isinstance(value, bool):
+        return None if value is None else str(value)
+    if isinstance(value, int) and value == 0xFFFFFFFF:
+        return "^all"
+    if (
+        isinstance(value, float)
+        and math.isfinite(value)
+        and value.is_integer()
+        and int(value) == 0xFFFFFFFF
+    ):
+        return "^all"
+    text = str(value).strip()
+    if text.casefold() in {
+        "^all",
+        "!ffffffff",
+        "ffffffff",
+        "0xffffffff",
+        "4294967295",
+    }:
+        return "^all"
+    return text or None
+
+
+def _bounded_meshtastic_text(value: Any) -> str | None:
+    """Keep only text that can fit one Meshtastic application payload."""
+    if not isinstance(value, str):
+        return None
+    try:
+        length = len(value.encode("utf-8"))
+    except UnicodeError:
+        return None
+    if not 1 <= length <= _MAX_MESHTASTIC_TEXT_BYTES or "\x00" in value:
+        return None
+    return value
 
 
 def _meshtastic_packet_hops(raw: dict[str, Any]) -> int | None:
@@ -1761,20 +1808,13 @@ def _meshtastic_location(position: dict[str, Any]) -> dict[str, Any]:
         "speed": speed,
         "heading": heading,
         "accuracy": accuracy,
-        "precision_bits": _first_nonnegative_int(
-            position, "precisionBits", "precision_bits"
-        ),
+        "precision_bits": _first_nonnegative_int(position, "precisionBits", "precision_bits"),
     }
 
 
 def _consistent_meshtastic_id(*values: Any) -> tuple[str | None, bool]:
     """Return one canonical ID only when every present source agrees."""
-    present = [
-        value
-        for value in values
-        if value is not None
-        and not (isinstance(value, str) and not value.strip())
-    ]
+    present = [value for value in values if value is not None and not (isinstance(value, str) and not value.strip())]
     if not present:
         return None, True
     canonical = [canonical_meshtastic_node_id(value) for value in present]
@@ -1784,6 +1824,51 @@ def _consistent_meshtastic_id(*values: Any) -> tuple[str | None, bool]:
     if len(identities) != 1:
         return None, False
     return next(iter(identities)), True
+
+
+def _meshtastic_neighbor_routing(
+    neighbor_info: Any,
+    *,
+    reporter_id: str,
+    observed_at: datetime | None,
+    via_mqtt: bool,
+) -> dict[str, Any]:
+    """Project one exact, bounded passive NeighborInfo observation."""
+    if not isinstance(neighbor_info, dict):
+        return {}
+    claimed_values = [
+        neighbor_info[key]
+        for key in ("nodeId", "node_id")
+        if key in neighbor_info and neighbor_info[key] not in (None, "")
+    ]
+    if claimed_values:
+        claimed_id, claims_consistent = _consistent_meshtastic_id(*claimed_values)
+        if not claims_consistent or claimed_id != reporter_id:
+            return {}
+
+    raw_neighbors = neighbor_info.get("neighbors", [])
+    if not isinstance(raw_neighbors, list):
+        return {}
+    neighbors: list[str] = []
+    seen: set[str] = set()
+    for raw_neighbor in raw_neighbors[:_MAX_MESHTASTIC_NEIGHBORS]:
+        if not isinstance(raw_neighbor, dict):
+            continue
+        candidate = _first_present_value(raw_neighbor, "nodeId", "node_id")
+        neighbor_id = canonical_meshtastic_node_id(candidate)
+        if neighbor_id is None or neighbor_id == reporter_id or neighbor_id in seen:
+            continue
+        seen.add(neighbor_id)
+        neighbors.append(neighbor_id)
+
+    routing: dict[str, Any] = {
+        "neighbors": neighbors,
+        "neighbor_count": len(neighbors),
+        "neighbors_via_mqtt": via_mqtt,
+    }
+    if (observed_at_text := timestamp_to_json(observed_at)) is not None:
+        routing["neighbors_updated_at"] = observed_at_text
+    return routing
 
 
 def meshtastic_packet_to_state_packet(
@@ -1798,12 +1883,12 @@ def meshtastic_packet_to_state_packet(
     telemetry = decoded.get("telemetry") if isinstance(decoded.get("telemetry"), dict) else {}
     mqtt_payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else {}
     payload = raw.get("payload", decoded.get("payload", data.get("payload")))
-    text = (
-        raw.get("text")
-        or decoded.get("text")
-        or data.get("text")
-        or telemetry.get("text")
-        or mqtt_payload.get("text")
+    text = _bounded_meshtastic_text(
+        _first_present_value(raw, "text")
+        or _first_present_value(decoded, "text")
+        or _first_present_value(data, "text")
+        or _first_present_value(telemetry, "text")
+        or _first_present_value(mqtt_payload, "text")
     )
     if isinstance(payload, bytes):
         payload = payload.hex()
@@ -1815,23 +1900,19 @@ def meshtastic_packet_to_state_packet(
     return MeshPacket(
         protocol=PROTOCOL_MESHTASTIC,
         gateway_id=gateway_id,
-        packet_id=str(raw.get("id") or raw.get("packet_id") or "") or None,
-        sender=str(raw.get("fromId") or raw.get("from") or raw.get("from_num") or "") or None,
-        receiver=str(raw.get("toId") or raw.get("to") or raw.get("to_num") or "") or None,
+        packet_id=(str(value) if (value := _first_present_value(raw, "id", "packet_id")) is not None else None),
+        sender=(str(value) if (value := _first_present_value(raw, "fromId", "from", "from_num")) is not None else None),
+        receiver=_meshtastic_receiver(
+            _first_present_value(raw, "toId", "to", "to_num")
+        ),
         channel=str(channel_value) if channel_value is not None else None,
-        portnum=str(
-            decoded.get("portnum")
-            or decoded.get("portnumName")
-            or raw.get("portnum")
-            or raw.get("type")
-            or ""
-        )
+        portnum=str(decoded.get("portnum") or decoded.get("portnumName") or raw.get("portnum") or raw.get("type") or "")
         or None,
         payload=payload,
         text=text,
         encrypted=bool(raw.get("encrypted")) if "encrypted" in raw else None,
-        rssi=coerce_float(raw.get("rxRssi") or raw.get("rssi")),
-        snr=coerce_float(raw.get("rxSnr") or raw.get("snr")),
+        rssi=coerce_float(_first_present_value(raw, "rxRssi", "rssi")),
+        snr=coerce_float(_first_present_value(raw, "rxSnr", "snr")),
         hops=_meshtastic_packet_hops(raw),
         hop_limit=_first_nonnegative_int(raw, "hopLimit", "hop_limit"),
         timestamp=packet_time,
@@ -1848,13 +1929,16 @@ def meshtastic_node_to_state(
     """Normalize Meshtastic node DB entries into NodeState."""
     user = raw.get("user") if isinstance(raw.get("user"), dict) else {}
     position = raw.get("position") if isinstance(raw.get("position"), dict) else {}
+    neighbor_info = (
+        raw.get("neighborInfo")
+        if isinstance(raw.get("neighborInfo"), dict)
+        else raw.get("neighbor_info")
+        if isinstance(raw.get("neighbor_info"), dict)
+        else None
+    )
     device_metrics = raw.get("deviceMetrics") if isinstance(raw.get("deviceMetrics"), dict) else {}
-    routing_id, routing_consistent = _consistent_meshtastic_id(
-        raw.get("num"), fallback_node_id
-    )
-    claimed_id, claims_consistent = _consistent_meshtastic_id(
-        raw.get("id"), user.get("id")
-    )
+    routing_id, routing_consistent = _consistent_meshtastic_id(raw.get("num"), fallback_node_id)
+    claimed_id, claims_consistent = _consistent_meshtastic_id(raw.get("id"), user.get("id"))
     if not routing_consistent:
         return None
     if routing_id is None:
@@ -1864,17 +1948,10 @@ def meshtastic_node_to_state(
         user_is_consistent = True
     else:
         canonical_node_id = routing_id
-        user_is_consistent = bool(
-            claims_consistent
-            and (claimed_id is None or claimed_id == routing_id)
-        )
+        user_is_consistent = bool(claims_consistent and (claimed_id is None or claimed_id == routing_id))
     safe_user = user if user_is_consistent else {}
-    mac = _normalize_meshtastic_mac(
-        safe_user.get("macaddr") or safe_user.get("mac")
-    )
-    public_key = _normalize_meshtastic_public_key(
-        safe_user.get("publicKey") or safe_user.get("public_key")
-    )
+    mac = _normalize_meshtastic_mac(safe_user.get("macaddr") or safe_user.get("mac"))
+    public_key = _normalize_meshtastic_public_key(safe_user.get("publicKey") or safe_user.get("public_key"))
     node_key = meshtastic_observation_node_key(
         canonical_node_id,
         mac=mac,
@@ -1890,21 +1967,20 @@ def meshtastic_node_to_state(
             sensors.update(_flatten_metrics(source))
     hops = _first_nonnegative_int(raw, "hopsAway", "hops_away", "hops")
     via_mqtt = _meshtastic_via_mqtt(raw)
+    neighbor_observed_at = (
+        parse_timestamp(raw.get("neighborInfoUpdatedAt"))
+        or parse_timestamp(raw.get("neighbor_info_updated_at"))
+        or last_heard
+    )
     return NodeState(
         node_key=node_key,
         protocol=PROTOCOL_MESHTASTIC,
         node_id=canonical_node_id,
         mac=mac,
         public_key=public_key,
-        user_name=_first_text(
-            safe_user, "userName", "username", "user_name", "name"
-        ),
-        long_name=_first_text(
-            safe_user, "longName", "long_name", "longname"
-        ),
-        short_name=_first_text(
-            safe_user, "shortName", "short_name", "shortname"
-        ),
+        user_name=_first_text(safe_user, "userName", "username", "user_name", "name"),
+        long_name=_first_text(safe_user, "longName", "long_name", "longname"),
+        short_name=_first_text(safe_user, "shortName", "short_name", "shortname"),
         hardware_model=(
             _first_textish(safe_user, "hwModel", "hw_model", "hardware")
             or _first_textish(raw, "hwModel", "hw_model", "hardware")
@@ -1919,9 +1995,7 @@ def meshtastic_node_to_state(
             "snr": coerce_float(raw.get("snr")),
             "rssi": coerce_float(raw.get("rssi")),
             "hops": hops,
-            "hops_gateway_id": (
-                gateway_id if hops is not None and not via_mqtt else None
-            ),
+            "hops_gateway_id": (gateway_id if hops is not None and not via_mqtt else None),
             "via_mqtt": via_mqtt,
             "channel_utilization": coerce_float(device_metrics.get("channelUtilization")),
             "air_utilization": coerce_float(device_metrics.get("airUtilTx")),
@@ -1931,6 +2005,12 @@ def meshtastic_node_to_state(
             "voltage": coerce_float(device_metrics.get("voltage")),
         },
         location=_meshtastic_location(position),
+        routing=_meshtastic_neighbor_routing(
+            neighbor_info,
+            reporter_id=canonical_node_id,
+            observed_at=neighbor_observed_at,
+            via_mqtt=via_mqtt,
+        ),
         sensors=sensors,
         raw=raw,
     )
@@ -1943,6 +2023,13 @@ def meshtastic_packet_to_node(packet: MeshPacket) -> NodeState | None:
     telemetry = decoded.get("telemetry") if isinstance(decoded.get("telemetry"), dict) else {}
     user = decoded.get("user") if isinstance(decoded.get("user"), dict) else {}
     position = decoded.get("position") if isinstance(decoded.get("position"), dict) else {}
+    neighbor_info = (
+        decoded.get("neighborInfo")
+        if isinstance(decoded.get("neighborInfo"), dict)
+        else decoded.get("neighbor_info")
+        if isinstance(decoded.get("neighbor_info"), dict)
+        else None
+    )
     mqtt_payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else {}
     if str(raw.get("type") or "").lower() == "nodeinfo" and mqtt_payload:
         user = {
@@ -1961,17 +2048,10 @@ def meshtastic_packet_to_node(packet: MeshPacket) -> NodeState | None:
     if not routing_consistent or routing_id is None:
         return None
     claimed_id, claims_consistent = _consistent_meshtastic_id(user.get("id"))
-    user_is_consistent = bool(
-        claims_consistent
-        and (claimed_id is None or claimed_id == routing_id)
-    )
+    user_is_consistent = bool(claims_consistent and (claimed_id is None or claimed_id == routing_id))
     safe_user = user if user_is_consistent else {}
-    mac = _normalize_meshtastic_mac(
-        safe_user.get("macaddr") or safe_user.get("mac")
-    )
-    public_key = _normalize_meshtastic_public_key(
-        safe_user.get("publicKey") or safe_user.get("public_key")
-    )
+    mac = _normalize_meshtastic_mac(safe_user.get("macaddr") or safe_user.get("mac"))
+    public_key = _normalize_meshtastic_public_key(safe_user.get("publicKey") or safe_user.get("public_key"))
     node_key = meshtastic_observation_node_key(
         routing_id,
         mac=mac,
@@ -1984,11 +2064,7 @@ def meshtastic_packet_to_node(packet: MeshPacket) -> NodeState | None:
         "snr": packet.snr,
         "rssi": packet.rssi,
         "hops": packet.hops,
-        "hops_gateway_id": (
-            packet.gateway_id
-            if packet.hops is not None and not via_mqtt
-            else None
-        ),
+        "hops_gateway_id": (packet.gateway_id if packet.hops is not None and not via_mqtt else None),
         "via_mqtt": via_mqtt,
         "hop_limit": packet.hop_limit,
     }
@@ -2016,18 +2092,10 @@ def meshtastic_packet_to_node(packet: MeshPacket) -> NodeState | None:
         node_id=routing_id,
         mac=mac,
         public_key=public_key,
-        user_name=_first_text(
-            safe_user, "userName", "username", "user_name", "name"
-        ),
-        long_name=_first_text(
-            safe_user, "longName", "long_name", "longname"
-        ),
-        short_name=_first_text(
-            safe_user, "shortName", "short_name", "shortname"
-        ),
-        hardware_model=_first_textish(
-            safe_user, "hwModel", "hw_model", "hardware"
-        ),
+        user_name=_first_text(safe_user, "userName", "username", "user_name", "name"),
+        long_name=_first_text(safe_user, "longName", "long_name", "longname"),
+        short_name=_first_text(safe_user, "shortName", "short_name", "shortname"),
+        hardware_model=_first_textish(safe_user, "hwModel", "hw_model", "hardware"),
         online=True,
         last_heard=packet.timestamp,
         last_gateway_id=packet.gateway_id,
@@ -2035,16 +2103,32 @@ def meshtastic_packet_to_node(packet: MeshPacket) -> NodeState | None:
         connectivity=connectivity,
         power=power,
         location=_meshtastic_location(position),
+        routing=_meshtastic_neighbor_routing(
+            neighbor_info,
+            reporter_id=routing_id,
+            observed_at=packet.timestamp,
+            via_mqtt=via_mqtt,
+        ),
         sensors=sensors,
         raw=raw,
     )
 
 
 def _flatten_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Return bounded documented telemetry scalars from an untrusted packet."""
     flattened: dict[str, Any] = {}
     for key, value in metrics.items():
-        if isinstance(value, (str, int, float, bool)) or value is None:
-            flattened[_snake(key)] = value
+        if len(flattened) >= _MAX_MESHTASTIC_SENSORS:
+            break
+        if not isinstance(key, str):
+            continue
+        normalized = _snake(key)
+        if normalized not in _MESHTASTIC_SENSOR_KEYS:
+            continue
+        if isinstance(value, bool) or isinstance(value, int):
+            flattened[normalized] = value
+        elif isinstance(value, float) and math.isfinite(value):
+            flattened[normalized] = value
     return flattened
 
 
@@ -2110,9 +2194,7 @@ def _normalize_meshtastic_public_key(value: Any) -> str | None:
         return None
     text = value.strip()
     compact = text.replace(":", "").replace("-", "")
-    if len(compact) == 64 and all(
-        char in "0123456789abcdefABCDEF" for char in compact
-    ):
+    if len(compact) == 64 and all(char in "0123456789abcdefABCDEF" for char in compact):
         return compact.lower()
     try:
         decoded = base64.b64decode(text, validate=True)

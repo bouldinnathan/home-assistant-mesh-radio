@@ -23,5 +23,14 @@ class MeshtasticConfigurationError(MeshtasticAsyncError):
     """The radio did not complete the Meshtastic configuration handshake."""
 
 
+class MeshtasticRemoteAdminError(MeshtasticConfigurationError):
+    """A remote-admin request failed with a stable, non-secret category."""
+
+    def __init__(self, code: str, public_message: str) -> None:
+        self.code = code
+        self.public_message = public_message
+        super().__init__(public_message)
+
+
 class MeshtasticCleanupError(MeshtasticAsyncError):
     """Bluetooth teardown could not be confirmed within its safety bound."""

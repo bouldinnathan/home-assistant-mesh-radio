@@ -40,6 +40,24 @@ _MAX_MESHCORE_LABEL_BYTES = 256
 _MAX_MESHCORE_MESSAGE_BYTES = 4096
 _MAX_MESHCORE_SENSOR_KEY_BYTES = 128
 _MAX_MESHCORE_SENSOR_TEXT_BYTES = 1024
+_MAX_MESHCORE_SENSORS = 64
+_MESHCORE_SENSOR_KEYS = frozenset(
+    {
+        "temperature",
+        "humidity",
+        "pressure",
+        "co2",
+        "air_quality",
+        "voltage",
+        "current",
+        "solar_charging",
+        "motion",
+        "accelerometer",
+        "door",
+        "pir",
+        "water",
+    }
+)
 
 
 class MeshCoreClient(MeshGateway):
@@ -1010,8 +1028,15 @@ def meshcore_payload_to_packet(
             maximum_bytes=_MAX_MESHCORE_LABEL_BYTES,
             allow_integer=True,
         )
-    route = payload.get("route") or raw.get("route")
-    hops = coerce_int(payload.get("hops") or payload.get("path_len") or (len(route) if isinstance(route, list) else None))
+    route = _first_present(payload, "route")
+    if route is None:
+        route = _first_present(raw, "route")
+    hops_value = _first_present(payload, "hops", "path_len")
+    if hops_value is None and isinstance(route, list):
+        hops_value = len(route)
+    packet_payload = _first_present(payload, "data", "payload")
+    if packet_payload is None:
+        packet_payload = _first_present(raw, "data")
     return MeshPacket(
         protocol=PROTOCOL_MESHCORE,
         gateway_id=gateway_id,
@@ -1020,16 +1045,16 @@ def meshcore_payload_to_packet(
         receiver=receiver,
         channel=channel,
         portnum=event_type,
-        payload=payload.get("data") or payload.get("payload") or raw.get("data"),
+        payload=packet_payload,
         text=text,
         encrypted=(
             payload.get("encrypted")
             if isinstance(payload.get("encrypted"), bool)
             else None
         ),
-        rssi=coerce_float(payload.get("rssi") or payload.get("last_rssi")),
-        snr=coerce_float(payload.get("snr") or payload.get("last_snr")),
-        hops=hops,
+        rssi=coerce_float(_first_present(payload, "rssi", "last_rssi")),
+        snr=coerce_float(_first_present(payload, "snr", "last_snr")),
+        hops=coerce_int(hops_value),
         hop_limit=coerce_int(payload.get("hop_limit")),
         timestamp=timestamp,
         raw={**raw, **({"topic": topic} if topic else {})},
@@ -1122,16 +1147,28 @@ def meshcore_payload_to_node(
         last_gateway_id=gateway_id,
         gateway_ids={gateway_id},
         connectivity={
-            "snr": coerce_float(payload.get("snr") or (packet.snr if packet else None)),
-            "rssi": coerce_float(payload.get("rssi") or (packet.rssi if packet else None)),
+            "snr": coerce_float(
+                _first_present(payload, "snr")
+                if "snr" in payload
+                else (packet.snr if packet else None)
+            ),
+            "rssi": coerce_float(
+                _first_present(payload, "rssi")
+                if "rssi" in payload
+                else (packet.rssi if packet else None)
+            ),
             "noise_floor": coerce_float(payload.get("noise_floor")),
-            "packet_rx": coerce_int(payload.get("rx") or payload.get("packet_rx")),
-            "packet_tx": coerce_int(payload.get("tx") or payload.get("packet_tx")),
+            "packet_rx": coerce_int(_first_present(payload, "rx", "packet_rx")),
+            "packet_tx": coerce_int(_first_present(payload, "tx", "packet_tx")),
             "hops": packet.hops if packet else coerce_int(payload.get("hops")),
         },
         power={
-            "battery_level": coerce_float(payload.get("battery") or payload.get("battery_level")),
-            "voltage": coerce_float(payload.get("voltage") or payload.get("battery_voltage")),
+            "battery_level": coerce_float(
+                _first_present(payload, "battery", "battery_level")
+            ),
+            "voltage": coerce_float(
+                _first_present(payload, "voltage", "battery_voltage")
+            ),
             "power_source": _first_bounded_text(
                 payload,
                 "power_source",
@@ -1152,9 +1189,15 @@ def meshcore_payload_to_node(
             "duty_cycle": coerce_float(payload.get("duty_cycle")),
         },
         location={
-            "latitude": coerce_float(payload.get("latitude") or payload.get("lat") or payload.get("adv_lat")),
-            "longitude": coerce_float(payload.get("longitude") or payload.get("lon") or payload.get("adv_lon")),
-            "altitude": coerce_float(payload.get("altitude") or payload.get("alt")),
+            "latitude": coerce_float(
+                _first_present(payload, "latitude", "lat", "adv_lat")
+            ),
+            "longitude": coerce_float(
+                _first_present(payload, "longitude", "lon", "adv_lon")
+            ),
+            "altitude": coerce_float(
+                _first_present(payload, "altitude", "alt")
+            ),
         },
         routing={
             "route": payload.get("route"),
@@ -1176,21 +1219,7 @@ def _extract_meshcore_sensors(payload: dict[str, Any]) -> dict[str, Any]:
         if normalized is None:
             continue
         normalized = normalized.casefold()
-        if normalized in {
-            "temperature",
-            "humidity",
-            "pressure",
-            "co2",
-            "air_quality",
-            "voltage",
-            "current",
-            "solar_charging",
-            "motion",
-            "accelerometer",
-            "door",
-            "pir",
-            "water",
-        }:
+        if normalized in _MESHCORE_SENSOR_KEYS:
             if (safe_value := _safe_sensor_scalar(value)) is not None:
                 sensors[normalized] = safe_value
     nested = payload.get("sensors")
@@ -1267,6 +1296,18 @@ def _first_bounded_text(
     return None
 
 
+def _first_present(values: dict[str, Any], *keys: str) -> Any:
+    """Return the first present non-empty value without dropping zero."""
+    for key in keys:
+        if key not in values:
+            continue
+        value = values[key]
+        if value is None or value == "":
+            continue
+        return value
+    return None
+
+
 def _safe_sensor_scalar(value: Any) -> str | bool | int | float | None:
     """Keep only Home Assistant state-safe, finite sensor scalars."""
     if isinstance(value, bool):
@@ -1287,10 +1328,16 @@ def _merge_safe_sensors(
 ) -> None:
     """Merge bounded scalar sensor values from an untrusted provider mapping."""
     for raw_key, raw_value in source.items():
+        if len(target) >= _MAX_MESHCORE_SENSORS:
+            return
         key = _bounded_text(
             raw_key,
             maximum_bytes=_MAX_MESHCORE_SENSOR_KEY_BYTES,
         )
         value = _safe_sensor_scalar(raw_value)
-        if key is not None and value is not None:
-            target[key.casefold()] = value
+        normalized = key.casefold() if key is not None else None
+        if (
+            normalized in _MESHCORE_SENSOR_KEYS
+            and value is not None
+        ):
+            target[normalized] = value

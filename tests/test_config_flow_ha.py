@@ -95,14 +95,21 @@ def test_service_schema_normalizes_yaml_node_numbers_without_boolean_coercion() 
             return False
 
         @staticmethod
-        def async_register(domain, service, handler, *, schema) -> None:
-            registrations[(domain, service)] = (handler, schema)
+        def async_register(
+            domain, service, handler, *, schema, supports_response=None
+        ) -> None:
+            registrations[(domain, service)] = (
+                handler,
+                schema,
+                supports_response,
+            )
 
     hass = SimpleNamespace(
         services=Services(), data={DOMAIN: {"entry-id": coordinator}}
     )
     _async_register_services(hass)
-    handler, schema = registrations[(DOMAIN, "send_message")]
+    handler, schema, supports_response = registrations[(DOMAIN, "send_message")]
+    assert supports_response is not None
 
     validated = schema(
         {

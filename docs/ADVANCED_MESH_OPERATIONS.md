@@ -1,0 +1,500 @@
+# Advanced Mesh Operations
+
+This guide is the operator contract for MeshNet's advanced local mesh tools.
+It explains what each feature does, what radio traffic it creates, which data
+Home Assistant retains, and the safety rules that the backend enforces even if
+the browser is bypassed.
+
+MeshNet is designed to keep working without Internet access, cloud services,
+MQTT, or Wi-Fi. A supported radio still needs a local connection to Home
+Assistant. The first advanced implementation uses the persistent Meshtastic
+Bluetooth transport because that is the transport for which MeshNet can own,
+correlate, cancel, and verify every request without blocking Home Assistant.
+
+## Safety Summary
+
+| Operation | Creates RF traffic | Automatic | Initial transport | Durable state |
+| --- | ---: | ---: | --- | --- |
+| Read cached nodes, messages, map, graph, or telemetry | No | Yes, from received packets | Any supported transport | Existing history cache |
+| Send a text message | Yes | Only when an automation explicitly calls it | Supported sending transports | Message/outbox history |
+| Load remote settings | Yes | Never | Meshtastic Bluetooth | No settings or session keys |
+| Apply remote settings | Yes | Never | Meshtastic Bluetooth | Sanitized result only |
+| Run a traceroute | Yes | Never | Meshtastic Bluetooth | Cooldown and sanitized route |
+| Move, filter, or sort the graph | No | Browser animation only | Not applicable | Browser-tab layout only |
+
+The following rules are invariants, not UI suggestions:
+
+- Reading, refreshing, polling, filtering, sorting, mapping, and graph
+  animation never transmit a traceroute or remote-admin packet.
+- A manual traceroute is unicast to one exact Meshtastic node. Broadcast,
+  self, ambiguous, malformed, and unknown targets are rejected.
+- A traceroute cooldown is reserved in SQLite before the radio write. A
+  failure, timeout, restart, second browser, or simultaneous request cannot
+  bypass the one-hour limit.
+- An RF timeout has an unknown outcome. MeshNet never automatically retries a
+  traceroute or remote setting write after a timeout.
+- All advanced commands require a Home Assistant administrator.
+- Node numbers and cryptographic identity are routing facts. Names are display
+  labels and are never used to merge or silently retarget nodes.
+- Graph distance never creates an edge. An edge exists only when MeshNet has
+  received passive route or neighbor evidence. Manual traceroute results stay
+  in the separate result view and never mutate the passive graph.
+- SNR and RSSI are signal observations, not physical-distance estimates.
+- Encrypted traffic that the connected radio cannot legitimately decrypt is
+  not inspected, guessed, retained, or exposed.
+
+## Remote Administration and Keys
+
+### What PKI remote administration means
+
+Meshtastic firmware 2.5 and later authorizes remote administration by storing
+the controlling radio's public key in one of the target radio's three Admin
+Key slots. The controlling radio keeps its own private key and performs the
+cryptographic operation. Home Assistant does not need the private key.
+
+MeshNet therefore uses this model:
+
+1. Home Assistant connects locally to the controller radio over Bluetooth.
+2. MeshNet offers a copy-only view of that radio's existing public key.
+3. The operator locally provisions that public key into an Admin Key slot on
+   each target, using the official app or CLI while physically connected to
+   the target.
+4. The target must also have supplied a valid public key in the controller's
+   node database. Merely knowing a node name is insufficient.
+5. MeshNet asks the controller radio to send authenticated remote Admin
+   messages. The controller radio, not Home Assistant, uses its private key.
+
+Up to three controlling public keys may be stored by a target. Removing or
+rotating those keys must be done with the official local tools in the initial
+release.
+
+### Why private-key import is deliberately absent
+
+MeshNet does not provide a private-key text box, file upload, service field, or
+WebSocket field. It never exports a private key from the radio. A private key,
+admin session passkey, or channel PSK must never enter browser state, SQLite,
+the Home Assistant Store, logs, diagnostics, repairs, events, action responses,
+or exception text.
+
+This is both safer and simpler than making Home Assistant a key vault. It also
+preserves the official trust model: possession of the physical controller
+radio is part of administrative authority.
+
+Meshtastic's SecurityConfig is excluded from generic remote reads and writes.
+An official security-config read can include the private key, and a partial
+security-config write can regenerate a keypair. MeshNet returns only derived,
+non-secret capability flags such as "public key available" and "remote admin
+eligible." It does not return the SecurityConfig payload.
+
+### Provisioning a target
+
+To authorize the MeshNet controller radio:
+
+1. In MeshNet, open **Remote administration** and select the connected
+   Meshtastic Bluetooth gateway.
+2. Copy the controller public key. Confirm that the displayed node number and
+   short name match the physical controller.
+3. Connect the official Meshtastic app or CLI locally to the target radio.
+4. Add the copied public key to one free **Security > Admin Key** slot.
+5. Save, reconnect to the controller, and wait for the target's NodeInfo/public
+   key to be present in the controller's node database.
+6. In MeshNet, select the target and use **Test access**. This performs an
+   explicit, read-only request; it does not change the target.
+
+Do not enable Managed Mode until remote read and write have both been tested
+on a non-critical node. A wrong radio region, channel, LoRa preset, key, role,
+or power setting can make a remote node unreachable.
+
+### Supported remote settings
+
+The remote editor follows the same safe shape as the local gateway editor:
+
+- The target and gateway are selected by exact stable identity.
+- Settings are fetched only after an explicit Load/Test access action.
+- Remote loads are never part of the five-second panel snapshot poll.
+- Only documented scalar and enum fields in an allowlist are displayed.
+- Fields unsupported by the target firmware are omitted; unknown fields fail
+  closed instead of being guessed or exposed as editable controls.
+- Values are validated against the protobuf type, enum, numeric range, byte
+  limit, and additional MeshNet safety constraints.
+- Changes remain in the current browser tab until Preview.
+- Preview produces a bounded diff and a short-lived, single-use token held in
+  process memory.
+- Every remote write requires a separate confirmation after Preview.
+- One target may have only one admin operation in flight.
+- A write uses the target's eight-byte session passkey only in memory, for at
+  most the firmware's session lifetime, and never returns it to the UI.
+- The write is sent once. MeshNet then requests the changed section again and
+  reports Verified, Mismatch, Rejected, or Unknown outcome.
+
+The safe initial allowlist covers the owner long/short name and reviewed
+non-secret DisplayConfig preferences that the existing settings planner can
+represent and verify. Bluetooth configuration is intentionally excluded from
+the first remote editor because changing another node's pairing behavior can
+create an avoidable local-access lockout. The following remain excluded even
+when the firmware offers them:
+
+- every SecurityConfig write, including public/private/admin keys, Managed
+  Mode, legacy admin, serial security, and debug-security controls;
+- channel PSKs and arbitrary channel replacement;
+- factory reset, node database reset, shutdown, reboot, and device deletion;
+- OTA/DFU, filesystem operations, backup/restore, and firmware mutation;
+- fixed-position commands that could publish a home's precise location;
+- contacts, key verification, ignored-node lists, and arbitrary protobufs;
+- raw AdminMessage passthrough and remote-admin automation services.
+
+Use the official app or CLI locally for excluded operations. This division is
+intentional: the Home Assistant integration remains a validated operator
+surface, not a root console for radios.
+
+### Remote-admin errors
+
+MeshNet presents stable categories without echoing packet contents or keys:
+
+| Result | Meaning | Safe next action |
+| --- | --- | --- |
+| Target public key unavailable | Controller NodeDB lacks the target key | Wait for NodeInfo or provision a verified contact locally |
+| Controller unauthorized | Target does not accept this controller public key | Provision the exact displayed key locally on the target |
+| Session expired or rejected | The short-lived admin session is invalid | Explicitly load settings again; no write is retried |
+| No route / no response | The target could not be reached or did not answer | Check passive last-seen data and try later |
+| Duty-cycle or rate limit | Firmware refused additional RF traffic | Wait; do not repeatedly submit the action |
+| Readback mismatch | Target answered but the requested value was not observed | Stop and inspect the target locally |
+| Unknown outcome | A write may have left Home Assistant but was not verified | Do not repeat blindly; inspect/reconnect first |
+
+## Messages
+
+### Conversation layout
+
+The **Messages** tab provides three kinds of conversation:
+
+- **Broadcast / Primary**: packets sent or received on channel index 0.
+- **Other channels**: separate threads for configured/observed channel indices
+  1 through 7. The initial UI labels them `Channel N`; it never exposes PSKs.
+- **Direct**: one thread per exact peer identity, with long name and short name
+  used only as labels. If User/NodeInfo has not arrived, `!xxxxxxxx` is the
+  correct label and the record is not merged with a guessed node.
+
+Message history is loaded from the bounded `meshnet/messages` WebSocket API,
+not the abbreviated panel snapshot. Malformed records are skipped. Text is
+HTML-escaped, UTF-8 validated, and bounded to the radio payload limit.
+
+The conversation selector and message draft survive the five-second cached
+snapshot refresh while the panel remains open. They are not written to browser
+storage. Navigating away discards unsent text.
+
+### Delivery wording
+
+`Submitted`, `queued`, `sent to radio`, and `delivered` are different states:
+
+- **Queued** means MeshNet durably accepted the message for a compatible
+  gateway that was unavailable or failed during submission.
+- **Sent** means the connected radio accepted the local request.
+- A broadcast acknowledgement can be implicit evidence that one relay handled
+  the packet; it is not proof that every node received it.
+- A direct-message acknowledgement is stronger transport evidence, but the
+  first version does not claim human delivery or that the recipient read it.
+
+Inbound direct/broadcast classification is made only when an exact destination
+or MeshCore's explicit `contact_message` event proves it. If the provider omits
+enough data, the UI says `Unknown delivery` rather than guessing.
+
+## Manual Traceroute
+
+Traceroute is intentionally separate from graph refresh.
+
+### Operator flow
+
+1. Open a Meshtastic node's details in the Mesh or Messages view.
+2. Select an active Meshtastic Bluetooth gateway.
+3. Press **Traceroute**, review the RF-traffic notice, and confirm.
+4. MeshNet reserves the integration-wide cooldown in SQLite.
+5. Exactly one RouteDiscovery packet is submitted to that destination.
+6. A correlated response, routing rejection, or timeout completes the action.
+
+The button displays the next permitted time. The backend permits at most one
+manual traceroute across the entire MeshNet integration every 3,600 seconds,
+regardless of gateway or destination. The reservation is shared by every
+browser session and survives Home Assistant restarts. The panel reloads the
+persisted cooldown and last privacy-bounded result, including completion time
+and available per-hop SNR, instead of treating a browser reload as a fresh
+airtime budget. A rejected local validation does not reserve airtime; once the
+backend reaches the reservation step, all outcomes consume the hour because RF
+transmission may have occurred.
+
+There is no traceroute Home Assistant service and no automation action in the
+initial implementation. It cannot be invoked by snapshot polling, coordinator
+refresh, reconnection, diagnostics, graph animation, map opening, or startup.
+There is no broadcast, batch, scheduled, automatic, or retry mode.
+
+### Route interpretation
+
+The result may contain a forward route, reverse route, and per-hop quarter-dB
+SNR observations. MeshNet validates size, source, destination, request ID,
+channel, and hop ordering before caching it. It labels the result with source
+and age. Route evidence can expire or become stale; it is not a guarantee that
+the same route will be used for the next packet.
+
+## Moving, Distance-Aware Graph
+
+The graph is a force-directed view inspired by Home Assistant's Zigbee graph:
+
+- Nodes repel each other and evidence-backed edges act as springs.
+- The layout animates with `requestAnimationFrame` and can be dragged.
+- Positions live only in the current panel element; they are not written to
+  the database or configuration.
+- Reduced-motion preference disables continuous motion and uses a stable
+  bounded layout.
+- Animation is stopped when the panel is detached or another view is selected.
+- Coordinates, velocities, iterations, and node counts are bounded so corrupt
+  input cannot create an infinite loop or non-finite SVG values.
+
+The selector shows the 20, 50, or 100 most recently heard nodes, defaulting to
+50. Favorites may be retained as pinned candidates, but the displayed count
+never exceeds the selected limit. Changing the limit is a local UI operation
+and generates no radio traffic.
+
+### Edge sources
+
+Edges are visually distinguished:
+
+- **Passive direct/neighbor evidence** came from packets the gateway already
+  received.
+- A Meshtastic NeighborInfo edge requires an exact, unambiguous reporter and
+  endpoint, a direct non-MQTT observation no more than one hour old, and a
+  bounded timestamp. Five minutes of future clock skew is tolerated; older,
+  farther-future, malformed, ambiguous, or MQTT-sourced evidence is ignored.
+- **Manual traceroute results** are displayed separately with their age and
+  durable cooldown. The first graph release does not silently add those routes
+  to the passive layout, avoiding a stale active measurement being mistaken
+  for a current neighbor observation.
+- Missing, ambiguous, or invalid route identifiers do not create edges.
+- Physical proximity alone never creates an edge.
+
+### Physical-distance spring length
+
+When both endpoints have valid locations, MeshNet computes great-circle
+distance with the Haversine formula and maps it monotonically to a bounded
+spring length. The displayed line can therefore settle shorter for nearby
+nodes and longer for distant nodes. The mapping is deliberately compressed;
+pixels are not meters and a graph must remain readable across neighborhood and
+regional meshes.
+
+Fallback order for a gateway endpoint is:
+
+1. the exact local radio node's valid cached GPS position;
+2. Home Assistant's configured home latitude/longitude, used only inside the
+   browser as a visibly labeled `Home Assistant location fallback`;
+3. a neutral default spring length.
+
+The fallback is never copied into a radio node, packet, diagnostic file, event,
+or MeshNet database. Invalid, zero-pair, deliberately imprecise, or missing
+locations use the neutral spring. A cached position can be older than the
+node's last-heard time and is labeled as cached rather than presented as live.
+SNR/RSSI never substitutes for GPS.
+
+## Home Assistant Automations and Network Failures
+
+### Sending
+
+Use the existing actions:
+
+- `meshnet.send_message`
+- `meshnet.broadcast_message`
+- `meshnet.schedule_message`
+- `meshnet.refresh_gateway`
+
+`send_message` accepts an exact target, gateway, channel 0–7, priority, and
+message type. The common backend enforces UTF-8 and the radio payload bound.
+Queued messages are retained by the outbox. The action response returns a
+schema version, correlation ID, and current status so an automation can record
+the accepted operation without parsing logs.
+
+Example direct send:
+
+```yaml
+action:
+  - action: meshnet.send_message
+    data:
+      target_node: "meshtastic:!1234abcd"
+      gateway_id: "garage_radio"
+      channel: 0
+      message_type: direct
+      message: "Generator alarm acknowledged"
+    response_variable: mesh_send
+```
+
+### Stable events
+
+MeshNet exposes bounded, versioned events. Event payloads never contain raw
+provider objects, credentials, admin packets, channel PSKs, private keys, or
+exception strings.
+
+| Event | Purpose |
+| --- | --- |
+| `meshnet_message_received` | Valid decoded inbound text |
+| `meshnet_message_status` | `queued`, `sent`, `blocked`, or `failed` transition |
+| `meshnet_gateway_status` | Connected/disconnected/start/reconnect transition |
+
+`meshnet_packet` is retained only as a deprecated compatibility event with a
+strict metadata projection. Automations should use entities and the events
+above; arbitrary raw packet and payload dictionaries are not a stable API.
+
+Example notification on a direct or channel message:
+
+```yaml
+trigger:
+  - platform: event
+    event_type: meshnet_message_received
+condition:
+  - condition: template
+    value_template: >-
+      {{ trigger.event.data.schema_version == 1
+         and trigger.event.data.delivery in ['direct', 'channel'] }}
+action:
+  - action: persistent_notification.create
+    data:
+      title: "Mesh message"
+      message: "{{ trigger.event.data.text }}"
+```
+
+### Failure detection
+
+Use each gateway's connectivity binary sensor as the simplest reliable
+trigger. It is `off` when that adapter is disconnected. Gateway last-packet,
+last-connected, packets, and monotonic failure-count sensors provide context.
+
+For richer automations, `meshnet_gateway_status` includes only:
+
+- `schema_version`
+- exact configured `gateway_id` within the local Home Assistant instance
+- protocol and transport
+- previous and current connectivity
+- stable transition and reason category
+- monotonic failure count
+- whether reconnect is scheduled
+- occurrence time
+
+The event is emitted on a real transition, not every coordinator refresh.
+Stale callbacks from a prior gateway generation are ignored.
+
+## Passive Weather and Sensor Data
+
+MeshNet passively decodes documented telemetry that a configured radio already
+receives and is authorized to decrypt. Supported data includes device metrics,
+temperature, humidity, pressure, air quality, power channels, radio statistics,
+and other documented finite scalar metrics. These become normal Home Assistant
+sensor or binary-sensor entities and can be used with state triggers.
+
+This is not promiscuous capture:
+
+- MeshNet cannot decode other channels without their PSKs.
+- It cannot read PKI direct messages exchanged between other nodes.
+- Unknown ports and unknown telemetry variants are ignored, not guessed.
+- ADMIN_APP/config/session payloads are consumed internally or dropped and are
+  never published as telemetry.
+- Metric keys, values, text lengths, and per-node metric counts are bounded.
+- NaN, infinity, invalid coordinates, and malformed messages are rejected.
+- Valid numeric zero values are preserved.
+- Packet deduplication and LoRa/MQTT provenance remain visible where known.
+
+For automations, prefer a node's Home Assistant sensor state over a generic
+packet event. Entity availability and `last_heard` show freshness; MeshNet does
+not poll remote sensors merely because a dashboard is open.
+
+## Privacy, Recovery, and Uninstall
+
+Advanced features keep MeshNet compartmentalized as a custom integration:
+
+- RF actions go only through a configured adapter and bounded coordinator path.
+- The browser cannot call provider objects directly.
+- Cooldowns and cached routes live in `meshnet.sqlite3` with the existing
+  integration history; they do not alter Home Assistant core databases.
+- Browser drafts and force-layout coordinates are memory-only.
+- Diagnostics remain cached and redacted and never run remote admin or
+  traceroute.
+- Unloading cancels in-flight waiters and animation owners. Late callbacks are
+  fenced by gateway generation.
+- Removing the integration stops adapters and entities. HACS removal deletes
+  component code; deleting `meshnet.sqlite3` after the integration is unloaded
+  removes the optional history/cooldown cache.
+
+If a remote setting has an unknown outcome, stop. Do not repeatedly press
+Apply. Reconnect locally with the official app/CLI, inspect the target, restore
+known-good settings, and only then retry remote administration.
+
+## Acceptance and Regression Contract
+
+The implementation is complete only when automated tests prove all of these:
+
+### Keys and remote administration
+
+- No private key, session passkey, channel PSK, or sentinel credential reaches
+  frontend JSON, storage, diagnostics, logs, events, action responses, or
+  public exceptions.
+- A generic AdminMessage and every SecurityConfig mutation are rejected by the
+  backend even when WebSocket validation is bypassed.
+- A remote read requires exact target identity, public-key presence, Bluetooth,
+  explicit admin action, and a correlated response.
+- A write obtains/uses the eight-byte session key in memory, sends once,
+  serializes per target, and performs exact readback verification.
+- Unauthorized, missing-key, bad-session, no-route, duty-cycle, timeout, and
+  unknown-outcome results remain distinct and actionable.
+
+### Messages and automation
+
+- Broadcast, channel, direct, and unknown-delivery records group correctly.
+- Exact identity is retained; duplicate names never merge conversations.
+- Draft, focus, and selected conversation survive snapshot refresh; navigation
+  clears the draft.
+- Malformed/oversized text and records are rejected and every rendered value is
+  escaped.
+- Immediate send, offline queue, provider failure, replay, and permanent block
+  each emit exactly one safe status transition with a correlation ID.
+- Deprecated packet events cannot expose raw payloads or admin/config data.
+
+### Traceroute
+
+- Broadcast, self, unknown, ambiguous, wrong-protocol, and wrong-transport
+  destinations fail before reservation or transmission.
+- Reservation is atomic, stored before send, survives database reopen, and
+  permits one manual traceroute across the entire MeshNet integration every
+  3,600 seconds.
+- Simultaneous callers cannot both transmit. Timeout/failure consumes the
+  reservation and is never retried.
+- Only the admin WebSocket/manual panel path reaches the provider; polling,
+  refresh, startup, diagnostics, messages, maps, graph, services, and
+  automations have no traceroute call path.
+- Response request/source/destination/channel and bounded hop order are
+  validated before caching.
+
+### Graph
+
+- Limits accept only 20, 50, or 100 and selection is deterministic by recent
+  valid `last_heard` data.
+- Haversine distance is finite, monotonic, and clamped; invalid or missing GPS
+  uses the neutral spring.
+- Radio GPS wins over the labeled, browser-only Home Assistant fallback.
+- Proximity never creates an edge and SNR/RSSI is never converted to distance.
+- The force step remains finite and bounded; animation and drag listeners stop
+  on detach/view change; reduced motion has no continuous animation.
+- Changing graph limit or moving a node performs zero transport calls.
+
+### Telemetry and gateway health
+
+- Only documented decoded variants produce typed, bounded entities.
+- Metric count/key/value limits, finite-number checks, zero preservation,
+  deduplication, and provenance are tested for Meshtastic and MeshCore.
+- ADMIN_APP and unknown/config ports never become events or entities.
+- Gateway transitions fire once with monotonic failure counts and stale
+  lifecycle callbacks cannot emit failures.
+
+## Official Protocol References
+
+- [Meshtastic remote node administration](https://meshtastic.org/docs/configuration/remote-admin/)
+- [Meshtastic security configuration](https://meshtastic.org/docs/configuration/radio/security/)
+- [Meshtastic CLI usage](https://meshtastic.org/docs/software/python/cli/usage/)
+- [Meshtastic Python API](https://python.meshtastic.org/)
+- [Admin protocol definition](https://github.com/meshtastic/protobufs/blob/master/meshtastic/admin.proto)
+- [Mesh packet, route, neighbor, and error definitions](https://github.com/meshtastic/protobufs/blob/master/meshtastic/mesh.proto)
+- [Port number definitions](https://github.com/meshtastic/protobufs/blob/master/meshtastic/portnums.proto)
+- [Telemetry protocol definition](https://github.com/meshtastic/protobufs/blob/master/meshtastic/telemetry.proto)

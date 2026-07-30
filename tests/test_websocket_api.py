@@ -80,6 +80,48 @@ def test_panel_identity_safety_handles_legacy_protocol_case() -> None:
     assert _panel_node(node, identity_valid=True)["identity_valid"] is False
 
 
+def test_panel_node_projects_only_bounded_passive_neighbor_evidence() -> None:
+    """Provider routing data cannot inject graph nodes or hide MQTT provenance."""
+    node = NodeState(
+        node_key="meshtastic:!01020304",
+        protocol="meshtastic",
+        node_id="!01020304",
+        location={
+            "latitude": 41.0,
+            "longitude": -87.0,
+            "precision_bits": 12,
+            "private_note": "home",
+        },
+        routing={
+            "neighbors": [
+                "!11121314",
+                "!21222324",
+                "not-an-id",
+                {"private": "value"},
+            ],
+            "neighbor_count": 999,
+            "neighbors_updated_at": "2026-07-30T12:00:00+00:00",
+            "neighbors_via_mqtt": False,
+            "private_route_data": "secret",
+        },
+    )
+
+    projected = _panel_node(node, identity_valid=True)
+
+    assert projected["location"] == {
+        "latitude": 41.0,
+        "longitude": -87.0,
+        "precision_bits": 12,
+    }
+    assert projected["routing"] == {
+        "neighbors": ["!11121314", "!21222324"],
+        "neighbor_count": 2,
+        "neighbors_updated_at": "2026-07-30T12:00:00+00:00",
+        "neighbors_via_mqtt": False,
+    }
+    assert "secret" not in json.dumps(projected)
+
+
 def test_messages_websocket_redacts_legacy_raw_provider_metadata() -> None:
     async def run() -> None:
         message = MessageRecord(

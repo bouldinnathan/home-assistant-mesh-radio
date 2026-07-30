@@ -2078,10 +2078,11 @@ def test_passive_topology_uses_only_direct_hops_and_exact_meshcore_routes() -> N
     protocol: "meshcore",
   }));
   assert.equal(panel._passiveTopology(many, gateways).nodes.length, 36);
+  assert.equal(panel._passiveTopology.toString().includes("meshnet/traceroute"), false);
+  assert.equal(panel._graph.toString().includes("meshnet/traceroute"), false);
 """
     )
     source = _source()
-    assert 'type: "meshnet/traceroute"' not in source
     assert "sendTraceroute" not in source
     assert "byGateway" not in source
 

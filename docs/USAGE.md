@@ -18,12 +18,12 @@ MeshNet
 
 The panel shows:
 
-- An explicit broadcast/direct message composer with cached node and gateway
-  dropdowns
+- App-like broadcast, channel, and direct conversation threads with a composer
 - Gateway online state
 - Node online/last-seen state with favorites-aware sorting
 - Recent messages
-- Passive, evidence-only topology
+- A draggable, moving 20/50/100-node passive graph whose spring lengths use
+  valid GPS distance only after an edge has independent route evidence
 - A link to Home Assistant's native Map
 - RF heat based on RSSI or SNR
 
@@ -67,10 +67,40 @@ yet**. Edges are explicitly labeled as last received, cached evidence rather
 than a live route; MeshNet does not currently expire a received MeshCore
 route/path on a guessed schedule.
 
+Locally received Meshtastic NeighborInfo may add a node-to-node edge when both
+identities resolve exactly and the report is no more than one hour old. MQTT,
+ambiguous, malformed, stale, and implausibly future-dated neighbor reports do
+not create graph edges. This processing is passive and sends no traceroute.
+
 MeshNet does not run traceroute automatically, on refresh, on startup, or to
-fill the graph. This release exposes no traceroute action at all. Any future
-manual testing implementation must enforce a backend-persisted cooldown of at
-least one hour per gateway and destination.
+fill the graph. Administrators may explicitly request one unicast traceroute
+from the MeshNet panel when using a connected Meshtastic Bluetooth gateway.
+The backend permits at most one manual traceroute across the entire MeshNet
+integration per hour, reserves that global cooldown before transmitting, never
+retries, and exposes no traceroute service or automation action. The panel
+reloads the persisted cooldown and last bounded result after Home Assistant or
+the browser restarts.
+
+## Remote Node Administration
+
+For a non-critical Meshtastic node that should accept this controller:
+
+1. Open **MeshNet** in the Home Assistant sidebar and use its **Remote node
+   administration** card with a connected Meshtastic Bluetooth gateway.
+2. Select the exact target and press **Load / Test access**.
+3. Copy the displayed controller public key. It is copy-only; MeshNet never
+   handles the controller private key.
+4. Connect the official Meshtastic app or CLI locally to the target and place
+   that public key in a free Security Admin Key slot.
+5. Reconnect MeshNet, load the target again, edit an offered owner/display
+   field, Preview, review the warning, confirm, and Apply once.
+
+The target must have a valid public key in the controller NodeDB. Bluetooth
+configuration, channel keys, SecurityConfig, admin-key slots, resets, firmware,
+files, position mutation, and raw admin commands are excluded. A timeout is an
+unknown outcome: inspect the radio locally instead of pressing Apply again.
+The full trust model and recovery table are in
+[Advanced Mesh Operations](ADVANCED_MESH_OPERATIONS.md).
 
 ## Verify Gateway Status
 
@@ -88,6 +118,7 @@ Expected gateway entities:
 - `sensor.<gateway>_packets_received`
 - `sensor.<gateway>_packets_sent`
 - `sensor.<gateway>_duplicate_packets`
+- `sensor.<gateway>_failure_count`
 - `sensor.<gateway>_error_count`
 
 If a gateway is offline, run:
@@ -237,6 +268,12 @@ MeshNet fires these Home Assistant events:
 | `meshnet_packet` | A packet is received and not deduplicated |
 | `meshnet_message_received` | A received packet contains message text |
 | `meshnet_message_sent` | A message send succeeds, including queued replay |
+| `meshnet_message_status` | A send attempt is queued, sent, blocked, or fails safely |
+| `meshnet_gateway_status` | A gateway connection or failure state really changes |
+
+`meshnet_packet` is a deprecated, metadata-only compatibility event. It and
+the versioned status events omit raw provider payloads, credentials, and
+exception strings.
 
 Listen in:
 
@@ -309,7 +346,7 @@ It stores:
 - Nodes
 - Messages
 - Packets
-- Route placeholders
+- Manual traceroute cooldowns and sanitized results
 
 Pruning follows `history_days`.
 

@@ -1,6 +1,6 @@
 # MeshNet for Home Assistant
 
-MeshNet turns Home Assistant into one operating surface for Meshtastic and MeshCore radios. It creates gateway and node entities, records telemetry and messages, tracks valid GPS positions, exposes actions and events, and provides an admin-only mesh panel with explicit broadcast/direct messaging, favorites-aware node sorting, native Map access, passive evidence-only topology, and validated live gateway settings.
+MeshNet turns Home Assistant into one operating surface for Meshtastic and MeshCore radios. It creates gateway and node entities, records telemetry and messages, tracks valid GPS positions, exposes actions and events, and provides an admin-only mesh panel with app-like broadcast/channel/direct conversations, favorites-aware node sorting, native Map access, a moving distance-aware passive graph, validated live gateway settings, guarded Meshtastic remote administration, and manual cooldown-protected traceroute.
 
 > [!IMPORTANT]
 > The current package is an in-process Home Assistant custom integration. Use it
@@ -178,6 +178,23 @@ excluded destructive operations.
 > An applied setting persists on the radio. Removing the integration or
 > uninstalling it through HACS cannot restore an intentional hardware change.
 
+### Advanced local mesh tools
+
+Version 0.7.0 adds a dedicated **Messages** view, a draggable 20/50/100-node
+force graph whose evidence-backed spring lengths use GPS distance, manual
+Meshtastic Bluetooth traceroute with a durable integration-wide one-hour
+cooldown, privacy-safe message/gateway status events, and a deliberately
+narrow remote-node settings editor.
+
+Remote administration uses the connected controller radio's existing keypair.
+MeshNet displays only its public key for copy/provisioning and never imports,
+exports, reads, or stores a private key, channel PSK, SecurityConfig, or raw
+AdminMessage. A target must already authorize that public key. Remote writes
+are Bluetooth-only, previewed, confirmed, single-use, sent once, and verified
+by readback; the initial allowlist is owner names and reviewed display options.
+See [Advanced Mesh Operations](docs/ADVANCED_MESH_OPERATIONS.md) for setup,
+airtime, recovery, automation, telemetry, and privacy details.
+
 ## Container hardware access
 
 Network gateways need to be reachable from inside the Home Assistant container, not just from the Docker host.
@@ -221,9 +238,10 @@ Useful documentation:
 2. [Configuration](docs/CONFIGURATION.md)
 3. [Usage](docs/USAGE.md)
 4. [Gateway Settings](docs/GATEWAY_SETTINGS.md)
-5. [Troubleshooting](docs/TROUBLESHOOTING.md)
-6. [Security](docs/SECURITY.md)
-7. [Architecture](docs/ARCHITECTURE.md)
+5. [Advanced Mesh Operations](docs/ADVANCED_MESH_OPERATIONS.md)
+6. [Troubleshooting](docs/TROUBLESHOOTING.md)
+7. [Security](docs/SECURITY.md)
+8. [Architecture](docs/ARCHITECTURE.md)
 
 ## Development check
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 import random
 import re
 import time
@@ -40,8 +41,10 @@ from .const import (
     DEFAULT_NODE_TIMEOUT,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    EVENT_GATEWAY_STATUS,
     EVENT_MESSAGE_RECEIVED,
     EVENT_MESSAGE_SENT,
+    EVENT_MESSAGE_STATUS,
     EVENT_PACKET,
     MAX_PANEL_NODES,
     MESSAGE_TYPE_BROADCAST,
@@ -50,6 +53,7 @@ from .const import (
     MESSAGE_TYPE_GROUP,
     PROTOCOL_MESHCORE,
     PROTOCOL_MESHTASTIC,
+    TRANSPORT_BLUETOOTH,
     TRANSPORT_REST,
 )
 from .dedupe import PacketDeduplicator
@@ -79,6 +83,7 @@ from .node_identity import (
 )
 from .panel_telemetry import PanelTelemetry
 from .rate_limiter import TokenBucket
+from .remote_admin import RemoteAdminManager
 from .store import MeshStore
 
 _LOGGER = logging.getLogger(__name__)
@@ -90,28 +95,21 @@ _GATEWAY_TASK_CANCEL_TIMEOUT = 2.0
 _CONNECTION_UPDATE_ACK_TIMEOUT = 5.0
 _DIAGNOSTIC_STORE_TIMEOUT = 2.0
 _AMBIGUOUS_MESSAGE_ERROR = (
-    "The selected Meshtastic identity is ambiguous; direct messaging is "
-    "disabled until its node records agree"
+    "The selected Meshtastic identity is ambiguous; direct messaging is disabled until its node records agree"
 )
 _INVALID_MESSAGE_IDENTITY_ERROR = (
-    "The selected Meshtastic identity is malformed or internally "
-    "inconsistent; direct messaging is disabled"
+    "The selected Meshtastic identity is malformed or internally inconsistent; direct messaging is disabled"
 )
 _UNSAFE_MESSAGE_IDENTITY_ERROR_CODE = "unsafe_identity"
 _INVALID_MESSAGE_ERROR_CODE = "invalid_message"
 _UNSAFE_MESSAGE_ROUTE_ERROR_CODE = "unsafe_route"
 _INVALID_MESSAGE_TYPE_ERROR = "Unsupported mesh message type"
 _INVALID_MESSAGE_TARGET_ERROR = (
-    "Direct messages require exactly one target; broadcast, group, and "
-    "emergency messages must not specify a target"
+    "Direct messages require exactly one target; broadcast, group, and emergency messages must not specify a target"
 )
-_MESSAGE_PROTOCOL_MISMATCH_ERROR = (
-    "The selected target and gateway use different mesh protocols"
-)
+_MESSAGE_PROTOCOL_MISMATCH_ERROR = "The selected target and gateway use different mesh protocols"
 _UNKNOWN_MESSAGE_TARGET_ERROR = "The selected mesh target is not a known node"
-_STALE_MESSAGE_TARGET_ERROR = (
-    "The selected mesh identity changed before delivery; the message was blocked"
-)
+_STALE_MESSAGE_TARGET_ERROR = "The selected mesh identity changed before delivery; the message was blocked"
 _SUPPORTED_MESSAGE_TYPES = frozenset(
     {
         MESSAGE_TYPE_BROADCAST,
@@ -129,6 +127,16 @@ _PUBLIC_MESSAGE_ERROR_CODES = frozenset(
         "send_failed",
     }
 )
+_PRIVATE_MESHTASTIC_PORTS = frozenset(
+    {
+        "ADMIN_APP",
+        "CONFIG_APP",
+        "CHANNEL_CONFIG",
+        "SECURITY_CONFIG",
+        "SESSION",
+    }
+)
+_TRACEROUTE_COOLDOWN_SECONDS = 3600
 _GATEWAY_ISSUE_CATEGORIES = (
     "gateway_start",
     "send_failed",
@@ -184,14 +192,10 @@ def _canonical_public_key_input(value: Any) -> str | None:
         return None
     text = value.strip().casefold()
     compact = text.replace(":", "").replace("-", "")
-    if len(compact) != 64 or any(
-        character not in "0123456789abcdef" for character in compact
-    ):
+    if len(compact) != 64 or any(character not in "0123456789abcdef" for character in compact):
         return None
     if text != compact:
-        colon = ":".join(
-            compact[index : index + 2] for index in range(0, 64, 2)
-        )
+        colon = ":".join(compact[index : index + 2] for index in range(0, 64, 2))
         if text not in {colon, colon.replace(":", "-")}:
             return None
     return compact
@@ -219,15 +223,8 @@ def _looks_like_bare_identity_input(value: str) -> bool:
             return True
 
     compact = text.replace(":", "").replace("-", "")
-    if (
-        len(compact) in {12, 64}
-        and compact.isascii()
-        and compact.isalnum()
-    ):
-        hex_characters = sum(
-            character.casefold() in "0123456789abcdef"
-            for character in compact
-        )
+    if len(compact) in {12, 64} and compact.isascii() and compact.isalnum():
+        hex_characters = sum(character.casefold() in "0123456789abcdef" for character in compact)
         return hex_characters >= (len(compact) * 3) // 4
     return False
 
@@ -257,9 +254,7 @@ def validated_message_envelope(
     else:
         raise HomeAssistantError(_INVALID_MESSAGE_TARGET_ERROR)
 
-    if (normalized_type == MESSAGE_TYPE_DIRECT) != (
-        normalized_target is not None
-    ):
+    if (normalized_type == MESSAGE_TYPE_DIRECT) != (normalized_target is not None):
         raise HomeAssistantError(_INVALID_MESSAGE_TARGET_ERROR)
 
     if not isinstance(message, str) or not message.strip():
@@ -306,11 +301,7 @@ def validated_message_envelope(
 
     if gateway_id is None:
         normalized_gateway_id = None
-    elif (
-        isinstance(gateway_id, str)
-        and gateway_id == gateway_id.strip()
-        and 1 <= len(gateway_id) <= 128
-    ):
+    elif isinstance(gateway_id, str) and gateway_id == gateway_id.strip() and 1 <= len(gateway_id) <= 128:
         normalized_gateway_id = gateway_id
     else:
         raise HomeAssistantError("Invalid MeshNet gateway ID")
@@ -373,13 +364,186 @@ def message_api_dict(message: MessageRecord) -> dict[str, Any]:
     if isinstance(status, str) and status in _PUBLIC_MESSAGE_STATUSES:
         raw["status"] = status
     error_code = message.raw.get("last_error_code")
-    if (
-        isinstance(error_code, str)
-        and error_code in _PUBLIC_MESSAGE_ERROR_CODES
-    ):
+    if isinstance(error_code, str) and error_code in _PUBLIC_MESSAGE_ERROR_CODES:
         raw["last_error_code"] = error_code
     data["raw"] = raw
+    delivery, peer_node_key = _message_delivery(message)
+    channel_index = _message_channel_index(message.channel)
+    data["channel"] = (
+        str(channel_index)
+        if channel_index is not None
+        else "0"
+        if delivery == "broadcast"
+        else None
+    )
+    data["delivery"] = delivery
+    data["peer_node_key"] = peer_node_key
     return data
+
+
+def _message_channel_index(value: Any) -> int | None:
+    """Return one exact supported channel index without coercing booleans."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 0 <= value <= 7 else None
+    if isinstance(value, str) and value in {"0", "1", "2", "3", "4", "5", "6", "7"}:
+        return int(value)
+    return None
+
+
+def _meshcore_peer_node_key(value: Any) -> str | None:
+    """Return one exact MeshCore conversation key without guessing a name."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or len(text.encode("utf-8")) > 256:
+        return None
+    folded = text.casefold()
+    if folded.startswith("pub:"):
+        public_key = folded[4:]
+        if re.fullmatch(r"[0-9a-f]{2,128}", public_key) is not None:
+            return f"pub:{public_key}"
+        return None
+    if re.fullmatch(r"[0-9a-f]{2,128}", folded) is not None:
+        return f"pub:{folded}"
+    if folded.startswith("meshcore:"):
+        suffix = text[len("meshcore:") :]
+        if suffix and all(character.isprintable() for character in suffix):
+            return text
+    return None
+
+
+def _message_delivery(message: MessageRecord) -> tuple[str, str | None]:
+    """Classify a message only from exact destination/identity evidence."""
+    protocol = _known_protocol(message.protocol)
+    receiver_text = str(message.receiver or "").strip()
+    receiver_folded = receiver_text.casefold()
+    receiver_id = canonical_meshtastic_node_id(receiver_text) if protocol == PROTOCOL_MESHTASTIC else None
+    if receiver_id is not None:
+        peer = message.sender if message.direction == "rx" else message.receiver
+        peer_id = canonical_meshtastic_node_id(peer)
+        return (
+            "direct",
+            f"meshtastic:{peer_id}" if peer_id is not None else None,
+        )
+    if protocol == PROTOCOL_MESHCORE and message.message_type == MESSAGE_TYPE_DIRECT:
+        peer = message.sender if message.direction == "rx" else message.receiver
+        peer_node_key = _meshcore_peer_node_key(peer)
+        if peer_node_key is not None:
+            return "direct", peer_node_key
+        return "unknown", None
+    channel_index = _message_channel_index(message.channel)
+    if channel_index is not None and channel_index > 0:
+        return "channel", None
+    if receiver_folded in {"", "^all", "!ffffffff", "ffffffff"} and channel_index in {None, 0}:
+        return "broadcast", None
+    return "unknown", None
+
+
+def message_submission_response(message_id: str, status: str) -> dict[str, Any]:
+    """Return the bounded response for a Home Assistant send action."""
+    durable_status = status if status in _PUBLIC_MESSAGE_STATUSES else "queued"
+    return {
+        "schema_version": 1,
+        "message_id": str(message_id)[:128],
+        "status": durable_status,
+    }
+
+
+def _message_status_event(
+    record: MessageRecord,
+    status: str,
+    *,
+    retryable: bool,
+    error_code: str | None = None,
+) -> dict[str, Any]:
+    """Project one message submission outcome without message content."""
+    event: dict[str, Any] = {
+        "schema_version": 1,
+        "message_id": str(record.message_id)[:128],
+        "status": status,
+        "retryable": retryable,
+        "protocol": _known_protocol(record.protocol) or "unknown",
+        "gateway_id": str(record.gateway_id)[:128],
+        "message_type": (
+            record.message_type if record.message_type in _SUPPORTED_MESSAGE_TYPES else MESSAGE_TYPE_BROADCAST
+        ),
+        "occurred_at": timestamp_to_json(utcnow()),
+    }
+    if error_code in _PUBLIC_MESSAGE_ERROR_CODES:
+        event["error_code"] = error_code
+    return event
+
+
+def _packet_event_dict(packet: MeshPacket) -> dict[str, Any]:
+    """Project the deprecated packet event onto strict decoded metadata."""
+    event: dict[str, Any] = {
+        "schema_version": 1,
+        "protocol": _known_protocol(packet.protocol) or "unknown",
+        "gateway_id": str(packet.gateway_id)[:128],
+        "encrypted": bool(packet.encrypted),
+        "timestamp": timestamp_to_json(packet.timestamp),
+    }
+    fields = {
+        "packet_id": packet.packet_id,
+        "sender": packet.sender,
+        "receiver": packet.receiver,
+        "channel": packet.channel,
+        "portnum": packet.portnum,
+        "rssi": packet.rssi,
+        "snr": packet.snr,
+        "hops": packet.hops,
+        "hop_limit": packet.hop_limit,
+    }
+    for key, value in fields.items():
+        if value is None:
+            continue
+        if isinstance(value, str):
+            event[key] = value[:128]
+        elif isinstance(value, bool):
+            continue
+        elif isinstance(value, (int, float)) and math.isfinite(float(value)):
+            event[key] = value
+    return event
+
+
+def _message_received_event(record: MessageRecord) -> dict[str, Any]:
+    """Project one decoded text message for privacy-safe automations."""
+    delivery, _peer_node_key = _message_delivery(record)
+    return {
+        "schema_version": 1,
+        "message_id": str(record.message_id)[:128],
+        "protocol": _known_protocol(record.protocol) or "unknown",
+        "gateway_id": str(record.gateway_id)[:128],
+        "sender": str(record.sender or "")[:128] or None,
+        "receiver": str(record.receiver or "")[:128] or None,
+        "channel": str(record.channel)[:32] if record.channel is not None else None,
+        "text": record.text,
+        "delivery": delivery,
+        "encrypted": bool(record.encrypted),
+        "hops": record.hops,
+        "timestamp": timestamp_to_json(record.timestamp),
+    }
+
+
+def _safe_inbound_text(value: Any) -> str | None:
+    """Return a valid Meshtastic-sized text string or no text."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    return value if len(encoded) <= 237 else None
+
+
+def _packet_port_is_private(packet: MeshPacket) -> bool:
+    """Fail closed for admin/config/unknown Meshtastic packet types."""
+    if _known_protocol(packet.protocol) != PROTOCOL_MESHTASTIC:
+        return False
+    portnum = str(packet.portnum or "").strip().upper()
+    return portnum in _PRIVATE_MESHTASTIC_PORTS or portnum.startswith("UNKNOWN")
 
 
 def node_age_bucket(
@@ -395,11 +559,7 @@ def node_age_bucket(
         current = current.replace(tzinfo=UTC)
     else:
         current = current.astimezone(UTC)
-    heard = (
-        last_heard.replace(tzinfo=UTC)
-        if last_heard.tzinfo is None
-        else last_heard.astimezone(UTC)
-    )
+    heard = last_heard.replace(tzinfo=UTC) if last_heard.tzinfo is None else last_heard.astimezone(UTC)
     age_seconds = max(0.0, (current - heard).total_seconds())
     if age_seconds < 15 * 60:
         return "<15m"
@@ -513,9 +673,7 @@ def node_observability_aggregate(
     """Return identity-free, side-effect-free node provenance aggregates."""
     node_list = list(nodes)
     observed_keys = set(observed_node_keys)
-    current_session_count = sum(
-        node.node_key in observed_keys for node in node_list
-    )
+    current_session_count = sum(node.node_key in observed_keys for node in node_list)
     online_count = sum(bool(node.online) for node in node_list)
     located_flags = [
         has_valid_location(
@@ -548,16 +706,13 @@ def node_observability_aggregate(
             "offline": len(node_list) - online_count,
             "located": located_count,
             "located_offline": sum(
-                located and not node.online
-                for node, located in zip(node_list, located_flags, strict=True)
+                located and not node.online for node, located in zip(node_list, located_flags, strict=True)
             ),
         },
         "via_mqtt_counts": via_mqtt_counts,
         "hop_counts": hop_counts,
         "age_counts": age_counts,
-        "identity_alias_collisions": _identity_alias_collision_summary(
-            node_list
-        ),
+        "identity_alias_collisions": _identity_alias_collision_summary(node_list),
         "location_provenance": {
             "independent_timestamp_available": False,
             "source_available": False,
@@ -573,8 +728,12 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self.entry = entry
-        self.node_timeout = int(entry.options.get(CONF_NODE_TIMEOUT, entry.data.get(CONF_NODE_TIMEOUT, DEFAULT_NODE_TIMEOUT)))
-        self.history_days = int(entry.options.get(CONF_HISTORY_DAYS, entry.data.get(CONF_HISTORY_DAYS, DEFAULT_HISTORY_DAYS)))
+        self.node_timeout = int(
+            entry.options.get(CONF_NODE_TIMEOUT, entry.data.get(CONF_NODE_TIMEOUT, DEFAULT_NODE_TIMEOUT))
+        )
+        self.history_days = int(
+            entry.options.get(CONF_HISTORY_DAYS, entry.data.get(CONF_HISTORY_DAYS, DEFAULT_HISTORY_DAYS))
+        )
         self.store = MeshStore(Path(hass.config.path(DEFAULT_DATABASE_NAME)), executor=hass.async_add_executor_job)
         self.deduplicator = PacketDeduplicator()
         self.tx_limiter = TokenBucket(rate=0.5, capacity=5)
@@ -586,8 +745,12 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         self._gateway_startup_task: asyncio.Task[Any] | None = None
         self._reconnect_tasks: dict[str, asyncio.Task[Any]] = {}
         self._send_tasks: set[asyncio.Task[Any]] = set()
+        self._traceroute_tasks: set[asyncio.Task[Any]] = set()
+        self._radio_operations_accepting = True
         self._active_send_message_ids: set[str] = set()
         self._gateway_generation = 0
+        self._gateway_connected_states: dict[str, bool] = {}
+        self._gateway_failure_counts: dict[str, int] = {}
         self._shutting_down = False
         self._reconnect_suspended = False
         self._last_update_attempt_at: datetime | None = None
@@ -609,6 +772,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         self._connection_update_lock = asyncio.Lock()
         self.panel_telemetry = PanelTelemetry(_LOGGER)
         self.gateway_settings = GatewaySettingsManager(self)
+        self.remote_admin = RemoteAdminManager(self)
         super().__init__(
             hass,
             _LOGGER,
@@ -617,6 +781,13 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             update_interval=timedelta(seconds=30),
             always_update=True,
         )
+
+    def _fire_event(self, event_type: str, data: dict[str, Any]) -> None:
+        """Fire an event when attached to a live Home Assistant bus."""
+        bus = getattr(getattr(self, "hass", None), "bus", None)
+        fire = getattr(bus, "async_fire", None)
+        if callable(fire):
+            fire(event_type, data)
 
     async def _async_setup(self) -> None:
         self._legacy_issue_cleanup_count = self._delete_legacy_gateway_issues()
@@ -627,33 +798,16 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         self.snapshot.recent_messages = cached.recent_messages
         await self._rebuild_gateways()
 
-    def _refresh_effective_node_projection(
-        self, *, changed_raw_key: str | None = None
-    ) -> None:
+    def _refresh_effective_node_projection(self, *, changed_raw_key: str | None = None) -> None:
         """Publish a reversible distinct-node view from retained raw records."""
         raw_nodes = getattr(self, "_raw_nodes", self.snapshot.nodes)
         if changed_raw_key is not None:
-            effective_key = getattr(
-                self, "_node_alias_redirects", {}
-            ).get(changed_raw_key)
-            aliases = getattr(
-                self, "_node_aliases_by_effective", {}
-            ).get(effective_key or "")
-            if (
-                effective_key is not None
-                and aliases
-                and all(alias in raw_nodes for alias in aliases)
-            ):
-                subset = project_effective_nodes(
-                    {alias: raw_nodes[alias] for alias in aliases}
-                )
-                if (
-                    set(subset.redirects) == set(aliases)
-                    and set(subset.nodes) == {effective_key}
-                ):
-                    self.snapshot.nodes[effective_key] = subset.nodes[
-                        effective_key
-                    ]
+            effective_key = getattr(self, "_node_alias_redirects", {}).get(changed_raw_key)
+            aliases = getattr(self, "_node_aliases_by_effective", {}).get(effective_key or "")
+            if effective_key is not None and aliases and all(alias in raw_nodes for alias in aliases):
+                subset = project_effective_nodes({alias: raw_nodes[alias] for alias in aliases})
+                if set(subset.redirects) == set(aliases) and set(subset.nodes) == {effective_key}:
+                    self.snapshot.nodes[effective_key] = subset.nodes[effective_key]
                     self._refresh_effective_observed_node_keys()
                     return
 
@@ -664,8 +818,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         for raw_key, effective_key in projection.redirects.items():
             aliases_by_effective.setdefault(effective_key, []).append(raw_key)
         self._node_aliases_by_effective = {
-            effective_key: tuple(sorted(raw_keys))
-            for effective_key, raw_keys in aliases_by_effective.items()
+            effective_key: tuple(sorted(raw_keys)) for effective_key, raw_keys in aliases_by_effective.items()
         }
         self._node_identity_stats = projection.stats
         self._unsafe_meshtastic_node_keys = projection.unsafe_node_keys
@@ -675,10 +828,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         """Map live raw observations onto the current distinct-node view."""
         observed = getattr(self, "_session_observed_node_keys", set())
         self._effective_observed_node_keys = {
-            getattr(self, "_node_alias_redirects", {}).get(
-                node_key, node_key
-            )
-            for node_key in observed
+            getattr(self, "_node_alias_redirects", {}).get(node_key, node_key) for node_key in observed
         }
 
     async def async_start_gateways(self) -> None:
@@ -707,9 +857,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         task = self._gateway_startup_task
         if task is not None and not task.done():
             return
-        task = self._async_create_background_task(
-            self.async_start_gateways(), "MeshNet gateway startup"
-        )
+        task = self._async_create_background_task(self.async_start_gateways(), "MeshNet gateway startup")
         self._gateway_startup_task = task
 
         def clear_startup(done_task: asyncio.Task[Any]) -> None:
@@ -718,9 +866,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
 
         task.add_done_callback(clear_startup)
 
-    def _async_create_background_task(
-        self, target: Coroutine[Any, Any, Any], name: str
-    ) -> asyncio.Task[Any]:
+    def _async_create_background_task(self, target: Coroutine[Any, Any, Any], name: str) -> asyncio.Task[Any]:
         """Create long-lived work tied to this config entry when possible."""
         creator = getattr(self.entry, "async_create_background_task", None)
         if callable(creator):
@@ -741,19 +887,12 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             self.snapshot.messages_today = await self.store.async_messages_since(midnight)
             self.snapshot.mesh_health_score = self._mesh_health_score()
         except Exception as err:
-            self._last_update_duration_seconds = round(
-                time.monotonic() - started, 3
-            )
+            self._last_update_duration_seconds = round(time.monotonic() - started, 3)
             error_category = _diagnostic_error_category(str(err))
             self._last_update_error_category = error_category
-            raise UpdateFailed(
-                f"MeshNet update failed ({error_category}; "
-                f"{_safe_error_type(err)})"
-            ) from err
+            raise UpdateFailed(f"MeshNet update failed ({error_category}; {_safe_error_type(err)})") from err
         self._last_update_success_at = utcnow()
-        self._last_update_duration_seconds = round(
-            time.monotonic() - started, 3
-        )
+        self._last_update_duration_seconds = round(time.monotonic() - started, 3)
         self._last_update_error_category = None
         return self.snapshot
 
@@ -761,12 +900,9 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         """Stop gateways and close durable storage."""
         self._shutting_down = True
         self._reconnect_suspended = True
+        radio_operations_drained = await self.async_quiesce_radio_operations()
         settings_manager = getattr(self, "gateway_settings", None)
-        settings_drained = (
-            await settings_manager.async_quiesce()
-            if settings_manager is not None
-            else True
-        )
+        settings_drained = await settings_manager.async_quiesce() if settings_manager is not None else True
         await super().async_shutdown()
         startup_drained = await self._cancel_gateway_startup_task()
         reconnects_drained = await self._cancel_reconnect_tasks()
@@ -774,23 +910,20 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         sends_drained = await self._cancel_send_tasks()
         if not startup_drained:
             _LOGGER.warning(
-                "Gateway startup did not stop promptly; continuing bounded "
-                "shutdown with transport stop fences"
+                "Gateway startup did not stop promptly; continuing bounded shutdown with transport stop fences"
             )
         if not reconnects_drained:
             _LOGGER.warning(
-                "Gateway reconnect did not stop promptly; continuing bounded "
-                "shutdown with transport stop fences"
+                "Gateway reconnect did not stop promptly; continuing bounded shutdown with transport stop fences"
             )
         if not outbox_drained:
-            _LOGGER.warning(
-                "Outbox delivery did not stop promptly; continuing bounded "
-                "shutdown with lifecycle fences"
-            )
+            _LOGGER.warning("Outbox delivery did not stop promptly; continuing bounded shutdown with lifecycle fences")
         if not sends_drained:
+            _LOGGER.warning("Message delivery did not stop promptly; continuing bounded shutdown with lifecycle fences")
+        if not radio_operations_drained:
             _LOGGER.warning(
-                "Message delivery did not stop promptly; continuing bounded "
-                "shutdown with lifecycle fences"
+                "Remote administration or traceroute work did not stop promptly; "
+                "continuing bounded shutdown with lifecycle fences"
             )
         if not settings_drained:
             _LOGGER.warning(
@@ -812,12 +945,10 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
     async def async_reload_gateways(self) -> None:
         """Reload gateway configuration from the current config entry."""
         self._reconnect_suspended = True
+        radio_operations_drained = await self.async_quiesce_radio_operations()
         settings_manager = getattr(self, "gateway_settings", None)
-        settings_drained = (
-            await settings_manager.async_quiesce()
-            if settings_manager is not None
-            else True
-        )
+        settings_drained = await settings_manager.async_quiesce() if settings_manager is not None else True
+        reload_completed = False
         try:
             startup_drained = await self._cancel_gateway_startup_task()
             reconnects_drained = await self._cancel_reconnect_tasks()
@@ -828,24 +959,32 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                 or not reconnects_drained
                 or not outbox_drained
                 or not sends_drained
+                or not radio_operations_drained
                 or not settings_drained
             ):
-                _LOGGER.warning(
-                    "Gateway reload deferred because previous transport work "
-                    "did not stop promptly"
-                )
+                _LOGGER.warning("Gateway reload deferred because previous transport work did not stop promptly")
                 return
             for gateway in list(self.gateways.values()):
                 await gateway.async_stop()
             self._gateway_configs = self._load_gateway_configs(self.entry)
             await self._rebuild_gateways()
+            reload_completed = True
         finally:
             self._reconnect_suspended = False
             if settings_manager is not None and not self._shutting_down:
                 if not settings_manager.resume():
+                    _LOGGER.warning("Gateway settings remain fenced because old work is still stopping")
+            if not self._shutting_down:
+                if reload_completed:
+                    if not self.resume_radio_operations():
+                        _LOGGER.warning(
+                            "Remote administration and traceroute remain fenced "
+                            "because old radio work is still stopping"
+                        )
+                elif radio_operations_drained:
                     _LOGGER.warning(
-                        "Gateway settings remain fenced because old work is "
-                        "still stopping"
+                        "Remote administration and traceroute remain fenced until "
+                        "the deferred gateway reload succeeds"
                     )
         self.async_start_gateways_background()
 
@@ -858,7 +997,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         priority: str = "normal",
         message_type: str = MESSAGE_TYPE_BROADCAST,
         gateway_id: str | None = None,
-    ) -> str:
+    ) -> dict[str, Any]:
         """Send or queue a mesh message."""
         task = asyncio.current_task()
         if task is not None:
@@ -885,7 +1024,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         priority: str,
         message_type: str,
         gateway_id: str | None,
-    ) -> str:
+    ) -> dict[str, Any]:
         """Send once while fencing storage and events from lifecycle changes."""
         gateway_generation = self._gateway_generation
         if not self._gateway_callback_is_current(gateway_generation):
@@ -912,9 +1051,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             target_node=target_node,
             target_protocol=resolved.protocol,
         )
-        target_node = self._validated_gateway_message_target(
-            gateway, target_node
-        )
+        target_node = self._validated_gateway_message_target(gateway, target_node)
         message_id = self._message_id(
             target_node=target_node,
             message=message,
@@ -947,9 +1084,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         """Resolve a retained alias to the protocol's stable send identifier."""
         return self._resolve_message_target(target_node).value
 
-    def _resolve_message_target(
-        self, target_node: str | None
-    ) -> _ResolvedMessageTarget:
+    def _resolve_message_target(self, target_node: str | None) -> _ResolvedMessageTarget:
         """Resolve one target without allowing identity syntax to become a name."""
         if target_node is None:
             return _ResolvedMessageTarget(None, None, None)
@@ -971,46 +1106,33 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             requested_mac = canonical_meshtastic_mac(suffix)
             if requested_mac is None:
                 raise HomeAssistantError(_INVALID_MESSAGE_IDENTITY_ERROR)
-            return self._resolved_identity_matches(
-                self._message_nodes_matching_mac(requested_mac)
-            )
+            return self._resolved_identity_matches(self._message_nodes_matching_mac(requested_mac))
 
         if reserved_prefix == "pub":
             requested_public_key = _canonical_public_key_input(suffix)
             if requested_public_key is None:
                 raise HomeAssistantError(_INVALID_MESSAGE_IDENTITY_ERROR)
-            return self._resolved_identity_matches(
-                self._message_nodes_matching_public_key(requested_public_key)
-            )
+            return self._resolved_identity_matches(self._message_nodes_matching_public_key(requested_public_key))
 
         if reserved_prefix == "meshtastic-proof":
             proof = suffix.casefold()
-            if len(proof) != 64 or any(
-                character not in "0123456789abcdef" for character in proof
-            ):
+            if len(proof) != 64 or any(character not in "0123456789abcdef" for character in proof):
                 raise HomeAssistantError(_INVALID_MESSAGE_IDENTITY_ERROR)
             proof_key = f"meshtastic-proof:{proof}"
             redirected_keys = {
                 effective_key
-                for alias, effective_key in getattr(
-                    self, "_node_alias_redirects", {}
-                ).items()
+                for alias, effective_key in getattr(self, "_node_alias_redirects", {}).items()
                 if alias.casefold() == proof_key
             }
             matches = [
                 (node_key, candidate)
                 for node_key, candidate in self.snapshot.nodes.items()
                 if _known_protocol(candidate.protocol) == PROTOCOL_MESHTASTIC
-                and (
-                    candidate.node_key.casefold() == proof_key
-                    or node_key in redirected_keys
-                )
+                and (candidate.node_key.casefold() == proof_key or node_key in redirected_keys)
             ]
             return self._resolved_identity_matches(matches)
 
-        requested_meshtastic_id = canonical_meshtastic_node_id(
-            identity_requested
-        )
+        requested_meshtastic_id = canonical_meshtastic_node_id(identity_requested)
         if requested_meshtastic_id is not None:
             # ID grammar is authoritative. A numeric-looking cached name can
             # never redirect a direct message to a different node.
@@ -1018,24 +1140,16 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
 
         requested_mac = canonical_meshtastic_mac(identity_requested)
         if requested_mac is not None:
-            return self._resolved_identity_matches(
-                self._message_nodes_matching_mac(requested_mac)
-            )
+            return self._resolved_identity_matches(self._message_nodes_matching_mac(requested_mac))
 
-        requested_public_key = _canonical_public_key_input(
-            identity_requested
-        )
+        requested_public_key = _canonical_public_key_input(identity_requested)
         if requested_public_key is not None:
-            return self._resolved_identity_matches(
-                self._message_nodes_matching_public_key(requested_public_key)
-            )
+            return self._resolved_identity_matches(self._message_nodes_matching_public_key(requested_public_key))
 
         if _looks_like_bare_identity_input(identity_requested):
             raise HomeAssistantError(_INVALID_MESSAGE_IDENTITY_ERROR)
 
-        effective_key = getattr(self, "_node_alias_redirects", {}).get(
-            requested, requested
-        )
+        effective_key = getattr(self, "_node_alias_redirects", {}).get(requested, requested)
         node = self.snapshot.nodes.get(effective_key)
         if node is None:
             alias_matches = [
@@ -1069,34 +1183,24 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                     self._normalized_meshtastic_name(candidate.long_name),
                 }
             ]
-            self._validate_meshtastic_send_candidates(
-                [candidate for _, candidate in name_matches]
-            )
+            self._validate_meshtastic_send_candidates([candidate for _, candidate in name_matches])
         if name_matches:
             return self._resolved_node_target(*name_matches[0])
         raise HomeAssistantError(_UNKNOWN_MESSAGE_TARGET_ERROR)
 
-    def _resolved_meshtastic_id(
-        self, canonical_id: str
-    ) -> _ResolvedMessageTarget:
+    def _resolved_meshtastic_id(self, canonical_id: str) -> _ResolvedMessageTarget:
         """Validate a canonical ID before returning it as a destination."""
         matches = self._meshtastic_nodes_for_id(canonical_id)
         self._validate_meshtastic_send_candidates(matches)
         if matches:
-            return self._resolved_node_target(
-                matches[0].node_key, matches[0]
-            )
+            return self._resolved_node_target(matches[0].node_key, matches[0])
         return _ResolvedMessageTarget(
             canonical_id,
             PROTOCOL_MESHTASTIC,
-            self._canonical_target_binding(
-                canonical_id, PROTOCOL_MESHTASTIC
-            ),
+            self._canonical_target_binding(canonical_id, PROTOCOL_MESHTASTIC),
         )
 
-    def _resolved_identity_matches(
-        self, matches: list[tuple[str, NodeState]]
-    ) -> _ResolvedMessageTarget:
+    def _resolved_identity_matches(self, matches: list[tuple[str, NodeState]]) -> _ResolvedMessageTarget:
         """Resolve a strong-proof grammar exactly once or fail closed."""
         if not matches:
             raise HomeAssistantError(_INVALID_MESSAGE_IDENTITY_ERROR)
@@ -1104,9 +1208,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             raise HomeAssistantError(_AMBIGUOUS_MESSAGE_ERROR)
         return self._resolved_node_target(*matches[0])
 
-    def _resolved_node_target(
-        self, node_key: str, node: NodeState
-    ) -> _ResolvedMessageTarget:
+    def _resolved_node_target(self, node_key: str, node: NodeState) -> _ResolvedMessageTarget:
         """Bind a known node's provider target to its normalized protocol."""
         protocol = _known_protocol(node.protocol)
         if protocol == PROTOCOL_MESHTASTIC:
@@ -1120,9 +1222,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             return _ResolvedMessageTarget(
                 node_key,
                 protocol,
-                self._node_target_binding(
-                    node_key, node, node_key, protocol
-                ),
+                self._node_target_binding(node_key, node, node_key, protocol),
             )
         raise HomeAssistantError(_MESSAGE_PROTOCOL_MISMATCH_ERROR)
 
@@ -1163,15 +1263,9 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                         else str(node.node_id or "")
                     ),
                     "mac": canonical_meshtastic_mac(node.mac),
-                    "public_key": _canonical_public_key_input(
-                        node.public_key
-                    ),
-                    "short_name": self._normalized_meshtastic_name(
-                        node.short_name
-                    ),
-                    "long_name": self._normalized_meshtastic_name(
-                        node.long_name
-                    ),
+                    "public_key": _canonical_public_key_input(node.public_key),
+                    "short_name": self._normalized_meshtastic_name(node.short_name),
+                    "long_name": self._normalized_meshtastic_name(node.long_name),
                 }
             ).encode()
         ).hexdigest()
@@ -1192,8 +1286,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         if (
             protocol is None
             or not isinstance(target_binding, str)
-            or re.fullmatch(r"(?:canonical|node):[0-9a-f]{64}", target_binding)
-            is None
+            or re.fullmatch(r"(?:canonical|node):[0-9a-f]{64}", target_binding) is None
         ):
             raise HomeAssistantError(_STALE_MESSAGE_TARGET_ERROR)
 
@@ -1202,24 +1295,18 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             if canonical_id is None:
                 raise HomeAssistantError(_STALE_MESSAGE_TARGET_ERROR)
             if target_binding.startswith("canonical:"):
-                self._validate_meshtastic_send_candidates(
-                    self._meshtastic_nodes_for_id(canonical_id)
-                )
+                self._validate_meshtastic_send_candidates(self._meshtastic_nodes_for_id(canonical_id))
                 resolved = _ResolvedMessageTarget(
                     canonical_id,
                     PROTOCOL_MESHTASTIC,
-                    self._canonical_target_binding(
-                        canonical_id, PROTOCOL_MESHTASTIC
-                    ),
+                    self._canonical_target_binding(canonical_id, PROTOCOL_MESHTASTIC),
                 )
             else:
                 matches = self._meshtastic_nodes_for_id(canonical_id)
                 self._validate_meshtastic_send_candidates(matches)
                 if not matches:
                     raise HomeAssistantError(_STALE_MESSAGE_TARGET_ERROR)
-                resolved = self._resolved_node_target(
-                    matches[0].node_key, matches[0]
-                )
+                resolved = self._resolved_node_target(matches[0].node_key, matches[0])
         else:
             if target_binding.startswith("canonical:"):
                 raise HomeAssistantError(_STALE_MESSAGE_TARGET_ERROR)
@@ -1229,9 +1316,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             raise HomeAssistantError(_STALE_MESSAGE_TARGET_ERROR)
         return resolved
 
-    def _message_nodes_matching_mac(
-        self, canonical_mac: str
-    ) -> list[tuple[str, NodeState]]:
+    def _message_nodes_matching_mac(self, canonical_mac: str) -> list[tuple[str, NodeState]]:
         """Return every node matching one strict MAC identity."""
         return [
             (node_key, candidate)
@@ -1240,15 +1325,12 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             and canonical_meshtastic_mac(candidate.mac) == canonical_mac
         ]
 
-    def _message_nodes_matching_public_key(
-        self, canonical_public_key: str
-    ) -> list[tuple[str, NodeState]]:
+    def _message_nodes_matching_public_key(self, canonical_public_key: str) -> list[tuple[str, NodeState]]:
         """Return every node matching one strict public-key identity."""
         return [
             (node_key, candidate)
             for node_key, candidate in self.snapshot.nodes.items()
-            if _canonical_public_key_input(candidate.public_key)
-            == canonical_public_key
+            if _canonical_public_key_input(candidate.public_key) == canonical_public_key
         ]
 
     def _meshtastic_send_target(self, node: NodeState) -> str:
@@ -1258,9 +1340,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         canonical_id = canonical_meshtastic_node_id(node.node_id)
         if canonical_id is None:
             raise HomeAssistantError(_INVALID_MESSAGE_IDENTITY_ERROR)
-        self._validate_meshtastic_send_candidates(
-            self._meshtastic_nodes_for_id(canonical_id)
-        )
+        self._validate_meshtastic_send_candidates(self._meshtastic_nodes_for_id(canonical_id))
         return canonical_id
 
     @staticmethod
@@ -1271,8 +1351,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         """Keep provider-specific fallback resolution outside the send boundary."""
         if (
             gateway is not None
-            and _known_protocol(gateway.config.protocol)
-            == PROTOCOL_MESHTASTIC
+            and _known_protocol(gateway.config.protocol) == PROTOCOL_MESHTASTIC
             and target_node is not None
         ):
             canonical_id = canonical_meshtastic_node_id(target_node)
@@ -1305,13 +1384,9 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         """Reject ambiguous or malformed known Meshtastic destinations."""
         if len(candidates) > 1:
             raise HomeAssistantError(_AMBIGUOUS_MESSAGE_ERROR)
-        if candidates and not meshtastic_identity_is_valid(
-            candidates[0].node_key, candidates[0]
-        ):
+        if candidates and not meshtastic_identity_is_valid(candidates[0].node_key, candidates[0]):
             raise HomeAssistantError(_INVALID_MESSAGE_IDENTITY_ERROR)
-        if candidates and candidates[0].node_key in meshtastic_unsafe_identity_keys(
-            self.snapshot.nodes
-        ):
+        if candidates and candidates[0].node_key in meshtastic_unsafe_identity_keys(self.snapshot.nodes):
             raise HomeAssistantError(_AMBIGUOUS_MESSAGE_ERROR)
 
     @staticmethod
@@ -1356,15 +1431,13 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         target_protocol: str | None,
         target_binding: str | None,
         gateway_generation: int,
-    ) -> str:
+    ) -> dict[str, Any]:
         """Persist and deliver one direct-send record."""
         queued_protocol = target_protocol
         if queued_protocol is None and gateway_id:
             configured_gateway = self.gateways.get(gateway_id)
             if configured_gateway is not None:
-                queued_protocol = _known_protocol(
-                    configured_gateway.config.protocol
-                )
+                queued_protocol = _known_protocol(configured_gateway.config.protocol)
         raw: dict[str, Any] = {
             "status": "queued",
             "target_node": target_node,
@@ -1374,12 +1447,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             raw["target_binding"] = target_binding
         record = MessageRecord(
             message_id=message_id,
-            protocol=(
-                _known_protocol(gateway.config.protocol)
-                if gateway
-                else queued_protocol
-            )
-            or "unknown",
+            protocol=(_known_protocol(gateway.config.protocol) if gateway else queued_protocol) or "unknown",
             gateway_id=gateway.config.gateway_id if gateway else gateway_id or "queued",
             sender="homeassistant",
             receiver=target_node,
@@ -1392,40 +1460,43 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         )
         await self.store.async_add_message(record)
         if not self._gateway_callback_is_current(gateway_generation):
-            return message_id
+            return message_submission_response(message_id, "queued")
         if gateway is None:
             self.snapshot.recent_messages = await self.store.async_recent_messages(100)
             if not self._gateway_callback_is_current(gateway_generation):
-                return message_id
+                return message_submission_response(message_id, "queued")
             self.async_set_updated_data(self.snapshot)
-            return message_id
+            self._fire_event(
+                EVENT_MESSAGE_STATUS,
+                _message_status_event(record, "queued", retryable=True),
+            )
+            return message_submission_response(message_id, "queued")
 
         await self.tx_limiter.acquire()
         if not self._gateway_callback_is_current(gateway_generation):
-            return message_id
+            return message_submission_response(message_id, "queued")
         try:
             # Identity may change while persistence or the limiter yields.
             # Revalidate immediately before entering the provider coroutine.
-            resolved = self._revalidate_bound_target(
-                target_node, target_protocol, target_binding
-            )
-            target_protocol = self._enforce_target_protocol(
-                target_protocol, resolved.protocol
-            )
-            target_protocol = self._enforce_target_protocol(
-                target_protocol, gateway.config.protocol
-            )
+            resolved = self._revalidate_bound_target(target_node, target_protocol, target_binding)
+            target_protocol = self._enforce_target_protocol(target_protocol, resolved.protocol)
+            target_protocol = self._enforce_target_protocol(target_protocol, gateway.config.protocol)
             target_node = resolved.value
-            target_node = self._validated_gateway_message_target(
-                gateway, target_node
-            )
+            target_node = self._validated_gateway_message_target(gateway, target_node)
         except HomeAssistantError:
             self._block_unsafe_message(record)
             await self.store.async_add_message(record)
+            self._fire_event(
+                EVENT_MESSAGE_STATUS,
+                _message_status_event(
+                    record,
+                    "blocked",
+                    retryable=False,
+                    error_code=_UNSAFE_MESSAGE_IDENTITY_ERROR_CODE,
+                ),
+            )
             if self._gateway_callback_is_current(gateway_generation):
-                self.snapshot.recent_messages = (
-                    await self.store.async_recent_messages(100)
-                )
+                self.snapshot.recent_messages = await self.store.async_recent_messages(100)
                 if self._gateway_callback_is_current(gateway_generation):
                     self.async_set_updated_data(self.snapshot)
             raise
@@ -1439,7 +1510,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             )
         except Exception as err:
             if not self._gateway_callback_is_current(gateway_generation):
-                return message_id
+                return message_submission_response(message_id, "queued")
             record.raw["status"] = "queued"
             record.raw["last_error_code"] = "send_failed"
             record.raw.pop("last_error", None)
@@ -1450,10 +1521,17 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             if not self._gateway_callback_is_current(gateway_generation):
                 return message_id
             self.async_set_updated_data(self.snapshot)
-            self._create_issue(
-                issue_id=self._gateway_issue_id(
-                    "send_failed", gateway.config.gateway_id
+            self._fire_event(
+                EVENT_MESSAGE_STATUS,
+                _message_status_event(
+                    record,
+                    "failed",
+                    retryable=True,
+                    error_code="send_failed",
                 ),
+            )
+            self._create_issue(
+                issue_id=self._gateway_issue_id("send_failed", gateway.config.gateway_id),
                 message=(
                     "Message queued after gateway adapter "
                     f"{self._gateway_ordinal(gateway.config.gateway_id)} "
@@ -1462,20 +1540,24 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                     f"{_safe_error_type(err)})."
                 ),
             )
-            return message_id
+            return message_submission_response(message_id, "queued")
         if not self._gateway_callback_is_current(gateway_generation):
-            return message_id
+            return message_submission_response(message_id, "queued")
         record.raw["status"] = "sent"
         record.raw["provider_id"] = provider_id
         await self.store.async_add_message(record)
         if not self._gateway_callback_is_current(gateway_generation):
-            return message_id
-        self.hass.bus.async_fire(EVENT_MESSAGE_SENT, message_api_dict(record))
+            return message_submission_response(message_id, "sent")
+        self._fire_event(EVENT_MESSAGE_SENT, message_api_dict(record))
+        self._fire_event(
+            EVENT_MESSAGE_STATUS,
+            _message_status_event(record, "sent", retryable=False),
+        )
         self.snapshot.recent_messages = await self.store.async_recent_messages(100)
         if not self._gateway_callback_is_current(gateway_generation):
             return message_id
         self.async_set_updated_data(self.snapshot)
-        return message_id
+        return message_submission_response(message_id, "sent")
 
     async def async_gateway_refresh(self, gateway_id: str | None = None) -> None:
         """Refresh one or all gateways."""
@@ -1490,9 +1572,203 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         for gateway in gateways:
             await gateway.async_refresh()
 
-    async def async_gateway_settings_get(
-        self, gateway_id: str | None = None
+    async def async_manual_traceroute(
+        self,
+        *,
+        gateway_id: str,
+        target_node: str,
     ) -> dict[str, Any]:
+        """Own one manual traceroute for bounded reload/unload cancellation."""
+        if (
+            not getattr(self, "_radio_operations_accepting", True)
+            or getattr(self, "_shutting_down", False)
+            or getattr(self, "_reconnect_suspended", False)
+        ):
+            raise HomeAssistantError(
+                "Manual radio operations are temporarily unavailable"
+            )
+        task = asyncio.current_task()
+        tasks = getattr(self, "_traceroute_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._traceroute_tasks = tasks
+        if task is not None:
+            tasks.add(task)
+        try:
+            if (
+                not getattr(self, "_radio_operations_accepting", True)
+                or getattr(self, "_shutting_down", False)
+                or getattr(self, "_reconnect_suspended", False)
+            ):
+                raise HomeAssistantError(
+                    "Manual radio operations are temporarily unavailable"
+                )
+            return await self._async_manual_traceroute(
+                gateway_id=gateway_id,
+                target_node=target_node,
+            )
+        finally:
+            if task is not None:
+                tasks.discard(task)
+
+    async def _async_manual_traceroute(
+        self,
+        *,
+        gateway_id: str,
+        target_node: str,
+    ) -> dict[str, Any]:
+        """Run one explicit, cooldown-protected BLE unicast traceroute."""
+        if not isinstance(gateway_id, str) or not gateway_id or len(gateway_id) > 128:
+            raise HomeAssistantError("Invalid MeshNet gateway ID")
+        gateway = self.gateways.get(gateway_id)
+        if gateway is None:
+            raise HomeAssistantError("Unknown MeshNet gateway")
+        if (
+            _known_protocol(gateway.config.protocol) != PROTOCOL_MESHTASTIC
+            or gateway.config.transport != TRANSPORT_BLUETOOTH
+        ):
+            raise HomeAssistantError("Manual traceroute requires a Meshtastic Bluetooth gateway")
+        if not gateway.status.connected:
+            raise HomeAssistantError("The selected gateway is not connected")
+        if not isinstance(target_node, str) or target_node != target_node.strip() or len(target_node) > 128:
+            raise HomeAssistantError("Select one exact known node")
+        node = self.snapshot.nodes.get(target_node)
+        if node is None or node.node_key != target_node:
+            raise HomeAssistantError("Select one exact known node")
+        if _known_protocol(node.protocol) != PROTOCOL_MESHTASTIC:
+            raise HomeAssistantError("Select one Meshtastic node")
+        provider_target = canonical_meshtastic_node_id(node.node_id)
+        if provider_target is None or target_node != f"meshtastic:{provider_target}":
+            raise HomeAssistantError("The selected node identity is invalid")
+        local_node_id = canonical_meshtastic_node_id(getattr(gateway, "local_node_id", None))
+        if local_node_id is not None and provider_target == local_node_id:
+            raise HomeAssistantError("A gateway cannot traceroute itself")
+
+        reservation = await self.store.async_reserve_traceroute(
+            gateway_id,
+            target_node,
+            cooldown_seconds=_TRACEROUTE_COOLDOWN_SECONDS,
+        )
+        reserved = (
+            reservation
+            if isinstance(reservation, bool)
+            else isinstance(reservation, Mapping)
+            and (reservation.get("reserved") is True or reservation.get("status") == "reserved")
+        )
+        if not reserved:
+            raise HomeAssistantError(
+                "MeshNet permits at most one manual traceroute each hour"
+            )
+
+        try:
+            provider_result = await gateway.async_manual_traceroute(provider_target)
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            category = _diagnostic_error_category(str(err))
+            raise HomeAssistantError(f"Manual traceroute failed ({category})") from None
+
+        if (
+            not getattr(self, "_radio_operations_accepting", True)
+            or getattr(self, "_shutting_down", False)
+            or getattr(self, "_reconnect_suspended", False)
+        ):
+            raise HomeAssistantError(
+                "Manual traceroute result was discarded because the integration "
+                "lifecycle changed"
+            )
+
+        result = self._validated_manual_traceroute_result(
+            provider_result,
+            gateway_id=gateway_id,
+            target_node=target_node,
+            provider_target=provider_target,
+            local_node_id=local_node_id,
+        )
+        await self.store.async_store_traceroute_result(gateway_id, target_node, result)
+        status_getter = getattr(self.store, "async_get_traceroute_status", None)
+        status = await status_getter(gateway_id, target_node) if callable(status_getter) else None
+        if isinstance(status, Mapping):
+            next_allowed_at = status.get("next_allowed_at")
+            if isinstance(next_allowed_at, str):
+                result["next_allowed_at"] = next_allowed_at
+        return result
+
+    @staticmethod
+    def _validated_manual_traceroute_result(
+        provider_result: Any,
+        *,
+        gateway_id: str,
+        target_node: str,
+        provider_target: str,
+        local_node_id: str | None,
+    ) -> dict[str, Any]:
+        """Validate and bound a correlated provider traceroute response."""
+        if not isinstance(provider_result, Mapping):
+            raise HomeAssistantError("The traceroute response was invalid")
+        correlation_id = provider_result.get("correlation_id")
+        source = canonical_meshtastic_node_id(provider_result.get("source"))
+        destination = canonical_meshtastic_node_id(provider_result.get("destination"))
+        if (
+            not isinstance(correlation_id, str)
+            or not 1 <= len(correlation_id) <= 128
+            or destination != provider_target
+            or source is None
+            or (local_node_id is not None and source != local_node_id)
+        ):
+            raise HomeAssistantError("The traceroute response was invalid")
+        channel = provider_result.get("channel")
+        if isinstance(channel, bool) or not isinstance(channel, int):
+            raise HomeAssistantError("The traceroute response was invalid")
+        if not 0 <= channel <= 7:
+            raise HomeAssistantError("The traceroute response was invalid")
+
+        output: dict[str, Any] = {
+            "schema_version": 1,
+            "gateway_id": gateway_id,
+            "correlation_id": correlation_id,
+            "source": f"meshtastic:{source}",
+            "destination": target_node,
+            "channel": channel,
+            "status": "complete",
+            "completed_at": timestamp_to_json(utcnow()),
+        }
+        for provider_key, public_key in (
+            ("forward_route", "forward_route"),
+            ("reverse_route", "reverse_route"),
+        ):
+            raw_route = provider_result.get(provider_key)
+            if raw_route is None:
+                continue
+            if not isinstance(raw_route, (list, tuple)) or len(raw_route) > 64:
+                raise HomeAssistantError("The traceroute response was invalid")
+            route: list[str] = []
+            for item in raw_route:
+                route_node = canonical_meshtastic_node_id(item)
+                if route_node is None:
+                    raise HomeAssistantError("The traceroute response was invalid")
+                route.append(f"meshtastic:{route_node}")
+            output[public_key] = route
+        for provider_key in ("snr_towards", "snr_back"):
+            raw_snr = provider_result.get(provider_key)
+            if raw_snr is None:
+                continue
+            if not isinstance(raw_snr, (list, tuple)) or len(raw_snr) > 64:
+                raise HomeAssistantError("The traceroute response was invalid")
+            snr_values: list[float] = []
+            for item in raw_snr:
+                if (
+                    isinstance(item, bool)
+                    or not isinstance(item, (int, float))
+                    or not math.isfinite(float(item))
+                    or not -128 <= float(item) <= 128
+                ):
+                    raise HomeAssistantError("The traceroute response was invalid")
+                snr_values.append(float(item))
+            output[provider_key] = snr_values
+        return output
+
+    async def async_gateway_settings_get(self, gateway_id: str | None = None) -> dict[str, Any]:
         """Read one local gateway's bounded, privacy-safe settings schema."""
         return await self.gateway_settings.async_get(gateway_id)
 
@@ -1526,6 +1802,44 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             confirm_critical=confirm_critical,
         )
 
+    async def async_remote_settings_get(self, *, gateway_id: str, target_node: str) -> dict[str, Any]:
+        """Read the reviewed settings projection for one exact remote node."""
+        return await self.remote_admin.async_get(gateway_id, target_node)
+
+    async def async_remote_settings_preview(
+        self,
+        *,
+        gateway_id: str,
+        target_node: str,
+        revision: str,
+        changes: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Retain one short-lived, value-redacted remote write preview."""
+        return await self.remote_admin.async_preview(
+            gateway_id,
+            target_node,
+            revision,
+            changes,
+        )
+
+    async def async_remote_settings_apply(
+        self,
+        *,
+        gateway_id: str,
+        target_node: str,
+        revision: str,
+        preview_id: str,
+        confirm_remote: bool,
+    ) -> dict[str, Any]:
+        """Consume and apply one explicitly confirmed remote write preview."""
+        return await self.remote_admin.async_apply(
+            gateway_id,
+            target_node,
+            revision,
+            preview_id,
+            confirm_remote=confirm_remote,
+        )
+
     async def async_persist_gateway_connection_updates(
         self,
         gateway_id: str,
@@ -1536,9 +1850,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         if lock is None:
             lock = self._connection_update_lock = asyncio.Lock()
         async with lock:
-            await self._async_persist_gateway_connection_updates(
-                gateway_id, updates
-            )
+            await self._async_persist_gateway_connection_updates(gateway_id, updates)
 
     async def _async_persist_gateway_connection_updates(
         self,
@@ -1564,10 +1876,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             raise ValueError("Invalid gateway connection update")
 
         gateway = self.gateways.get(gateway_id)
-        if (
-            gateway is None
-            or gateway.config.protocol != PROTOCOL_MESHCORE
-        ):
+        if gateway is None or gateway.config.protocol != PROTOCOL_MESHCORE:
             raise ValueError("Unsupported gateway connection update")
 
         source_gateways = (
@@ -1578,11 +1887,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         if not isinstance(source_gateways, list):
             raise ValueError("Invalid gateway configuration")
         gateways = deepcopy(source_gateways)
-        matches = [
-            item
-            for item in gateways
-            if isinstance(item, dict) and item.get("gateway_id") == gateway_id
-        ]
+        matches = [item for item in gateways if isinstance(item, dict) and item.get("gateway_id") == gateway_id]
         if len(matches) != 1:
             raise ValueError("Gateway configuration was not found")
         gateway_data = matches[0]
@@ -1605,9 +1910,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         waiter = asyncio.get_running_loop().create_future()
         self._connection_update_reload_waiter = waiter
         try:
-            changed = self.hass.config_entries.async_update_entry(
-                self.entry, options=entry_options
-            )
+            changed = self.hass.config_entries.async_update_entry(self.entry, options=entry_options)
         except BaseException:
             self._clear_connection_update_reload(waiter)
             raise
@@ -1624,9 +1927,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                 self._clear_connection_update_reload(waiter)
                 raise
             if acknowledged is not True:
-                raise ValueError(
-                    "Gateway connection update was superseded before acknowledgement"
-                )
+                raise ValueError("Gateway connection update was superseded before acknowledgement")
 
         # Keep this running session coherent because the matching internal
         # update listener is intentionally suppressed.
@@ -1635,9 +1936,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         else:
             gateway.config.options["pin"] = pin
 
-    def consume_connection_update_reload(
-        self, options: Mapping[str, Any]
-    ) -> bool:
+    def consume_connection_update_reload(self, options: Mapping[str, Any]) -> bool:
         """Consume the next expected internal connection-options update.
 
         The marker is discarded on every listener invocation, including a
@@ -1654,9 +1953,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             waiter.set_result(matched)
         return matched
 
-    def _clear_connection_update_reload(
-        self, waiter: asyncio.Future[bool]
-    ) -> None:
+    def _clear_connection_update_reload(self, waiter: asyncio.Future[bool]) -> None:
         """Clear one marker only if it still owns the listener handshake."""
         if getattr(self, "_connection_update_reload_waiter", None) is not waiter:
             return
@@ -1672,9 +1969,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         gateway_diagnostics: list[dict[str, Any]] = []
         for index, (_gateway_id, gateway) in enumerate(gateway_items, start=1):
             status = gateway.status
-            error_categories = Counter(
-                _diagnostic_error_category(error) for error in status.errors
-            )
+            error_categories = Counter(_diagnostic_error_category(error) for error in status.errors)
             client_snapshot = getattr(gateway, "diagnostic_snapshot", None)
             try:
                 client = client_snapshot() if callable(client_snapshot) else {}
@@ -1711,34 +2006,17 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                     "configured": {
                         "host_configured": bool(getattr(config, "host", None)),
                         "port": getattr(config, "port", None),
-                        "serial_endpoint_configured": bool(
-                            getattr(config, "serial_path", None)
-                        ),
-                        "bluetooth_endpoint_configured": bool(
-                            getattr(config, "ble_address", None)
-                        ),
-                        "mqtt_subscription_configured": bool(
-                            getattr(config, "mqtt_topic", None)
-                        ),
-                        "rest_endpoint_configured": bool(
-                            getattr(config, "api_url", None)
-                        ),
-                        "api_key_configured": bool(
-                            getattr(config, "api_key", None)
-                        ),
-                        "publish_endpoint_configured": bool(
-                            options.get("publish_topic")
-                        ),
-                        "custom_send_endpoint_configured": bool(
-                            options.get("send_url")
-                        ),
+                        "serial_endpoint_configured": bool(getattr(config, "serial_path", None)),
+                        "bluetooth_endpoint_configured": bool(getattr(config, "ble_address", None)),
+                        "mqtt_subscription_configured": bool(getattr(config, "mqtt_topic", None)),
+                        "rest_endpoint_configured": bool(getattr(config, "api_url", None)),
+                        "api_key_configured": bool(getattr(config, "api_key", None)),
+                        "publish_endpoint_configured": bool(options.get("publish_topic")),
+                        "custom_send_endpoint_configured": bool(options.get("send_url")),
                         "bluetooth_adapter_metadata_configured": bool(
-                            options.get("bluetooth_adapter")
-                            and options.get("bluetooth_adapter_address")
+                            options.get("bluetooth_adapter") and options.get("bluetooth_adapter_address")
                         ),
-                        "bluetooth_bond_managed": bool(
-                            options.get("bluetooth_bond_managed")
-                        ),
+                        "bluetooth_bond_managed": bool(options.get("bluetooth_bond_managed")),
                         "debug": bool(options.get("debug")),
                         **numeric_options,
                     },
@@ -1748,12 +2026,8 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
 
         reconnect_tasks = getattr(self, "_reconnect_tasks", {})
         send_tasks = getattr(self, "_send_tasks", set())
-        reconnect_states = Counter(
-            _diagnostic_task_state(task) for task in reconnect_tasks.values()
-        )
-        send_states = Counter(
-            _diagnostic_task_state(task) for task in send_tasks
-        )
+        reconnect_states = Counter(_diagnostic_task_state(task) for task in reconnect_tasks.values())
+        send_states = Counter(_diagnostic_task_state(task) for task in send_tasks)
         update_interval = getattr(self, "update_interval", None)
         last_update_attempt_time = getattr(self, "_last_update_attempt_at", None)
         last_update_success_time = getattr(self, "_last_update_success_at", None)
@@ -1776,32 +2050,21 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
 
         gateway_configs = getattr(self, "_gateway_configs", [])
         protocol_counts = Counter(node.protocol for node in nodes)
-        role_counts = Counter(
-            safe_node_metadata(node.role, "role") or "redacted_or_unknown"
-            for node in nodes
-        )
+        role_counts = Counter(safe_node_metadata(node.role, "role") or "redacted_or_unknown" for node in nodes)
         hardware_counts = Counter(
-            safe_node_metadata(node.hardware_model, "hardware_model")
-            or "redacted_or_unknown"
-            for node in nodes
+            safe_node_metadata(node.hardware_model, "hardware_model") or "redacted_or_unknown" for node in nodes
         )
         firmware_counts = Counter(
-            safe_node_metadata(node.firmware_version, "firmware_version")
-            or "redacted_or_unknown"
-            for node in nodes
+            safe_node_metadata(node.firmware_version, "firmware_version") or "redacted_or_unknown" for node in nodes
         )
         radio_type_counts = Counter(
-            safe_node_metadata(node.radio_type, "radio_type")
-            or "redacted_or_unknown"
-            for node in nodes
+            safe_node_metadata(node.radio_type, "radio_type") or "redacted_or_unknown" for node in nodes
         )
         gateway_reachability = Counter(str(len(node.gateway_ids)) for node in nodes)
         last_heard_values = [node.last_heard for node in nodes if node.last_heard]
         settings_manager = getattr(self, "gateway_settings", None)
         settings_diagnostics = (
-            settings_manager.diagnostic_snapshot()
-            if settings_manager is not None
-            else {"available": False}
+            settings_manager.diagnostic_snapshot() if settings_manager is not None else {"available": False}
         )
 
         return {
@@ -1809,57 +2072,30 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                 "node_timeout": self.node_timeout,
                 "history_days": self.history_days,
                 "gateway_count": len(self.gateways),
-                "protocol_counts": dict(
-                    sorted(
-                        Counter(config.protocol for config in gateway_configs).items()
-                    )
-                ),
-                "transport_counts": dict(
-                    sorted(
-                        Counter(config.transport for config in gateway_configs).items()
-                    )
-                ),
+                "protocol_counts": dict(sorted(Counter(config.protocol for config in gateway_configs).items())),
+                "transport_counts": dict(sorted(Counter(config.transport for config in gateway_configs).items())),
             },
             "lifecycle": {
                 "shutting_down": getattr(self, "_shutting_down", False),
-                "reconnect_suspended": getattr(
-                    self, "_reconnect_suspended", False
-                ),
+                "reconnect_suspended": getattr(self, "_reconnect_suspended", False),
                 "gateway_generation": getattr(self, "_gateway_generation", 0),
                 "last_update_success": getattr(self, "last_update_success", None),
-                "last_update_attempt_time": timestamp_to_json(
-                    last_update_attempt_time
-                ),
+                "last_update_attempt_time": timestamp_to_json(last_update_attempt_time),
                 "last_update_success_time": timestamp_to_json(last_update_success_time),
-                "last_update_duration_seconds": getattr(
-                    self, "_last_update_duration_seconds", None
-                ),
-                "last_update_error_category": getattr(
-                    self, "_last_update_error_category", None
-                ),
-                "update_interval_seconds": (
-                    update_interval.total_seconds() if update_interval else None
-                ),
+                "last_update_duration_seconds": getattr(self, "_last_update_duration_seconds", None),
+                "last_update_error_category": getattr(self, "_last_update_error_category", None),
+                "update_interval_seconds": (update_interval.total_seconds() if update_interval else None),
                 "coordinator_data_available": getattr(self, "data", None) is not None,
             },
             "tasks": {
-                "gateway_startup": _diagnostic_task_state(
-                    getattr(self, "_gateway_startup_task", None)
-                ),
+                "gateway_startup": _diagnostic_task_state(getattr(self, "_gateway_startup_task", None)),
                 "reconnect_count": len(reconnect_tasks),
                 "reconnect_states": dict(sorted(reconnect_states.items())),
-                "outbox_flush": _diagnostic_task_state(
-                    getattr(self, "_outbox_flush_owner", None)
-                ),
-                "outbox_lock_held": bool(
-                    getattr(self, "_outbox_lock", None)
-                    and self._outbox_lock.locked()
-                ),
+                "outbox_flush": _diagnostic_task_state(getattr(self, "_outbox_flush_owner", None)),
+                "outbox_lock_held": bool(getattr(self, "_outbox_lock", None) and self._outbox_lock.locked()),
                 "send_count": len(send_tasks),
                 "send_states": dict(sorted(send_states.items())),
-                "active_send_count": len(
-                    getattr(self, "_active_send_message_ids", set())
-                ),
+                "active_send_count": len(getattr(self, "_active_send_message_ids", set())),
             },
             "gateways": gateway_diagnostics,
             "dedupe": self.deduplicator.stats(),
@@ -1887,15 +2123,9 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                 "hardware_model_counts": dict(sorted(hardware_counts.items())),
                 "firmware_version_counts": dict(sorted(firmware_counts.items())),
                 "radio_type_counts": dict(sorted(radio_type_counts.items())),
-                "gateway_reachability_counts": dict(
-                    sorted(gateway_reachability.items())
-                ),
-                "oldest_last_heard": timestamp_to_json(
-                    min(last_heard_values) if last_heard_values else None
-                ),
-                "newest_last_heard": timestamp_to_json(
-                    max(last_heard_values) if last_heard_values else None
-                ),
+                "gateway_reachability_counts": dict(sorted(gateway_reachability.items())),
+                "oldest_last_heard": timestamp_to_json(min(last_heard_values) if last_heard_values else None),
+                "newest_last_heard": timestamp_to_json(max(last_heard_values) if last_heard_values else None),
             },
             "node_observability": self.node_observability_diagnostics(),
             "panel": self.panel_telemetry.snapshot(),
@@ -1908,20 +2138,14 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         """Return whether a live gateway callback observed this node."""
         if node_key in getattr(self, "_session_observed_node_keys", set()):
             return True
-        return node_key in getattr(
-            self, "_effective_observed_node_keys", set()
-        )
+        return node_key in getattr(self, "_effective_observed_node_keys", set())
 
     def node_alias_keys(self, node_key: str) -> tuple[str, ...]:
         """Return retained raw aliases for one effective node key."""
-        aliases = getattr(self, "_node_aliases_by_effective", {}).get(
-            node_key
-        )
+        aliases = getattr(self, "_node_aliases_by_effective", {}).get(node_key)
         return aliases or (node_key,)
 
-    def node_observability_diagnostics(
-        self, *, now: datetime | None = None
-    ) -> dict[str, Any]:
+    def node_observability_diagnostics(self, *, now: datetime | None = None) -> dict[str, Any]:
         """Return passive node provenance diagnostics without identity values."""
         stored_total = len(self.snapshot.nodes)
         nodes = list(islice(self.snapshot.nodes.values(), MAX_PANEL_NODES))
@@ -1943,9 +2167,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                 "analysis_truncated": stored_total > analyzed,
             }
         )
-        identity_stats = dict(
-            getattr(self, "_node_identity_stats", {})
-        )
+        identity_stats = dict(getattr(self, "_node_identity_stats", {}))
         if not identity_stats:
             identity_stats = {
                 "raw_record_count": stored_total,
@@ -1953,12 +2175,8 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                 "collapsed_alias_record_count": 0,
                 "candidate_identity_group_count": 0,
                 "resolved_identity_group_count": 0,
-                "unresolved_identity_group_count": result[
-                    "identity_alias_collisions"
-                ]["group_count"],
-                "unresolved_identity_record_count": result[
-                    "identity_alias_collisions"
-                ]["node_count"],
+                "unresolved_identity_group_count": result["identity_alias_collisions"]["group_count"],
+                "unresolved_identity_record_count": result["identity_alias_collisions"]["node_count"],
                 "invalid_identity_record_count": 0,
             }
         result["identity_projection"] = identity_stats
@@ -1972,48 +2190,31 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         identity_projection = observability["identity_projection"]
         return {
             "total_node_count": node_counts["stored_total"],
-            "retained_node_record_count": identity_projection[
-                "raw_record_count"
-            ],
-            "collapsed_alias_record_count": identity_projection[
-                "collapsed_alias_record_count"
-            ],
-            "resolved_identity_group_count": identity_projection[
-                "resolved_identity_group_count"
-            ],
-            "unresolved_identity_group_count": identity_projection[
-                "unresolved_identity_group_count"
-            ],
-            "unresolved_identity_node_count": identity_projection[
-                "unresolved_identity_record_count"
-            ],
-            "invalid_identity_record_count": identity_projection[
-                "invalid_identity_record_count"
-            ],
+            "retained_node_record_count": identity_projection["raw_record_count"],
+            "collapsed_alias_record_count": identity_projection["collapsed_alias_record_count"],
+            "resolved_identity_group_count": identity_projection["resolved_identity_group_count"],
+            "unresolved_identity_group_count": identity_projection["unresolved_identity_group_count"],
+            "unresolved_identity_node_count": identity_projection["unresolved_identity_record_count"],
+            "invalid_identity_record_count": identity_projection["invalid_identity_record_count"],
             "analyzed_node_count": node_counts["analyzed"],
             "omitted_node_count": node_counts["analysis_omitted"],
-            "current_session_node_count": node_counts[
-                "observed_this_session"
-            ],
+            "current_session_node_count": node_counts["observed_this_session"],
             "cached_only_node_count": node_counts["cached_only"],
             "online_node_count": node_counts["online"],
             "located_node_count": node_counts["located"],
             "located_offline_node_count": node_counts["located_offline"],
             "mqtt_node_count": via_mqtt_counts["true"],
             "mqtt_unknown_node_count": via_mqtt_counts["unknown"],
-            "identity_collision_group_count": identity_projection[
-                "unresolved_identity_group_count"
-            ],
-            "identity_collision_node_count": identity_projection[
-                "unresolved_identity_record_count"
-            ],
+            "identity_collision_group_count": identity_projection["unresolved_identity_group_count"],
+            "identity_collision_node_count": identity_projection["unresolved_identity_record_count"],
         }
 
-    async def _handle_packet(
-        self, packet: MeshPacket, *, gateway_generation: int | None = None
-    ) -> None:
+    async def _handle_packet(self, packet: MeshPacket, *, gateway_generation: int | None = None) -> None:
         if not self._gateway_callback_is_current(gateway_generation):
             return
+        if _packet_port_is_private(packet):
+            return
+        packet.text = _safe_inbound_text(packet.text)
         gateway = self.gateways.get(packet.gateway_id)
         if self.deduplicator.is_duplicate(packet):
             if gateway:
@@ -2022,7 +2223,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         await self.store.async_add_packet(packet)
         if not self._gateway_callback_is_current(gateway_generation):
             return
-        self.hass.bus.async_fire(EVENT_PACKET, packet.as_dict())
+        self._fire_event(EVENT_PACKET, _packet_event_dict(packet))
         if packet.text:
             record = MessageRecord(
                 message_id=packet.fingerprint(),
@@ -2035,7 +2236,14 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                 encrypted=packet.encrypted,
                 hops=packet.hops,
                 timestamp=packet.timestamp,
-                raw=packet.raw,
+                message_type=(
+                    MESSAGE_TYPE_DIRECT
+                    if _known_protocol(packet.protocol) == PROTOCOL_MESHCORE
+                    and str(packet.portnum or "").strip().casefold()
+                    == "contact_message"
+                    else MESSAGE_TYPE_BROADCAST
+                ),
+                raw={},
             )
             await self.store.async_add_message(record)
             if not self._gateway_callback_is_current(gateway_generation):
@@ -2043,23 +2251,17 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             self.snapshot.recent_messages = await self.store.async_recent_messages(100)
             if not self._gateway_callback_is_current(gateway_generation):
                 return
-            self.hass.bus.async_fire(
-                EVENT_MESSAGE_RECEIVED, message_api_dict(record)
-            )
+            self._fire_event(EVENT_MESSAGE_RECEIVED, _message_received_event(record))
         self.async_set_updated_data(self.snapshot)
 
-    async def _handle_node(
-        self, node: NodeState, *, gateway_generation: int | None = None
-    ) -> None:
+    async def _handle_node(self, node: NodeState, *, gateway_generation: int | None = None) -> None:
         if not self._gateway_callback_is_current(gateway_generation):
             return
         node_update_lock = getattr(self, "_node_update_lock", None)
         if node_update_lock is None:
             node_update_lock = self._node_update_lock = asyncio.Lock()
         async with node_update_lock:
-            observed_node_keys = getattr(
-                self, "_session_observed_node_keys", None
-            )
+            observed_node_keys = getattr(self, "_session_observed_node_keys", None)
             if observed_node_keys is None:
                 observed_node_keys = self._session_observed_node_keys = set()
             observed_node_keys.add(node.node_key)
@@ -2067,27 +2269,16 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             if raw_nodes is None:
                 raw_nodes = self._raw_nodes = dict(self.snapshot.nodes)
             existing = raw_nodes.get(node.node_key)
-            identity_before = (
-                self._node_identity_signature(existing)
-                if existing is not None
-                else None
-            )
+            identity_before = self._node_identity_signature(existing) if existing is not None else None
             if existing:
                 existing.merge(node)
                 node = existing
             raw_nodes[node.node_key] = node
-            identity_unchanged = (
-                identity_before is not None
-                and identity_before == self._node_identity_signature(node)
-            )
+            identity_unchanged = identity_before is not None and identity_before == self._node_identity_signature(node)
             await self.store.async_upsert_node(node)
             if not self._gateway_callback_is_current(gateway_generation):
                 return
-            self._refresh_effective_node_projection(
-                changed_raw_key=node.node_key
-                if identity_unchanged
-                else None
-            )
+            self._refresh_effective_node_projection(changed_raw_key=node.node_key if identity_unchanged else None)
         if not self._gateway_callback_is_current(gateway_generation):
             return
         self.async_set_updated_data(self.snapshot)
@@ -2103,19 +2294,26 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             node.public_key,
         )
 
-    async def _handle_gateway_status(
-        self, status: GatewayStatus, *, gateway_generation: int | None = None
-    ) -> None:
+    async def _handle_gateway_status(self, status: GatewayStatus, *, gateway_generation: int | None = None) -> None:
         if not self._gateway_callback_is_current(gateway_generation):
             return
         gateway = self.gateways.get(status.gateway_id)
         if gateway is None or gateway.status is not status:
             return
+        connected_states = getattr(self, "_gateway_connected_states", None)
+        if connected_states is None:
+            connected_states = self._gateway_connected_states = {}
+        failure_counts = getattr(self, "_gateway_failure_counts", None)
+        if failure_counts is None:
+            failure_counts = self._gateway_failure_counts = {}
+        previously_observed = status.gateway_id in connected_states
+        previous_connected = connected_states.get(status.gateway_id, bool(status.connected))
+        previous_failure_count = failure_counts.get(status.gateway_id, max(0, int(status.failure_count)))
+        failure_count = max(previous_failure_count, int(status.failure_count))
+        status.failure_count = failure_count
         self.snapshot.gateways[status.gateway_id] = status
         if status.connected:
-            self._delete_resolved_issue(
-                self._gateway_issue_id("gateway_start", status.gateway_id)
-            )
+            self._delete_resolved_issue(self._gateway_issue_id("gateway_start", status.gateway_id))
             reconnect_task = self._reconnect_tasks.get(status.gateway_id)
             if reconnect_task and reconnect_task is not asyncio.current_task():
                 reconnect_task.cancel()
@@ -2127,6 +2325,43 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                 return
         else:
             self._schedule_reconnect(status.gateway_id)
+        connectivity_changed = previously_observed and previous_connected != bool(status.connected)
+        failure_changed = previously_observed and failure_count > previous_failure_count
+        connected_states[status.gateway_id] = bool(status.connected)
+        failure_counts[status.gateway_id] = failure_count
+        if connectivity_changed or failure_changed:
+            if connectivity_changed:
+                transition = "connected" if status.connected else "disconnected"
+            else:
+                transition = "failure"
+            reason = status.last_failure_category
+            if reason not in {
+                "authentication",
+                "bluetooth",
+                "configuration",
+                "connection",
+                "data",
+                "permission",
+                "serial",
+                "timeout",
+                "other",
+            }:
+                reason = None
+            event: dict[str, Any] = {
+                "schema_version": 1,
+                "gateway_id": status.gateway_id[:128],
+                "protocol": _known_protocol(status.protocol) or "unknown",
+                "transport": str(status.transport)[:32],
+                "previous_connected": previous_connected,
+                "connected": bool(status.connected),
+                "transition": transition,
+                "failure_count": failure_count,
+                "reconnect_scheduled": not bool(status.connected),
+                "occurred_at": timestamp_to_json(utcnow()),
+            }
+            if reason is not None:
+                event["reason_category"] = reason
+            self._fire_event(EVENT_GATEWAY_STATUS, event)
         self.async_set_updated_data(self.snapshot)
 
     async def _rebuild_gateways(self) -> None:
@@ -2136,19 +2371,17 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             settings_manager.invalidate()
         gateway_generation = self._gateway_generation
         self.gateways = {}
+        self._gateway_connected_states = {}
+        self._gateway_failure_counts = {}
 
         async def handle_packet(packet: MeshPacket) -> None:
-            await self._handle_packet(
-                packet, gateway_generation=gateway_generation
-            )
+            await self._handle_packet(packet, gateway_generation=gateway_generation)
 
         async def handle_node(node: NodeState) -> None:
             await self._handle_node(node, gateway_generation=gateway_generation)
 
         async def handle_status(status: GatewayStatus) -> None:
-            await self._handle_gateway_status(
-                status, gateway_generation=gateway_generation
-            )
+            await self._handle_gateway_status(status, gateway_generation=gateway_generation)
 
         for config in self._gateway_configs:
             if config.protocol == PROTOCOL_MESHTASTIC:
@@ -2171,18 +2404,16 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                 )
             else:
                 self._create_issue(
-                    issue_id=self._gateway_issue_id(
-                        "unsupported_protocol", config.gateway_id
-                    ),
+                    issue_id=self._gateway_issue_id("unsupported_protocol", config.gateway_id),
                     message=(
-                        "Gateway adapter "
-                        f"{self._gateway_ordinal(config.gateway_id)} uses an "
-                        "unsupported protocol."
+                        f"Gateway adapter {self._gateway_ordinal(config.gateway_id)} uses an unsupported protocol."
                     ),
                 )
                 continue
             self.gateways[config.gateway_id] = gateway
             self.snapshot.gateways[config.gateway_id] = gateway.status
+            self._gateway_connected_states[config.gateway_id] = bool(gateway.status.connected)
+            self._gateway_failure_counts[config.gateway_id] = max(0, int(gateway.status.failure_count))
 
     async def _start_gateways(self) -> None:
         if not self.gateways:
@@ -2198,9 +2429,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             return_exceptions=True,
         )
         for gateway, result in zip(self.gateways.values(), results, strict=False):
-            issue_id = self._gateway_issue_id(
-                "gateway_start", gateway.config.gateway_id
-            )
+            issue_id = self._gateway_issue_id("gateway_start", gateway.config.gateway_id)
             if isinstance(result, BaseException):
                 self._create_issue(
                     issue_id=issue_id,
@@ -2261,9 +2490,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                 return None
             self._outbox_flush_owner = current_task
             try:
-                pending = await self.store.async_pending_outbox(
-                    limit=100, after=after
-                )
+                pending = await self.store.async_pending_outbox(limit=100, after=after)
                 if not self._gateway_callback_is_current(gateway_generation):
                     return
                 if not pending:
@@ -2272,9 +2499,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                 for record in pending:
                     if not self._gateway_callback_is_current(gateway_generation):
                         return
-                    if record.message_id in getattr(
-                        self, "_active_send_message_ids", set()
-                    ):
+                    if record.message_id in getattr(self, "_active_send_message_ids", set()):
                         continue
                     raw_gateway_id = record.raw.get("gateway_id")
                     persisted_gateway_id = record.gateway_id
@@ -2296,18 +2521,21 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                             message_type=record.message_type,
                             gateway_id=desired_gateway,
                         )
-                        self._validate_requested_gateway_id(
-                            envelope.gateway_id
-                        )
+                        self._validate_requested_gateway_id(envelope.gateway_id)
                     except HomeAssistantError:
-                        self._block_message(
-                            record, _INVALID_MESSAGE_ERROR_CODE
-                        )
+                        self._block_message(record, _INVALID_MESSAGE_ERROR_CODE)
                         await self.store.async_add_message(record)
-                        if not self._gateway_callback_is_current(
-                            gateway_generation
-                        ):
+                        if not self._gateway_callback_is_current(gateway_generation):
                             return
+                        self._fire_event(
+                            EVENT_MESSAGE_STATUS,
+                            _message_status_event(
+                                record,
+                                "blocked",
+                                retryable=False,
+                                error_code=_INVALID_MESSAGE_ERROR_CODE,
+                            ),
+                        )
                         updated_any = True
                         continue
                     record.receiver = envelope.target_node
@@ -2316,29 +2544,29 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                     record.message_type = envelope.message_type
                     try:
                         persisted_protocol = _known_protocol(record.protocol)
-                        if (
-                            persisted_protocol is None
-                            and str(record.protocol).casefold() != "unknown"
-                        ):
-                            raise HomeAssistantError(
-                                _MESSAGE_PROTOCOL_MISMATCH_ERROR
-                            )
+                        if persisted_protocol is None and str(record.protocol).casefold() != "unknown":
+                            raise HomeAssistantError(_MESSAGE_PROTOCOL_MISMATCH_ERROR)
                         resolved = self._revalidate_bound_target(
                             envelope.target_node,
                             persisted_protocol,
                             record.raw.get("target_binding"),
                         )
-                        target_protocol = self._enforce_target_protocol(
-                            persisted_protocol, resolved.protocol
-                        )
+                        target_protocol = self._enforce_target_protocol(persisted_protocol, resolved.protocol)
                         provider_target = resolved.value
                     except HomeAssistantError:
                         self._block_unsafe_message(record)
                         await self.store.async_add_message(record)
-                        if not self._gateway_callback_is_current(
-                            gateway_generation
-                        ):
+                        if not self._gateway_callback_is_current(gateway_generation):
                             return
+                        self._fire_event(
+                            EVENT_MESSAGE_STATUS,
+                            _message_status_event(
+                                record,
+                                "blocked",
+                                retryable=False,
+                                error_code=_UNSAFE_MESSAGE_IDENTITY_ERROR_CODE,
+                            ),
+                        )
                         updated_any = True
                         continue
                     try:
@@ -2353,32 +2581,40 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                             # a wrong-protocol gateway must leave an auto-routed
                             # record queued for a compatible radio.
                             continue
-                        self._block_message(
-                            record, _UNSAFE_MESSAGE_ROUTE_ERROR_CODE
-                        )
+                        self._block_message(record, _UNSAFE_MESSAGE_ROUTE_ERROR_CODE)
                         await self.store.async_add_message(record)
-                        if not self._gateway_callback_is_current(
-                            gateway_generation
-                        ):
+                        if not self._gateway_callback_is_current(gateway_generation):
                             return
+                        self._fire_event(
+                            EVENT_MESSAGE_STATUS,
+                            _message_status_event(
+                                record,
+                                "blocked",
+                                retryable=False,
+                                error_code=_UNSAFE_MESSAGE_ROUTE_ERROR_CODE,
+                            ),
+                        )
                         updated_any = True
                         continue
                     if gateway is None:
                         continue
                     try:
-                        target_protocol = self._enforce_target_protocol(
-                            target_protocol, gateway.config.protocol
-                        )
-                        provider_target = self._validated_gateway_message_target(
-                            gateway, provider_target
-                        )
+                        target_protocol = self._enforce_target_protocol(target_protocol, gateway.config.protocol)
+                        provider_target = self._validated_gateway_message_target(gateway, provider_target)
                     except HomeAssistantError:
                         self._block_unsafe_message(record)
                         await self.store.async_add_message(record)
-                        if not self._gateway_callback_is_current(
-                            gateway_generation
-                        ):
+                        if not self._gateway_callback_is_current(gateway_generation):
                             return
+                        self._fire_event(
+                            EVENT_MESSAGE_STATUS,
+                            _message_status_event(
+                                record,
+                                "blocked",
+                                retryable=False,
+                                error_code=_UNSAFE_MESSAGE_IDENTITY_ERROR_CODE,
+                            ),
+                        )
                         updated_any = True
                         continue
                     await self.tx_limiter.acquire()
@@ -2391,23 +2627,24 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                             target_protocol,
                             record.raw.get("target_binding"),
                         )
-                        target_protocol = self._enforce_target_protocol(
-                            target_protocol, resolved.protocol
-                        )
-                        target_protocol = self._enforce_target_protocol(
-                            target_protocol, gateway.config.protocol
-                        )
+                        target_protocol = self._enforce_target_protocol(target_protocol, resolved.protocol)
+                        target_protocol = self._enforce_target_protocol(target_protocol, gateway.config.protocol)
                         provider_target = resolved.value
-                        provider_target = self._validated_gateway_message_target(
-                            gateway, provider_target
-                        )
+                        provider_target = self._validated_gateway_message_target(gateway, provider_target)
                     except HomeAssistantError:
                         self._block_unsafe_message(record)
                         await self.store.async_add_message(record)
-                        if not self._gateway_callback_is_current(
-                            gateway_generation
-                        ):
+                        if not self._gateway_callback_is_current(gateway_generation):
                             return
+                        self._fire_event(
+                            EVENT_MESSAGE_STATUS,
+                            _message_status_event(
+                                record,
+                                "blocked",
+                                retryable=False,
+                                error_code=_UNSAFE_MESSAGE_IDENTITY_ERROR_CODE,
+                            ),
+                        )
                         updated_any = True
                         continue
                     try:
@@ -2425,6 +2662,16 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                         record.raw["last_error_code"] = "send_failed"
                         record.raw.pop("last_error", None)
                         await self.store.async_add_message(record)
+                        if self._gateway_callback_is_current(gateway_generation):
+                            self._fire_event(
+                                EVENT_MESSAGE_STATUS,
+                                _message_status_event(
+                                    record,
+                                    "failed",
+                                    retryable=True,
+                                    error_code="send_failed",
+                                ),
+                            )
                         continue
                     if not self._gateway_callback_is_current(gateway_generation):
                         return
@@ -2435,8 +2682,10 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                     await self.store.async_add_message(record)
                     if not self._gateway_callback_is_current(gateway_generation):
                         return
-                    self.hass.bus.async_fire(
-                        EVENT_MESSAGE_SENT, message_api_dict(record)
+                    self._fire_event(EVENT_MESSAGE_SENT, message_api_dict(record))
+                    self._fire_event(
+                        EVENT_MESSAGE_STATUS,
+                        _message_status_event(record, "sent", retryable=False),
                     )
                     updated_any = True
                 if updated_any:
@@ -2451,13 +2700,9 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             return None
         return (cursor_timestamp, pending[-1].message_id), len(pending) == 100
 
-    def _gateway_callback_is_current(
-        self, gateway_generation: int | None
-    ) -> bool:
+    def _gateway_callback_is_current(self, gateway_generation: int | None) -> bool:
         """Return whether provider work still belongs to the active gateways."""
-        if getattr(self, "_shutting_down", False) or getattr(
-            self, "_reconnect_suspended", False
-        ):
+        if getattr(self, "_shutting_down", False) or getattr(self, "_reconnect_suspended", False):
             return False
         return gateway_generation is None or gateway_generation == getattr(
             self, "_gateway_generation", gateway_generation
@@ -2466,9 +2711,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
     def _schedule_reconnect(self, gateway_id: str) -> None:
         if self._shutting_down or self._reconnect_suspended or gateway_id in self._reconnect_tasks:
             return
-        task = self._async_create_background_task(
-            self._delayed_reconnect(gateway_id), "MeshNet gateway reconnect"
-        )
+        task = self._async_create_background_task(self._delayed_reconnect(gateway_id), "MeshNet gateway reconnect")
         self._reconnect_tasks[gateway_id] = task
 
         def clear_reconnect(done_task: asyncio.Task[Any]) -> None:
@@ -2542,9 +2785,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         done: set[asyncio.Task[Any]] = set()
         pending: set[asyncio.Task[Any]] = set()
         if waitable_tasks:
-            done, pending = await asyncio.wait(
-                waitable_tasks, timeout=_GATEWAY_TASK_CANCEL_TIMEOUT
-            )
+            done, pending = await asyncio.wait(waitable_tasks, timeout=_GATEWAY_TASK_CANCEL_TIMEOUT)
         if done:
             await asyncio.gather(*done, return_exceptions=True)
         for gateway_id, task in list(self._reconnect_tasks.items()):
@@ -2561,9 +2802,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             return False
         if not task.done() and task.cancelling() == 0:
             task.cancel()
-        done, _pending = await asyncio.wait(
-            {task}, timeout=_GATEWAY_TASK_CANCEL_TIMEOUT
-        )
+        done, _pending = await asyncio.wait({task}, timeout=_GATEWAY_TASK_CANCEL_TIMEOUT)
         if task not in done:
             # Keep the entry-owned task retained. Its original done callback
             # clears this reference if the provider eventually returns.
@@ -2582,9 +2821,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             return False
         if not task.done() and task.cancelling() == 0:
             task.cancel()
-        done, _pending = await asyncio.wait(
-            {task}, timeout=_GATEWAY_TASK_CANCEL_TIMEOUT
-        )
+        done, _pending = await asyncio.wait({task}, timeout=_GATEWAY_TASK_CANCEL_TIMEOUT)
         if task not in done:
             return False
         await asyncio.gather(task, return_exceptions=True)
@@ -2605,17 +2842,63 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         done: set[asyncio.Task[Any]] = set()
         pending: set[asyncio.Task[Any]] = set()
         if waitable_tasks:
-            done, pending = await asyncio.wait(
-                waitable_tasks, timeout=_GATEWAY_TASK_CANCEL_TIMEOUT
-            )
+            done, pending = await asyncio.wait(waitable_tasks, timeout=_GATEWAY_TASK_CANCEL_TIMEOUT)
         if done:
             await asyncio.gather(*done, return_exceptions=True)
             self._send_tasks.difference_update(done)
         return not pending and current_task not in send_tasks
 
-    def _validate_requested_gateway_id(
-        self, gateway_id: str | None
-    ) -> None:
+    async def _cancel_traceroute_tasks(self) -> bool:
+        """Cancel active manual traceroutes within the gateway task bound."""
+        trace_tasks = set(getattr(self, "_traceroute_tasks", set()))
+        if not trace_tasks:
+            return True
+        current_task = asyncio.current_task()
+        waitable_tasks = trace_tasks - {current_task}
+        for task in waitable_tasks:
+            if not task.done() and task.cancelling() == 0:
+                task.cancel()
+        done: set[asyncio.Task[Any]] = set()
+        pending: set[asyncio.Task[Any]] = set()
+        if waitable_tasks:
+            done, pending = await asyncio.wait(
+                waitable_tasks,
+                timeout=_GATEWAY_TASK_CANCEL_TIMEOUT,
+            )
+        if done:
+            await asyncio.gather(*done, return_exceptions=True)
+            self._traceroute_tasks.difference_update(done)
+        return not pending and current_task not in trace_tasks
+
+    async def async_quiesce_radio_operations(self) -> bool:
+        """Fence and drain manual RF work before reload or platform unload."""
+        self._radio_operations_accepting = False
+        remote_admin = getattr(self, "remote_admin", None)
+        quiesce = getattr(remote_admin, "async_quiesce", None)
+        remote_drained = await quiesce() if callable(quiesce) else True
+        traceroutes_drained = await self._cancel_traceroute_tasks()
+        return bool(remote_drained and traceroutes_drained)
+
+    def resume_radio_operations(self) -> bool:
+        """Resume manual RF work only after every previous owner has drained."""
+        tasks = getattr(self, "_traceroute_tasks", set())
+        done = {task for task in tasks if task.done()}
+        if done:
+            tasks.difference_update(done)
+        if (
+            any(not task.done() for task in tasks)
+            or getattr(self, "_shutting_down", False)
+            or getattr(self, "_reconnect_suspended", False)
+        ):
+            return False
+        remote_admin = getattr(self, "remote_admin", None)
+        resume = getattr(remote_admin, "resume", None)
+        if callable(resume) and resume() is not True:
+            return False
+        self._radio_operations_accepting = True
+        return True
+
+    def _validate_requested_gateway_id(self, gateway_id: str | None) -> None:
         """Reject an explicit gateway unless it exists exactly."""
         if gateway_id is not None and gateway_id not in self.gateways:
             raise HomeAssistantError("Unknown MeshNet gateway ID")
@@ -2635,20 +2918,14 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             if gateway is None:
                 return None
             gateway_protocol = _known_protocol(gateway.config.protocol)
-            if (
-                normalized_target_protocol is not None
-                and gateway_protocol != normalized_target_protocol
-            ):
+            if normalized_target_protocol is not None and gateway_protocol != normalized_target_protocol:
                 raise HomeAssistantError(_MESSAGE_PROTOCOL_MISMATCH_ERROR)
             if gateway.status.connected:
                 return gateway
             return None
         for node in self.snapshot.nodes.values():
             node_protocol = _known_protocol(node.protocol)
-            if (
-                normalized_target_protocol is not None
-                and node_protocol != normalized_target_protocol
-            ):
+            if normalized_target_protocol is not None and node_protocol != normalized_target_protocol:
                 continue
             if target_node and target_node in {
                 node.node_key,
@@ -2663,16 +2940,14 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                         and gateway.status.connected
                         and (
                             normalized_target_protocol is None
-                            or _known_protocol(gateway.config.protocol)
-                            == normalized_target_protocol
+                            or _known_protocol(gateway.config.protocol) == normalized_target_protocol
                         )
                     ):
                         return gateway
         for gateway in self.gateways.values():
             if gateway.status.connected and (
                 normalized_target_protocol is None
-                or _known_protocol(gateway.config.protocol)
-                == normalized_target_protocol
+                or _known_protocol(gateway.config.protocol) == normalized_target_protocol
             ):
                 return gateway
         return None
@@ -2739,10 +3014,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             if domain != DOMAIN or not isinstance(issue_id, str):
                 continue
             category = self._issue_category(issue_id)
-            if (
-                category not in _GATEWAY_ISSUE_CATEGORIES
-                or _SAFE_GATEWAY_ISSUE_RE.fullmatch(issue_id)
-            ):
+            if category not in _GATEWAY_ISSUE_CATEGORIES or _SAFE_GATEWAY_ISSUE_RE.fullmatch(issue_id):
                 continue
             try:
                 issue_deleter(hass, DOMAIN, issue_id)
@@ -2757,9 +3029,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
 
     def _delete_resolved_issue(self, issue_id: str) -> bool:
         """Delete one identity-free resolved repair without affecting startup."""
-        if issue_id != "no_gateways" and _SAFE_GATEWAY_ISSUE_RE.fullmatch(
-            issue_id
-        ) is None:
+        if issue_id != "no_gateways" and _SAFE_GATEWAY_ISSUE_RE.fullmatch(issue_id) is None:
             return False
         issue_deleter = getattr(ir, "async_delete_issue", None)
         hass = getattr(self, "hass", None)
@@ -2794,28 +3064,18 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                 "collection_error": type(err).__name__,
             }
 
-        categories = Counter(
-            self._issue_category(issue_id) for issue_id, _issue in entries
-        )
+        categories = Counter(self._issue_category(issue_id) for issue_id, _issue in entries)
         return {
             "available": True,
             "issue_count": len(entries),
-            "active_issue_count": sum(
-                bool(getattr(issue, "active", False))
-                for _issue_id, issue in entries
-            ),
-            "persistent_issue_count": sum(
-                bool(getattr(issue, "is_persistent", False))
-                for _issue_id, issue in entries
-            ),
+            "active_issue_count": sum(bool(getattr(issue, "active", False)) for _issue_id, issue in entries),
+            "persistent_issue_count": sum(bool(getattr(issue, "is_persistent", False)) for _issue_id, issue in entries),
             "legacy_identity_issue_count": sum(
                 self._issue_category(issue_id) in _GATEWAY_ISSUE_CATEGORIES
                 and _SAFE_GATEWAY_ISSUE_RE.fullmatch(issue_id) is None
                 for issue_id, _issue in entries
             ),
-            "legacy_issues_removed_during_setup": getattr(
-                self, "_legacy_issue_cleanup_count", 0
-            ),
+            "legacy_issues_removed_during_setup": getattr(self, "_legacy_issue_cleanup_count", 0),
             "category_counts": dict(sorted(categories.items())),
         }
 
@@ -2906,9 +3166,7 @@ def service_fields(call_data: dict[str, Any]) -> dict[str, Any]:
         message=call_data[ATTR_MESSAGE],
         channel=call_data.get(ATTR_CHANNEL),
         priority=call_data.get(ATTR_PRIORITY, "normal"),
-        message_type=call_data.get(
-            ATTR_MESSAGE_TYPE, MESSAGE_TYPE_BROADCAST
-        ),
+        message_type=call_data.get(ATTR_MESSAGE_TYPE, MESSAGE_TYPE_BROADCAST),
         gateway_id=call_data.get(ATTR_GATEWAY_ID),
     )
     return {

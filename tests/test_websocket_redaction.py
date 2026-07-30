@@ -19,9 +19,7 @@ def _preview(secret: str) -> dict:
         "type": "meshnet/settings/preview",
         "gateway_id": "gateway-one",
         "revision": "a" * 64,
-        "changes": {
-            "security.pin": {"operation": "replace", "value": secret}
-        },
+        "changes": {"security.pin": {"operation": "replace", "value": secret}},
     }
 
 
@@ -111,6 +109,58 @@ def test_filter_redacts_send_message_and_identifiers_without_mutation() -> None:
         assert private_value not in rendered
     assert rendered.count("<redacted by MeshNet>") == 4
     assert command == original
+
+
+def test_filter_redacts_remote_admin_and_traceroute_identifiers_and_drafts() -> None:
+    commands = (
+        {
+            "id": 20,
+            "type": "meshnet/remote_settings/get",
+            "gateway_id": "private-gateway",
+            "target_node": "!12345678",
+        },
+        {
+            "id": 21,
+            "type": "meshnet/remote_settings/preview",
+            "gateway_id": "private-gateway",
+            "target_node": "!12345678",
+            "revision": "a" * 64,
+            "changes": {"owner.long_name": "Private household node"},
+        },
+        {
+            "id": 22,
+            "type": "meshnet/remote_settings/apply",
+            "gateway_id": "private-gateway",
+            "target_node": "!12345678",
+            "revision": "a" * 64,
+            "preview_id": "p" * 43,
+            "confirm_remote": True,
+        },
+        {
+            "id": 23,
+            "type": "meshnet/traceroute",
+            "gateway_id": "private-gateway",
+            "target_node": "!12345678",
+        },
+    )
+    original = json.loads(json.dumps(commands))
+    record = logging.LogRecord(
+        "homeassistant.components.websocket_api.http.connection",
+        logging.DEBUG,
+        __file__,
+        1,
+        "%s: Received %s",
+        ("connection", commands),
+        None,
+    )
+
+    assert _MeshNetWebSocketRedactionFilter().filter(record) is True
+
+    rendered = record.getMessage()
+    assert "private-gateway" not in rendered
+    assert "!12345678" not in rendered
+    assert "Private household node" not in rendered
+    assert json.loads(json.dumps(commands)) == original
 
 
 def test_filter_redacts_send_message_inside_batch() -> None:
@@ -264,16 +314,12 @@ def test_filter_omits_serialized_outbound_bytes_string_and_batch() -> None:
 
         assert _MeshNetWebSocketRedactionFilter().filter(record) is True
         assert "private serialized result" not in record.getMessage()
-        assert record.getMessage() == (
-            "WebSocket result omitted by MeshNet privacy guard"
-        )
+        assert record.getMessage() == ("WebSocket result omitted by MeshNet privacy guard")
 
 
 def test_outbound_marker_cannot_turn_an_incoming_command_into_outbound_log() -> None:
     tagged = sensitive_result_message(29, {"text": "private"})
-    marker_field = next(
-        key for key in tagged if key not in {"id", "type", "success", "result"}
-    )
+    marker_field = next(key for key in tagged if key not in {"id", "type", "success", "result"})
     incoming = {
         "id": 30,
         "type": "unrelated/integration",
@@ -333,9 +379,7 @@ def test_filter_fails_closed_for_cyclic_or_oversized_sequence() -> None:
     """Unusual containers become fixed text without breaking logging."""
     cyclic: list = []
     cyclic.append(cyclic)
-    record = logging.LogRecord(
-        "test", logging.DEBUG, __file__, 1, "%s", (cyclic,), None
-    )
+    record = logging.LogRecord("test", logging.DEBUG, __file__, 1, "%s", (cyclic,), None)
 
     assert _MeshNetWebSocketRedactionFilter().filter(record) is True
 
@@ -347,9 +391,7 @@ def test_filter_fails_closed_without_copying_oversized_sensitive_mapping() -> No
     """An admin command cannot make the shared logger clone a huge mapping."""
     command = _send_command("private message")
     command.update({f"unused_{index}": index for index in range(65)})
-    record = logging.LogRecord(
-        "test", logging.DEBUG, __file__, 1, "%s", (command,), None
-    )
+    record = logging.LogRecord("test", logging.DEBUG, __file__, 1, "%s", (command,), None)
 
     assert _MeshNetWebSocketRedactionFilter().filter(record) is True
 
@@ -358,9 +400,7 @@ def test_filter_fails_closed_without_copying_oversized_sensitive_mapping() -> No
 
 
 def test_filter_omits_ha_core_invalid_private_service_payload() -> None:
-    private_data = _service_command("invalid private service message")[
-        "service_data"
-    ]
+    private_data = _service_command("invalid private service message")["service_data"]
     record = logging.LogRecord(
         "homeassistant.core",
         logging.DEBUG,
@@ -402,9 +442,7 @@ def test_filter_omits_ha_core_private_service_exception_and_traceback() -> None:
 
 
 def test_filter_leaves_other_ha_core_service_failure_unchanged() -> None:
-    other_call = SimpleNamespace(
-        domain="other", service="send_message", data={"message": "public"}
-    )
+    other_call = SimpleNamespace(domain="other", service="send_message", data={"message": "public"})
     args = (other_call,)
     record = logging.LogRecord(
         "homeassistant.core",
@@ -438,15 +476,10 @@ def test_filter_never_traverses_unrelated_ha_core_log_arguments() -> None:
 
 
 def test_install_is_idempotent_and_real_logger_never_emits_secret(caplog) -> None:
-    logger = logging.getLogger(
-        "homeassistant.components.websocket_api.http.connection"
-    )
+    logger = logging.getLogger("homeassistant.components.websocket_api.http.connection")
     install_websocket_secret_redaction()
     install_websocket_secret_redaction()
-    matching_filters = [
-        item for item in logger.filters
-        if isinstance(item, _MeshNetWebSocketRedactionFilter)
-    ]
+    matching_filters = [item for item in logger.filters if isinstance(item, _MeshNetWebSocketRedactionFilter)]
     assert len(matching_filters) == 1
 
     secret = "never-log-this-pin"

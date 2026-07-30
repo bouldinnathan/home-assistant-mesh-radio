@@ -1,5 +1,37 @@
 # Upgrade Guide
 
+## From 0.6.2
+
+0.7.0 adds an app-like **Messages** view, 20/50/100-node moving passive graph,
+distance-aware evidence-backed springs, manual Meshtastic Bluetooth traceroute,
+versioned automation outcomes, bounded passive telemetry, and a guarded remote
+node editor. Restart Home Assistant and hard-refresh the browser so the new
+panel JavaScript replaces its cached 0.6.x copy.
+
+Traceroute is manual and administrator-only. The backend reserves a SQLite
+cooldown before the single RF request and permits at most one manual traceroute
+across the entire MeshNet integration every 3,600 seconds. Failure and timeout
+consume it, and there is no service, polling, startup, graph-fill, scheduled,
+broadcast, or retry path.
+
+Remote administration initially supports only a connected Meshtastic
+Bluetooth controller, one exact known target with a valid public key, owner
+long/short names, and reviewed display options. Copy the controller radio's
+displayed public key into an Admin Key slot on the target using the official
+app or CLI first. MeshNet has no private-key, SecurityConfig, admin-key-slot,
+channel-PSK, raw AdminMessage, reset, firmware, or remote-admin service API.
+Every write requires Load, Preview, explicit confirmation, a short-lived
+single-use server token, one transmission, and readback verification. Treat an
+unknown outcome as potentially applied and do not retry blindly.
+
+The existing `meshnet.sqlite3` is extended in place with an isolated
+`traceroutes` table. Removing the integration leaves no Home Assistant core
+configuration changes; deleting that file after unload removes MeshNet history
+and cooldowns. Intentional settings written to radio firmware survive uninstall
+and must be reverted on the radio. See
+[Advanced Mesh Operations](ADVANCED_MESH_OPERATIONS.md) before enabling remote
+administration on anything important.
+
 ## From 0.6.1
 
 0.6.2 makes the **Gateway settings** page distinguish working read-only fields

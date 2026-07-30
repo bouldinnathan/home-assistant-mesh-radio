@@ -139,6 +139,13 @@ GATEWAY_SENSORS: tuple[MeshNetGatewaySensorDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         value_fn=lambda gateway: len(gateway.errors),
     ),
+    MeshNetGatewaySensorDescription(
+        key="failure_count",
+        translation_key="gateway_failure_count",
+        name="Failure count",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        value_fn=lambda gateway: gateway.failure_count,
+    ),
 )
 
 STATIC_NODE_SENSORS: tuple[MeshNetNodeSensorDescription, ...] = (
@@ -205,14 +212,22 @@ STATIC_NODE_SENSORS: tuple[MeshNetNodeSensorDescription, ...] = (
         translation_key="hops",
         name="Hops",
         state_class=SensorStateClass.MEASUREMENT,
-        value_fn=lambda node: node.connectivity.get("hops") or node.routing.get("hops"),
+        value_fn=lambda node: (
+            node.connectivity["hops"]
+            if node.connectivity.get("hops") is not None
+            else node.routing.get("hops")
+        ),
     ),
     MeshNetNodeSensorDescription(
         key="hop_limit",
         translation_key="hop_limit",
         name="Hop limit",
         state_class=SensorStateClass.MEASUREMENT,
-        value_fn=lambda node: node.connectivity.get("hop_limit") or node.routing.get("hop_limit"),
+        value_fn=lambda node: (
+            node.connectivity["hop_limit"]
+            if node.connectivity.get("hop_limit") is not None
+            else node.routing.get("hop_limit")
+        ),
     ),
     MeshNetNodeSensorDescription(
         key="latitude",

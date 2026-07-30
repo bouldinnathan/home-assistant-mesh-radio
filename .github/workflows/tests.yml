@@ -66,7 +66,12 @@ jobs:
           tests/test_config_flow_ha.py
           tests/test_bluetooth_pairing.py
           tests/test_aiomeshtastic_async.py
+          tests/test_advanced_backend.py
+          tests/test_advanced_controls_frontend.py
+          tests/test_advanced_frontend.py
+          tests/test_advanced_help_contract.py
           tests/test_meshtastic_ble.py
+          tests/test_meshtastic_traceroute_transport.py
           tests/test_ble_runtime_safety.py
           tests/test_clients.py
           tests/test_coordinator.py
@@ -76,7 +81,13 @@ jobs:
           tests/test_init.py
           tests/test_meshcore_settings.py
           tests/test_meshtastic_settings.py
+          tests/test_neighborinfo_projection.py
+          tests/test_radio_safety.py
+          tests/test_remote_admin_interface.py
+          tests/test_remote_admin_safety.py
+          tests/test_remote_admin_websocket.py
           tests/test_sensitive_logging.py
+          tests/test_entity_sensor_values.py
           tests/test_websocket_api.py
           tests/test_websocket_redaction.py
       - run: python -m pip check

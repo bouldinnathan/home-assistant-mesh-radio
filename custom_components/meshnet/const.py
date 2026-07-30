@@ -6,7 +6,7 @@ from typing import Final
 
 DOMAIN: Final = "meshnet"
 NAME: Final = "MeshNet"
-VERSION: Final = "0.6.2"
+VERSION: Final = "0.7.0"
 DATA_BLUETOOTH_PAIRING: Final = f"{DOMAIN}_bluetooth_pairing"
 
 PLATFORMS: Final = ["sensor", "binary_sensor", "device_tracker"]
@@ -80,6 +80,28 @@ ATTR_RAW: Final = "raw"
 EVENT_PACKET: Final = "meshnet_packet"
 EVENT_MESSAGE_RECEIVED: Final = "meshnet_message_received"
 EVENT_MESSAGE_SENT: Final = "meshnet_message_sent"
+EVENT_MESSAGE_STATUS: Final = "meshnet_message_status"
+EVENT_GATEWAY_STATUS: Final = "meshnet_gateway_status"
+
+# The same positive allowlist is enforced independently by the Home Assistant
+# manager and the radio protocol boundary. New firmware fields remain remote
+# read/write-inaccessible until their lockout and recovery behavior is reviewed.
+REMOTE_ADMIN_WRITABLE_PATHS: Final = frozenset(
+    {
+        "owner.long_name",
+        "owner.short_name",
+        "config.display.compass_north_top",
+        "config.display.compass_orientation",
+        "config.display.enable_message_bubbles",
+        "config.display.flip_screen",
+        "config.display.gps_format",
+        "config.display.heading_bold",
+        "config.display.units",
+        "config.display.use_12h_clock",
+        "config.display.use_long_node_name",
+        "config.display.wake_on_tap_or_motion",
+    }
+)
 
 STORAGE_SCHEMA_VERSION: Final = 1
 

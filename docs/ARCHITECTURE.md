@@ -337,8 +337,12 @@ Events:
 - `meshnet_packet`
 - `meshnet_message_received`
 - `meshnet_message_sent`
+- `meshnet_message_status`
+- `meshnet_gateway_status`
 
-Message sends use a token bucket to reduce radio flooding.
+Message sends use a token bucket to reduce radio flooding. Versioned status
+events and action responses expose correlation and stable outcomes without raw
+packet dictionaries, message text, credentials, or provider exceptions.
 
 ## Websocket API And Panel
 
@@ -354,14 +358,28 @@ Websocket commands:
 - `meshnet/snapshot`
 - `meshnet/messages`
 - `meshnet/send_message`
+- `meshnet/traceroute` (admin-only, explicit Meshtastic Bluetooth unicast)
 - `meshnet/settings/get`
 - `meshnet/settings/preview`
 - `meshnet/settings/apply`
+- `meshnet/remote_settings/get`
+- `meshnet/remote_settings/preview`
+- `meshnet/remote_settings/apply`
 
 All MeshNet websocket commands require an authenticated Home Assistant admin
-user. The sidebar panel is admin-only. Settings commands expose a typed,
-sanitized schema and preview token; there is no raw provider-command websocket
-endpoint.
+user. The sidebar panel is admin-only. Local and remote settings commands
+expose a typed, sanitized schema and preview token; there is no raw
+provider-command websocket endpoint. Remote administration is additionally
+Meshtastic-Bluetooth-only, exact-target-only, allowlisted to owner/display
+fields, and fenced from SecurityConfig, keys, PSKs, destructive commands, and
+Home Assistant services.
+
+The traceroute command reserves a SQLite cooldown before any provider call. It
+permits one manual traceroute across the integration every 3,600 seconds;
+changing the gateway or destination cannot bypass that global floor, and a
+timeout consumes the reservation. Its admin-only status command reads the
+persisted cooldown and bounded last result without sending RF. No service,
+poller, reconnect task, or automatic graph path can invoke traceroute.
 
 ## Setup Tools
 
@@ -393,15 +411,17 @@ Purpose:
 - Never persist or log a Meshtastic BlueZ pairing PIN. Persist a changed
   MeshCore connection PIN only after the physically connected radio verifies
   it, and never return or log its value.
-- Do not expose raw radio commands, remote RF administration, reset, firmware
-  flashing, or private-key import/export through gateway settings.
+- Do not expose raw radio commands, generic remote RF administration, reset,
+  firmware flashing, key/PSK mutation, SecurityConfig, or private-key
+  import/export. Reviewed remote owner/display fields use a separate
+  preview/confirmation/readback boundary.
 - Treat a settings-write timeout as an unknown outcome and never retry it
   automatically.
 - Treat topology as cached passive evidence: never infer node-to-node links
   from a shared gateway observation.
-- Do not expose automatic traceroute. A future manual testing action would need
-  a backend-persisted cooldown of at least 3,600 seconds per gateway and
-  destination, with no startup, polling, refresh, or graph-fill trigger.
+- Do not expose automatic traceroute. The admin-only manual WebSocket command
+  uses a backend-persisted integration-wide floor of 3,600 seconds, with no
+  startup, polling, refresh, graph-fill, service, or retry trigger.
 
 ## Isolation Boundary
 

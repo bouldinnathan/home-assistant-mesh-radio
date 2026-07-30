@@ -19,6 +19,10 @@ from collections.abc import Mapping
 from typing import Any
 
 _SETTINGS_PREVIEW_TYPE = "meshnet/settings/preview"
+_REMOTE_SETTINGS_GET_TYPE = "meshnet/remote_settings/get"
+_REMOTE_SETTINGS_PREVIEW_TYPE = "meshnet/remote_settings/preview"
+_REMOTE_SETTINGS_APPLY_TYPE = "meshnet/remote_settings/apply"
+_TRACEROUTE_TYPE = "meshnet/traceroute"
 _SEND_MESSAGE_TYPE = "meshnet/send_message"
 _CALL_SERVICE_TYPE = "call_service"
 _MESHNET_DOMAIN = "meshnet"
@@ -30,27 +34,23 @@ _SENSITIVE_MESHNET_SERVICES = frozenset(
         "refresh_gateway",
     }
 )
-_SENSITIVE_SERVICE_FIELDS = frozenset(
-    {"message", "target_node", "gateway_id", "channel"}
-)
+_SENSITIVE_SERVICE_FIELDS = frozenset({"message", "target_node", "gateway_id", "channel"})
 _SENSITIVE_COMMAND_FIELDS = {
     _SETTINGS_PREVIEW_TYPE: frozenset({"changes"}),
-    _SEND_MESSAGE_TYPE: frozenset(
-        {"message", "target_node", "gateway_id", "channel"}
-    ),
+    _REMOTE_SETTINGS_GET_TYPE: frozenset({"gateway_id", "target_node"}),
+    _REMOTE_SETTINGS_PREVIEW_TYPE: frozenset({"gateway_id", "target_node", "changes"}),
+    _REMOTE_SETTINGS_APPLY_TYPE: frozenset({"gateway_id", "target_node"}),
+    _TRACEROUTE_TYPE: frozenset({"gateway_id", "target_node"}),
+    _SEND_MESSAGE_TYPE: frozenset({"message", "target_node", "gateway_id", "channel"}),
 }
 _REDACTED = "<redacted by MeshNet>"
 _REDACTION_GUARD_MESSAGE = "WebSocket command omitted by MeshNet redaction guard"
-_OUTBOUND_REDACTION_GUARD_MESSAGE = (
-    "WebSocket result omitted by MeshNet privacy guard"
-)
+_OUTBOUND_REDACTION_GUARD_MESSAGE = "WebSocket result omitted by MeshNet privacy guard"
 # This marker is protocol metadata added only by ``sensitive_result_message``.
 # It is not accepted from any MeshNet websocket command or copied from a result.
 _OUTBOUND_SENTINEL_KEY = "__meshnet_private_response__"
 _OUTBOUND_SENTINEL_VALUE = "meshnet-server-redact-v1"
-_OUTBOUND_SENTINEL_TEXT = (
-    f'"{_OUTBOUND_SENTINEL_KEY}":"{_OUTBOUND_SENTINEL_VALUE}"'
-)
+_OUTBOUND_SENTINEL_TEXT = f'"{_OUTBOUND_SENTINEL_KEY}":"{_OUTBOUND_SENTINEL_VALUE}"'
 _OUTBOUND_SENTINEL_BYTES = _OUTBOUND_SENTINEL_TEXT.encode("ascii")
 _OUTBOUND_LOG_MARKER = "Sending %s"
 _CORE_SERVICE_LOG_MESSAGES = frozenset(
@@ -60,9 +60,7 @@ _CORE_SERVICE_LOG_MESSAGES = frozenset(
         "Service was cancelled: %s",
     }
 )
-_CORE_SERVICE_REDACTION_GUARD_MESSAGE = (
-    "Private MeshNet service call payload omitted by privacy guard"
-)
+_CORE_SERVICE_REDACTION_GUARD_MESSAGE = "Private MeshNet service call payload omitted by privacy guard"
 _MAX_SEQUENCE_DEPTH = 4
 _MAX_INSPECTED_ITEMS = 512
 _MAX_SENSITIVE_COMMAND_FIELDS = 64
@@ -101,9 +99,7 @@ def _redact_meshnet_service_command(value: Mapping[Any, Any]) -> tuple[Any, bool
     if len(value) > _MAX_SENSITIVE_COMMAND_FIELDS:
         raise _RedactionTraversalLimit
     service_data = value.get("service_data")
-    if not isinstance(service_data, Mapping) or isinstance(
-        service_data, (str, bytes)
-    ):
+    if not isinstance(service_data, Mapping) or isinstance(service_data, (str, bytes)):
         # This is malformed, but it still belongs to an exact private send
         # service. Omitting the record is safer than rendering its payload.
         raise _RedactionTraversalLimit

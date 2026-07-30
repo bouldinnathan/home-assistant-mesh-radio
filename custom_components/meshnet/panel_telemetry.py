@@ -16,6 +16,10 @@ PANEL_OPERATIONS = frozenset(
         "settings_get",
         "settings_preview",
         "settings_apply",
+        "remote_settings_get",
+        "remote_settings_preview",
+        "remote_settings_apply",
+        "traceroute",
         "render",
         "poll",
         "snapshot_schema",
@@ -95,6 +99,10 @@ PANEL_ERROR_CODES = frozenset(
         "settings_load_failed",
         "settings_preview_failed",
         "settings_apply_failed",
+        "remote_settings_load_failed",
+        "remote_settings_preview_failed",
+        "remote_settings_apply_failed",
+        "traceroute_failed",
         "timeout",
         "unavailable",
         "unexpected_error",
@@ -201,12 +209,8 @@ class PanelTelemetry:
         event_limit: int = _EVENT_LIMIT,
     ) -> None:
         self._logger = logger or logging.getLogger(__name__)
-        self._operations = {
-            operation: _new_operation_stats() for operation in sorted(PANEL_OPERATIONS)
-        }
-        self._failure_events: deque[dict[str, Any]] = deque(
-            maxlen=max(1, min(int(event_limit), _EVENT_LIMIT))
-        )
+        self._operations = {operation: _new_operation_stats() for operation in sorted(PANEL_OPERATIONS)}
+        self._failure_events: deque[dict[str, Any]] = deque(maxlen=max(1, min(int(event_limit), _EVENT_LIMIT)))
         self._sequence = 0
         self._failure_signatures: Counter[tuple[str, str, str, str]] = Counter()
 
@@ -315,13 +319,10 @@ class PanelTelemetry:
                 "failure_count": raw["failure_count"],
                 "recovery_count": raw["recovery_count"],
                 "consecutive_failure_count": raw["consecutive_failure_count"],
-                "error_category_counts": dict(
-                    sorted(raw["error_category_counts"].items())
-                ),
+                "error_category_counts": dict(sorted(raw["error_category_counts"].items())),
                 "error_type_counts": dict(sorted(raw["error_type_counts"].items())),
                 "duration_bucket_counts": {
-                    bucket: raw["duration_bucket_counts"].get(bucket, 0)
-                    for bucket in _DURATION_BUCKETS
+                    bucket: raw["duration_bucket_counts"].get(bucket, 0) for bucket in _DURATION_BUCKETS
                 },
             }
             operations[operation] = stats
@@ -343,10 +344,7 @@ class PanelTelemetry:
                 **dict(totals),
                 "error_category_counts": dict(sorted(total_categories.items())),
                 "error_type_counts": dict(sorted(total_types.items())),
-                "duration_bucket_counts": {
-                    bucket: total_durations.get(bucket, 0)
-                    for bucket in _DURATION_BUCKETS
-                },
+                "duration_bucket_counts": {bucket: total_durations.get(bucket, 0) for bucket in _DURATION_BUCKETS},
             },
             "operations": operations,
             "failure_events": [dict(event) for event in self._failure_events],
@@ -362,8 +360,4 @@ def _bounded_report_count(value: Any) -> int | None:
 
 def _should_warn(occurrence: int) -> bool:
     """Warn on the first three, powers of two, and periodic milestones."""
-    return (
-        occurrence <= 3
-        or occurrence & (occurrence - 1) == 0
-        or occurrence % 100 == 0
-    )
+    return occurrence <= 3 or occurrence & (occurrence - 1) == 0 or occurrence % 100 == 0

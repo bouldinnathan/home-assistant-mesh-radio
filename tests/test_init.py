@@ -557,6 +557,87 @@ def test_unload_fences_settings_before_platforms_and_resumes_on_failure() -> Non
     asyncio.run(run())
 
 
+def test_unload_fences_every_radio_operation_before_platforms() -> None:
+    """Remote admin and traceroute work cannot race platform teardown."""
+
+    async def run() -> None:
+        events: list[str] = []
+
+        class SettingsManager:
+            async def async_quiesce(self) -> bool:
+                events.append("settings_quiesce")
+                return True
+
+            def resume(self) -> bool:
+                events.append("settings_resume")
+                return True
+
+        class Coordinator:
+            gateway_settings = SettingsManager()
+
+            async def async_quiesce_radio_operations(self) -> bool:
+                events.append("radio_quiesce")
+                return True
+
+            def resume_radio_operations(self) -> bool:
+                events.append("radio_resume")
+                return True
+
+            async def async_shutdown(self) -> None:
+                raise AssertionError("failed platform unload must not shut down")
+
+        async def unload_platforms(_entry, _platforms) -> bool:
+            events.append("unload_platforms")
+            return False
+
+        coordinator = Coordinator()
+        entry = SimpleNamespace(entry_id="entry-id")
+        hass = SimpleNamespace(
+            data={DOMAIN: {entry.entry_id: coordinator}},
+            config_entries=SimpleNamespace(async_unload_platforms=unload_platforms),
+        )
+
+        assert await async_unload_entry(hass, entry) is False
+        assert events == [
+            "radio_quiesce",
+            "settings_quiesce",
+            "unload_platforms",
+            "settings_resume",
+            "radio_resume",
+        ]
+
+    asyncio.run(run())
+
+
+def test_unload_stops_before_platforms_when_radio_work_cannot_drain() -> None:
+    """A resistant remote operation preserves its owning integration state."""
+
+    async def run() -> None:
+        coordinator = SimpleNamespace(
+            async_quiesce_radio_operations=AsyncMock(return_value=False),
+            resume_radio_operations=MagicMock(),
+            gateway_settings=SimpleNamespace(
+                async_quiesce=AsyncMock(return_value=True),
+                resume=MagicMock(),
+            ),
+            async_shutdown=AsyncMock(),
+        )
+        entry = SimpleNamespace(entry_id="entry-id")
+        unload_platforms = AsyncMock(return_value=True)
+        hass = SimpleNamespace(
+            data={DOMAIN: {entry.entry_id: coordinator}},
+            config_entries=SimpleNamespace(async_unload_platforms=unload_platforms),
+        )
+
+        assert await async_unload_entry(hass, entry) is False
+        unload_platforms.assert_not_awaited()
+        coordinator.gateway_settings.async_quiesce.assert_not_awaited()
+        coordinator.resume_radio_operations.assert_not_called()
+        coordinator.async_shutdown.assert_not_awaited()
+
+    asyncio.run(run())
+
+
 def test_unload_does_not_touch_platforms_when_settings_cannot_drain() -> None:
     """A resistant write keeps ownership and transport lifecycle intact."""
 

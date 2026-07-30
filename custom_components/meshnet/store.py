@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import sqlite3
 from collections.abc import Awaitable, Callable, Iterable
 from datetime import UTC, datetime, timedelta
@@ -118,6 +119,19 @@ class MeshStore:
                 route_id TEXT PRIMARY KEY,
                 updated_at TEXT NOT NULL,
                 data TEXT NOT NULL
+            )
+            """
+        )
+        await self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS traceroutes (
+                gateway_id TEXT NOT NULL,
+                target_node TEXT NOT NULL,
+                reserved_at TEXT NOT NULL,
+                next_allowed_at TEXT NOT NULL,
+                result_updated_at TEXT,
+                result_data TEXT,
+                PRIMARY KEY(gateway_id, target_node)
             )
             """
         )
@@ -574,12 +588,291 @@ class MeshStore:
         )
         return int(row["count"] if row else 0)
 
+    async def async_reserve_traceroute(
+        self,
+        gateway_id: str,
+        target_node: str,
+        *,
+        cooldown_seconds: int = 3600,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Atomically reserve the integration-wide traceroute airtime slot."""
+        gateway_id, target_node = self._validated_traceroute_key(
+            gateway_id, target_node
+        )
+        if isinstance(cooldown_seconds, bool) or not isinstance(
+            cooldown_seconds, int
+        ):
+            raise ValueError("traceroute cooldown must be an integer")
+        # This is a safety floor, not a caller-selected rate limit.
+        cooldown_seconds = max(3600, cooldown_seconds)
+        reserved_at = self._traceroute_now(now)
+        next_allowed = reserved_at + timedelta(seconds=cooldown_seconds)
+        reserved_at_text = timestamp_to_json(reserved_at)
+        next_allowed_text = timestamp_to_json(next_allowed)
+
+        def reserve(conn: sqlite3.Connection) -> bool:
+            # Traceroute is intentionally integration-wide, not per target.
+            # One recent transmission blocks every gateway and destination so a
+            # user cannot walk a node list and create rude network traffic.
+            active = conn.execute(
+                """
+                SELECT 1
+                FROM traceroutes
+                WHERE next_allowed_at > ?
+                LIMIT 1
+                """,
+                (reserved_at_text,),
+            ).fetchone()
+            if active is not None:
+                return False
+            cursor = conn.execute(
+                """
+                INSERT INTO traceroutes(
+                    gateway_id, target_node, reserved_at, next_allowed_at
+                )
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(gateway_id, target_node) DO UPDATE SET
+                    reserved_at=excluded.reserved_at,
+                    next_allowed_at=excluded.next_allowed_at,
+                    result_updated_at=NULL,
+                    result_data=NULL
+                """,
+                (
+                    gateway_id,
+                    target_node,
+                    reserved_at_text,
+                    next_allowed_text,
+                ),
+            )
+            return cursor.rowcount == 1
+
+        reserved = bool(await self._run_serialized(reserve))
+        status = await self.async_get_traceroute_status(
+            gateway_id, target_node, now=reserved_at
+        )
+        return {
+            **(status or {}),
+            "reserved": reserved,
+            "status": "reserved" if reserved else "cooldown",
+        }
+
+    async def async_store_traceroute_result(
+        self,
+        gateway_id: str,
+        target_node: str,
+        result: dict[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        """Attach one sanitized result to an existing cooldown reservation."""
+        gateway_id, target_node = self._validated_traceroute_key(
+            gateway_id, target_node
+        )
+        safe_result = self._safe_traceroute_result(result)
+        await self._execute(
+            """
+            UPDATE traceroutes
+            SET result_updated_at = ?, result_data = ?
+            WHERE gateway_id = ? AND target_node = ?
+            """,
+            (
+                timestamp_to_json(self._traceroute_now(now)),
+                stable_json(safe_result),
+                gateway_id,
+                target_node,
+            ),
+        )
+
+    async def async_get_traceroute_status(
+        self,
+        gateway_id: str,
+        target_node: str,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Return the integration-wide cooldown regardless of selected target."""
+        self._validated_traceroute_key(gateway_id, target_node)
+        return await self.async_get_global_traceroute_status(now=now)
+
+    async def async_get_global_traceroute_status(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Return one active, or otherwise latest, sanitized reservation."""
+        current = self._traceroute_now(now)
+        current_text = timestamp_to_json(current)
+        row = await self._fetchone(
+            """
+            SELECT
+                gateway_id,
+                target_node,
+                reserved_at,
+                next_allowed_at,
+                result_updated_at,
+                result_data
+            FROM traceroutes
+            ORDER BY
+                CASE WHEN next_allowed_at > ? THEN 0 ELSE 1 END,
+                CASE WHEN next_allowed_at > ? THEN next_allowed_at ELSE NULL END DESC,
+                reserved_at DESC,
+                gateway_id ASC,
+                target_node ASC
+            LIMIT 1
+            """,
+            (current_text, current_text),
+        )
+        if row is None:
+            return {
+                "schema_version": 1,
+                "scope": "integration",
+                "reserved": False,
+                "status": "available",
+                "gateway_id": None,
+                "target_node": None,
+                "reserved_at": None,
+                "next_allowed_at": None,
+                "remaining_seconds": 0,
+                "result_updated_at": None,
+                "result": None,
+            }
+        next_allowed = parse_timestamp(row["next_allowed_at"])
+        remaining = (
+            max(0, math.ceil((next_allowed - current).total_seconds()))
+            if next_allowed is not None
+            else 0
+        )
+        result: dict[str, Any] | None = None
+        raw_result = row["result_data"]
+        if isinstance(raw_result, str):
+            try:
+                decoded = json.loads(raw_result)
+            except (json.JSONDecodeError, RecursionError, TypeError, ValueError):
+                decoded = None
+            if isinstance(decoded, dict):
+                result = self._safe_traceroute_result(decoded)
+        return {
+            "schema_version": 1,
+            "scope": "integration",
+            "reserved": remaining > 0,
+            "status": "cooldown" if remaining > 0 else "available",
+            "gateway_id": row["gateway_id"],
+            "target_node": row["target_node"],
+            "reserved_at": row["reserved_at"],
+            "next_allowed_at": row["next_allowed_at"],
+            "remaining_seconds": remaining,
+            "result_updated_at": row["result_updated_at"],
+            "result": result,
+        }
+
+    @staticmethod
+    def _validated_traceroute_key(
+        gateway_id: Any, target_node: Any
+    ) -> tuple[str, str]:
+        """Validate durable cooldown keys before they reach SQLite."""
+        if (
+            not isinstance(gateway_id, str)
+            or gateway_id != gateway_id.strip()
+            or not 1 <= len(gateway_id) <= 128
+        ):
+            raise ValueError("invalid traceroute gateway")
+        if (
+            not isinstance(target_node, str)
+            or target_node != target_node.strip()
+            or not 1 <= len(target_node) <= 256
+        ):
+            raise ValueError("invalid traceroute target")
+        return gateway_id, target_node
+
+    @staticmethod
+    def _traceroute_now(now: datetime | None) -> datetime:
+        """Return one timezone-aware UTC instant for cooldown comparisons."""
+        value = now or utcnow()
+        if not isinstance(value, datetime) or value.tzinfo is None:
+            raise ValueError("traceroute time must include a timezone")
+        return value.astimezone(UTC)
+
+    @staticmethod
+    def _safe_traceroute_result(result: Any) -> dict[str, Any]:
+        """Project route evidence onto a small JSON-safe allowlist."""
+        if not isinstance(result, dict):
+            raise ValueError("invalid traceroute result")
+        safe: dict[str, Any] = {}
+        schema_version = result.get("schema_version")
+        if (
+            isinstance(schema_version, int)
+            and not isinstance(schema_version, bool)
+            and schema_version == 1
+        ):
+            safe["schema_version"] = schema_version
+        for key, maximum_bytes in (
+            ("gateway_id", 128),
+            ("source", 256),
+            ("destination", 256),
+        ):
+            value = result.get(key)
+            if (
+                isinstance(value, str)
+                and value == value.strip()
+                and 1 <= len(value.encode("utf-8")) <= maximum_bytes
+            ):
+                safe[key] = value
+        completed_at = result.get("completed_at")
+        if (
+            isinstance(completed_at, str)
+            and len(completed_at.encode("utf-8")) <= 64
+        ):
+            parsed_completed_at = parse_timestamp(completed_at)
+            if parsed_completed_at is not None:
+                safe["completed_at"] = timestamp_to_json(parsed_completed_at)
+        channel = result.get("channel")
+        if isinstance(channel, int) and not isinstance(channel, bool) and 0 <= channel <= 7:
+            safe["channel"] = channel
+        for key in ("forward_route", "reverse_route"):
+            value = result.get(key)
+            if not isinstance(value, list) or len(value) > 64:
+                continue
+            route = [
+                item
+                for item in value
+                if isinstance(item, str) and 1 <= len(item.encode("utf-8")) <= 256
+            ]
+            if len(route) == len(value):
+                safe[key] = route
+        for key in ("snr_towards", "snr_back"):
+            value = result.get(key)
+            if not isinstance(value, list) or len(value) > 64:
+                continue
+            snr_values: list[float] = []
+            for item in value:
+                if (
+                    isinstance(item, bool)
+                    or not isinstance(item, (int, float))
+                    or not math.isfinite(float(item))
+                    or not -128 <= float(item) <= 128
+                ):
+                    break
+                snr_values.append(float(item))
+            else:
+                safe[key] = snr_values
+        return safe
+
     async def async_prune(self, history_days: int) -> None:
-        """Prune old packet and message history."""
-        cutoff = utcnow() - timedelta(days=history_days)
+        """Prune old history without deleting an active RF cooldown."""
+        current = utcnow()
+        cutoff = current - timedelta(days=history_days)
         cutoff_text = timestamp_to_json(cutoff)
+        current_text = timestamp_to_json(current)
         await self._execute("DELETE FROM messages WHERE timestamp < ?", (cutoff_text,))
         await self._execute("DELETE FROM packets WHERE timestamp < ?", (cutoff_text,))
+        await self._execute(
+            """
+            DELETE FROM traceroutes
+            WHERE reserved_at < ? AND next_allowed_at <= ?
+            """,
+            (cutoff_text, current_text),
+        )
 
     async def async_diagnostics(self) -> dict[str, Any]:
         """Return store health and aggregate metadata without stored content."""
@@ -602,6 +895,8 @@ class MeshStore:
             SELECT 'packets', COUNT(*) FROM packets
             UNION ALL
             SELECT 'routes', COUNT(*) FROM routes
+            UNION ALL
+            SELECT 'traceroutes', COUNT(*) FROM traceroutes
             """
         )
         table_counts = {
@@ -669,6 +964,7 @@ class MeshStore:
                 "message_count": table_counts.get("messages", 0),
                 "packet_count": table_counts.get("packets", 0),
                 "route_count": table_counts.get("routes", 0),
+                "traceroute_count": table_counts.get("traceroutes", 0),
                 "table_counts": table_counts,
                 "message_direction_counts": {
                     "received": int(message_summary["received_count"] or 0)

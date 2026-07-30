@@ -99,6 +99,11 @@ class MeshGateway(ABC):
         """Refresh gateway state if supported."""
         return None
 
+    async def async_manual_traceroute(self, target_node: str) -> dict[str, Any]:
+        """Run one explicitly requested traceroute when an adapter supports it."""
+        del target_node
+        raise GatewayError("This gateway does not support manual traceroute")
+
     async def async_get_settings_snapshot(self) -> dict[str, Any]:
         """Return a privacy-safe live settings schema for this gateway.
 
@@ -167,6 +172,9 @@ class MeshGateway(ABC):
 
     async def _emit_error(self, error: Exception | str) -> None:
         message = str(error)
+        self.status.failure_count += 1
+        self.status.last_failure_category = _safe_error_category(error)
+        self.status.last_failure_at = utcnow()
         self.status.errors.append(message)
         self.status.errors = self.status.errors[-20:]
         self._logger.warning(

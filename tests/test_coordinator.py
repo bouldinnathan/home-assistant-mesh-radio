@@ -1480,6 +1480,7 @@ def test_reload_defers_until_stubborn_startup_finishes(monkeypatch) -> None:
         await asyncio.wait_for(coordinator.async_reload_gateways(), timeout=0.1)
 
         assert coordinator._reconnect_suspended is False
+        assert coordinator._radio_operations_accepting is False
         assert coordinator._gateway_startup_task is startup_task
         assert replacement_starts == 0
         assert order == ["old-startup-active"]
@@ -1492,6 +1493,7 @@ def test_reload_defers_until_stubborn_startup_finishes(monkeypatch) -> None:
         await coordinator.async_reload_gateways()
 
         assert coordinator._reconnect_suspended is False
+        assert coordinator._radio_operations_accepting is True
         assert replacement_starts == 1
         assert order == [
             "old-startup-active",

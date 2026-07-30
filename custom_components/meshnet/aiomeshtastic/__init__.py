@@ -21,6 +21,7 @@ from .errors import (
     MeshtasticConfigurationError,
     MeshtasticConnectionError,
     MeshtasticNotConnectedError,
+    MeshtasticRemoteAdminError,
 )
 
 __all__ = [
@@ -31,6 +32,7 @@ __all__ = [
     "MeshtasticConfigurationError",
     "MeshtasticConnectionError",
     "MeshtasticNotConnectedError",
+    "MeshtasticRemoteAdminError",
 ]
 
 

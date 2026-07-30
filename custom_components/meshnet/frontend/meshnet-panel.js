@@ -33,6 +33,39 @@ class MeshNetPanel extends HTMLElement {
     this._pollRenderPending = false;
     this._focusFlushGeneration = 0;
     this._activeView = "mesh";
+    this._messages = [];
+    this._messageConversation = "broadcast:0";
+    this._messageRequestGeneration = 0;
+    this._messageLoading = false;
+    this._messageError = null;
+    this._graphLimit = 50;
+    this._graphPositions = new Map();
+    this._graphAnimationFrame = null;
+    this._graphAnimationTopology = null;
+    this._graphAnimationIterations = 0;
+    this._graphDrag = null;
+    this._graphDragCleanup = null;
+    this._remoteGatewayId = "";
+    this._remoteTargetNode = "";
+    this._remoteSettingsSnapshot = null;
+    this._remoteSettingsDraft = {};
+    this._remoteSettingsPreview = null;
+    this._remoteSettingsStatus = null;
+    this._remoteSettingsBusy = null;
+    this._remoteSettingsConfirmed = false;
+    this._remoteRequestGeneration = 0;
+    this._tracerouteGatewayId = "";
+    this._tracerouteTargetNode = "";
+    this._tracerouteConfirmation = null;
+    this._tracerouteResults = {};
+    this._tracerouteStatus = null;
+    this._tracerouteBusy = false;
+    this._tracerouteRequestGeneration = 0;
+    this._tracerouteGlobalStatus = null;
+    this._tracerouteStatusReady = false;
+    this._tracerouteStatusLoading = false;
+    this._tracerouteStatusAttempted = false;
+    this._tracerouteStatusRequestGeneration = 0;
     this._settingsGateways = [];
     this._settingsSnapshot = null;
     this._settingsGatewayId = "";
@@ -69,7 +102,39 @@ class MeshNetPanel extends HTMLElement {
     this._focusFlushGeneration += 1;
     this._pollEpoch += 1;
     this._snapshotGeneration += 1;
+    this._messageRequestGeneration += 1;
+    this._remoteRequestGeneration += 1;
+    this._tracerouteRequestGeneration += 1;
+    this._tracerouteStatusRequestGeneration += 1;
     this._settingsRequestGeneration += 1;
+    this._stopGraphAnimation();
+    this._graphPositions.clear();
+    this._messages = [];
+    this._messageConversation = "broadcast:0";
+    this._messageLoading = false;
+    this._messageError = null;
+    this._draft.message = "";
+    this._draft.delivery = "broadcast";
+    this._draft.recipient = "";
+    this._draft.channel = "0";
+    this._remoteGatewayId = "";
+    this._remoteTargetNode = "";
+    this._remoteSettingsSnapshot = null;
+    this._remoteSettingsDraft = {};
+    this._remoteSettingsPreview = null;
+    this._remoteSettingsStatus = null;
+    this._remoteSettingsBusy = null;
+    this._remoteSettingsConfirmed = false;
+    this._tracerouteGatewayId = "";
+    this._tracerouteTargetNode = "";
+    this._tracerouteConfirmation = null;
+    this._tracerouteResults = {};
+    this._tracerouteStatus = null;
+    this._tracerouteBusy = false;
+    this._tracerouteGlobalStatus = null;
+    this._tracerouteStatusReady = false;
+    this._tracerouteStatusLoading = false;
+    this._tracerouteStatusAttempted = false;
     this._settingsBusy = null;
     // Treat navigation away from the panel as abandoning the draft. Secret
     // replacements must not linger on a detached custom-element instance.
@@ -116,6 +181,9 @@ class MeshNetPanel extends HTMLElement {
   async _load(epoch) {
     try {
       await this._refreshSnapshot(epoch, "snapshot_request");
+      if (this._activeView === "messages") {
+        await this._loadMessages(100, false);
+      }
     } catch (error) {
       if (!this._failureWasRecorded(error)) {
         this._recordFailure("poll_unexpected", "lifecycle", error);
@@ -278,6 +346,8 @@ class MeshNetPanel extends HTMLElement {
       "render",
       "bind_composer",
       "bind_nodes",
+      "bind_graph",
+      "bind_messages",
       "restore_focus",
       "composer_event",
       "sort_event",
@@ -288,12 +358,21 @@ class MeshNetPanel extends HTMLElement {
       "invalid_recipient",
       "send_submission",
       "send_finalize",
+      "messages_load",
       "settings_get",
       "settings_preview",
       "settings_apply",
       "settings_event",
       "bind_settings",
       "bind_views",
+      "bind_remote_controls",
+      "remote_control_event",
+      "remote_settings_get",
+      "remote_settings_preview",
+      "remote_settings_apply",
+      "traceroute_event",
+      "traceroute_request",
+      "traceroute_status",
       "reporting",
     ], "poll_unexpected");
     const safeCategory = this._safeOperation(category, [
@@ -384,6 +463,8 @@ class MeshNetPanel extends HTMLElement {
       render: "render",
       bind_composer: "event_handler",
       bind_nodes: "event_handler",
+      bind_graph: "event_handler",
+      bind_messages: "event_handler",
       restore_focus: "event_handler",
       composer_event: "event_handler",
       sort_event: "event_handler",
@@ -394,12 +475,21 @@ class MeshNetPanel extends HTMLElement {
       invalid_recipient: "invalid_recipient",
       send_submission: "send_message",
       send_finalize: "render",
+      messages_load: "messages",
       settings_get: "settings_get",
       settings_preview: "settings_preview",
       settings_apply: "settings_apply",
       settings_event: "event_handler",
       bind_settings: "event_handler",
       bind_views: "event_handler",
+      bind_remote_controls: "event_handler",
+      remote_control_event: "event_handler",
+      remote_settings_get: "remote_settings_get",
+      remote_settings_preview: "remote_settings_preview",
+      remote_settings_apply: "remote_settings_apply",
+      traceroute_event: "event_handler",
+      traceroute_request: "traceroute",
+      traceroute_status: "traceroute",
       reporting: "reporting",
     };
     let operation = operationMap[event.operation] || "reporting";
@@ -465,6 +555,7 @@ class MeshNetPanel extends HTMLElement {
       snapshot_timeout: "timeout",
       post_send_refresh: "post_send_refresh_failed",
       send_message: "send_failed",
+      messages: "message_load_failed",
       settings_get: "settings_load_failed",
       settings_preview: "settings_preview_failed",
       settings_apply: "settings_apply_failed",
@@ -620,6 +711,10 @@ class MeshNetPanel extends HTMLElement {
       this._renderSettings(composerFocus);
       return;
     }
+    if (this._activeView === "messages") {
+      this._renderMessages(composerFocus);
+      return;
+    }
     const snapshot = this._snapshot || { nodes: {}, gateways: {}, recent_messages: [] };
     const sourceNodes = Object.values(snapshot.nodes || {}).filter(
       (node) => node && typeof node === "object" && !Array.isArray(node),
@@ -647,7 +742,7 @@ class MeshNetPanel extends HTMLElement {
     const hintedNodeCount = nodes.filter((node) => node._name_hint_exact_node_id === true).length;
     const favoriteLabelConfigured = snapshot.panel_metadata
       && snapshot.panel_metadata.favorite_label_configured === true;
-    const topology = this._passiveTopology(nodes, gateways);
+    const topology = this._passiveTopology(nodes, gateways, this._graphLimit);
     this.innerHTML = `
       <style>
         :host {
@@ -756,6 +851,13 @@ class MeshNetPanel extends HTMLElement {
           height: min(68vh, 720px);
           min-height: 420px;
           display: block;
+          touch-action: none;
+        }
+        .topology [data-graph-key] {
+          cursor: grab;
+        }
+        .topology [data-graph-key]:active {
+          cursor: grabbing;
         }
         .side {
           display: flex;
@@ -840,6 +942,97 @@ class MeshNetPanel extends HTMLElement {
         .field-help {
           color: var(--secondary-text-color);
           font-size: 11px;
+        }
+        .operator-controls {
+          display: grid;
+          gap: 9px;
+        }
+        .operator-controls label {
+          display: grid;
+          gap: 4px;
+          color: var(--secondary-text-color);
+          font-size: 12px;
+        }
+        .operator-controls select,
+        .operator-controls input[type="text"],
+        .operator-controls input[type="number"] {
+          width: 100%;
+          box-sizing: border-box;
+          border: 1px solid var(--divider-color);
+          border-radius: 6px;
+          padding: 7px;
+          color: var(--primary-text-color);
+          background: var(--card-background-color);
+          font: inherit;
+        }
+        .operator-actions {
+          display: flex;
+          flex-wrap: wrap;
+          align-items: center;
+          gap: 7px;
+        }
+        .operator-button {
+          border: 1px solid var(--primary-color);
+          border-radius: 6px;
+          padding: 7px 10px;
+          color: var(--primary-color);
+          background: transparent;
+          cursor: pointer;
+          font: inherit;
+        }
+        .operator-button.primary {
+          color: var(--text-primary-color, #fff);
+          background: var(--primary-color);
+        }
+        .operator-button:disabled {
+          cursor: default;
+          opacity: 0.55;
+        }
+        .operator-status {
+          min-height: 17px;
+          overflow-wrap: anywhere;
+          font-size: 12px;
+        }
+        .operator-card {
+          display: grid;
+          gap: 8px;
+          margin-top: 10px;
+          padding-top: 10px;
+          border-top: 1px solid var(--divider-color);
+        }
+        .operator-card h3 {
+          margin: 0;
+          font-size: 14px;
+          font-weight: 500;
+        }
+        .operator-field {
+          display: grid;
+          gap: 4px;
+        }
+        .controller-key {
+          display: block;
+          padding: 7px;
+          border: 1px solid var(--divider-color);
+          border-radius: 6px;
+          overflow-wrap: anywhere;
+          user-select: all;
+          font: 11px var(--code-font-family, monospace);
+        }
+        .confirmation-box {
+          display: grid;
+          grid-template-columns: auto 1fr;
+          align-items: start;
+          gap: 7px;
+          padding: 8px;
+          border: 1px solid var(--warning-color, #b26a00);
+          border-radius: 6px;
+          color: var(--primary-text-color);
+          font-size: 12px;
+        }
+        .route-list {
+          margin: 2px 0 0;
+          padding-left: 20px;
+          font-size: 12px;
         }
         .diagnostic-detail {
           color: var(--secondary-text-color);
@@ -1015,6 +1208,8 @@ class MeshNetPanel extends HTMLElement {
               </div>
             `).join("") || `<div class="label">No gateways configured</div>`}
           </section>
+          ${this._remoteAdminPanel(nodes, gateways)}
+          ${this._traceroutePanel(nodes, gateways)}
           ${this._panelDiagnostics(snapshot.panel_metadata, nodes)}
           <section class="panel">
             <div class="panel-heading">
@@ -1078,7 +1273,315 @@ class MeshNetPanel extends HTMLElement {
     this._safeStep("bind_views", "binding", () => this._bindViewControls());
     this._safeStep("bind_composer", "binding", () => this._bindComposer());
     this._safeStep("bind_nodes", "binding", () => this._bindNodeControls());
+    this._safeStep("bind_remote_controls", "binding", () => this._bindAdvancedControls());
+    this._safeStep("bind_graph", "binding", () => this._bindGraphControls(topology));
     this._safeStep("restore_focus", "focus", () => this._restoreComposerFocus(composerFocus));
+  }
+
+  _remoteGatewayCandidates(gateways) {
+    return (Array.isArray(gateways) ? gateways : []).filter((gateway) => (
+      gateway
+      && typeof gateway === "object"
+      && !Array.isArray(gateway)
+      && typeof gateway.gateway_id === "string"
+      && gateway.gateway_id.length >= 1
+      && gateway.gateway_id.length <= 128
+      && gateway.gateway_id === gateway.gateway_id.trim()
+      && String(gateway.protocol || "").trim().toLowerCase() === "meshtastic"
+      && String(gateway.transport || "").trim().toLowerCase() === "bluetooth"
+      && gateway.connected === true
+    ));
+  }
+
+  _remoteNodeCandidates(nodes) {
+    const seen = new Set();
+    return (Array.isArray(nodes) ? nodes : []).filter((node) => {
+      const nodeId = this._meshtasticNodeId(node);
+      if (!this._isExactRemoteTarget(nodeId) || seen.has(nodeId)) return false;
+      seen.add(nodeId);
+      return true;
+    });
+  }
+
+  _isExactRemoteTarget(value) {
+    return typeof value === "string"
+      && /^![0-9a-f]{8}$/.test(value)
+      && !["!00000000", "!ffffffff"].includes(value);
+  }
+
+  _isExactTracerouteTarget(value) {
+    return typeof value === "string"
+      && /^meshtastic:![0-9a-f]{8}$/.test(value)
+      && !["meshtastic:!00000000", "meshtastic:!ffffffff"].includes(value);
+  }
+
+  _operatorGatewayOptions(gateways, selected) {
+    if (!gateways.length) return '<option value="">No connected Meshtastic Bluetooth gateway</option>';
+    return gateways.map((gateway) => {
+      const gatewayId = gateway.gateway_id;
+      const name = typeof gateway.name === "string" && gateway.name.trim()
+        ? gateway.name.trim()
+        : gatewayId;
+      const label = name === gatewayId ? name : `${name} (${gatewayId})`;
+      return `<option value="${this._escape(gatewayId)}"${this._selected(selected, gatewayId)}>${this._escape(label)}</option>`;
+    }).join("");
+  }
+
+  _operatorTargetOptions(nodes, selected, { traceroute = false } = {}) {
+    if (!nodes.length) return '<option value="">No exact Meshtastic node available</option>';
+    return nodes.map((node) => {
+      const nodeId = this._meshtasticNodeId(node);
+      const value = traceroute ? `meshtastic:${nodeId}` : nodeId;
+      const label = this._nodeName(node);
+      const visible = label.includes(nodeId) ? label : `${label} · ${nodeId}`;
+      return `<option value="${this._escape(value)}"${this._selected(selected, value)}>${this._escape(visible)}</option>`;
+    }).join("");
+  }
+
+  _remoteAdminPanel(nodes, gateways) {
+    const compatibleGateways = this._remoteGatewayCandidates(gateways);
+    const compatibleNodes = this._remoteNodeCandidates(nodes);
+    const selectedGateway = compatibleGateways.some(
+      (gateway) => gateway.gateway_id === this._remoteGatewayId,
+    ) ? this._remoteGatewayId : compatibleGateways[0] && compatibleGateways[0].gateway_id || "";
+    const selectedTarget = compatibleNodes.some(
+      (node) => this._meshtasticNodeId(node) === this._remoteTargetNode,
+    ) ? this._remoteTargetNode : compatibleNodes[0] ? this._meshtasticNodeId(compatibleNodes[0]) : "";
+    const snapshot = this._remoteSettingsSnapshot;
+    const snapshotMatches = snapshot
+      && snapshot.gateway_id === selectedGateway
+      && snapshot.target_node === selectedTarget;
+    const fields = snapshotMatches ? this._remoteSettingsFields(snapshot) : [];
+    const hasDraft = Object.keys(this._remoteSettingsDraft).length > 0;
+    const busy = this._remoteSettingsBusy != null;
+    return `
+      <section class="panel" id="meshnet-remote-admin-panel">
+        <h2>Remote node administration</h2>
+        <div class="field-help">Explicit Meshtastic Bluetooth requests only. Loading is read-only; every write requires a preview and a separate confirmation.</div>
+        <div class="operator-controls">
+          <label>Gateway
+            <select id="meshnet-remote-gateway"${compatibleGateways.length ? "" : " disabled"}>
+              ${this._operatorGatewayOptions(compatibleGateways, selectedGateway)}
+            </select>
+          </label>
+          <label>Exact target node
+            <select id="meshnet-remote-target"${compatibleNodes.length ? "" : " disabled"}>
+              ${this._operatorTargetOptions(compatibleNodes, selectedTarget)}
+            </select>
+          </label>
+          <div class="operator-actions">
+            <button class="operator-button" id="meshnet-remote-load" type="button"${busy || !selectedGateway || !selectedTarget ? " disabled" : ""}>${this._remoteSettingsBusy === "get" ? "Loading…" : "Load / test access"}</button>
+          </div>
+          ${snapshotMatches ? `
+            <section class="operator-card">
+              <h3>${this._escape(this._remoteTargetLabel(snapshot.target))}</h3>
+              <div class="field-help">Controller ${this._escape(this._remoteControllerLabel(snapshot.controller))}</div>
+              <label>Controller public key (copy-only)
+                <code class="controller-key" id="meshnet-controller-public-key">${this._escape(snapshot.controller.public_key)}</code>
+              </label>
+              <div class="operator-actions">
+                <button class="operator-button" id="meshnet-controller-key-copy" type="button">Copy controller public key</button>
+              </div>
+            </section>
+            <form class="operator-card" id="meshnet-remote-settings-form">
+              ${snapshot.categories.map((category) => `
+                <section class="operator-card">
+                  <h3>${this._escape(category.label)}</h3>
+                  ${category.fields.map((field) => this._remoteSettingsField(
+                    field,
+                    fields.findIndex((candidate) => candidate.path === field.path),
+                  )).join("")}
+                </section>
+              `).join("")}
+              <div class="operator-actions">
+                <button class="operator-button primary" id="meshnet-remote-preview" type="submit"${busy || !hasDraft || this._remoteSettingsPreview ? " disabled" : ""}>${this._remoteSettingsBusy === "preview" ? "Preparing preview…" : "Preview remote changes"}</button>
+              </div>
+            </form>
+            ${this._remoteSettingsPreviewPanel()}
+          ` : ""}
+          <div class="operator-status ${this._remoteSettingsStatusClass()}" id="meshnet-remote-status" role="status" aria-live="polite">${this._escape(this._remoteSettingsStatus ? this._remoteSettingsStatus.text : "")}</div>
+        </div>
+      </section>
+    `;
+  }
+
+  _remoteTargetLabel(target) {
+    if (!target || typeof target !== "object") return "Remote node";
+    const names = [target.long_name, target.short_name]
+      .filter((value) => typeof value === "string" && value)
+      .join(" · ");
+    return names ? `${names} · ${target.node_id}` : target.node_id;
+  }
+
+  _remoteControllerLabel(controller) {
+    if (!controller || typeof controller !== "object") return "unknown";
+    return controller.short_name
+      ? `${controller.short_name} · ${controller.node_id}`
+      : controller.node_id;
+  }
+
+  _remoteSettingsFields(snapshot = this._remoteSettingsSnapshot) {
+    if (!snapshot || !Array.isArray(snapshot.categories)) return [];
+    return snapshot.categories.flatMap((category) => category.fields);
+  }
+
+  _remoteSettingsField(field, index) {
+    const value = Object.hasOwn(this._remoteSettingsDraft, field.path)
+      ? this._remoteSettingsDraft[field.path]
+      : field.value;
+    const common = `id="meshnet-remote-setting-${index}" data-remote-setting-index="${index}"${this._remoteSettingsBusy != null || !field.writable ? " disabled" : ""}`;
+    let input;
+    if (field.type === "boolean") {
+      input = `<input ${common} type="checkbox"${value === true ? " checked" : ""}>`;
+    } else if (field.type === "select") {
+      const selectedIndex = field.options.findIndex(
+        (option) => this._settingValuesEqual(option.value, value),
+      );
+      input = `<select ${common}>${field.options.map((option, optionIndex) => `<option value="${optionIndex}"${optionIndex === selectedIndex ? " selected" : ""}>${this._escape(option.label)}</option>`).join("")}</select>`;
+    } else if (field.type === "integer" || field.type === "number") {
+      const attributes = [
+        field.min != null ? `min="${this._escape(field.min)}"` : "",
+        field.max != null ? `max="${this._escape(field.max)}"` : "",
+        field.step != null ? `step="${this._escape(field.step)}"` : field.type === "integer" ? 'step="1"' : 'step="any"',
+      ].filter(Boolean).join(" ");
+      input = `<input ${common} type="number" ${attributes} value="${this._escape(value)}">`;
+    } else {
+      input = `<input ${common} type="text" value="${this._escape(value)}" maxlength="${field.max_length}">`;
+    }
+    return `
+      <label class="operator-field" for="meshnet-remote-setting-${index}">
+        <span>${this._escape(field.label)}</span>
+        ${input}
+        <span class="field-help">${this._escape(field.path)}</span>
+      </label>
+    `;
+  }
+
+  _remoteSettingsPreviewPanel() {
+    const preview = this._remoteSettingsPreview;
+    if (!preview) return "";
+    return `
+      <section class="operator-card" id="meshnet-remote-preview-result">
+        <h3>Remote write preview</h3>
+        <div class="field-help">Expires ${this._escape(preview.expires_at)}</div>
+        <ul class="route-list">
+          ${preview.changes.map((change) => `<li>${this._escape(change.label)} <span class="field-help">${this._escape(change.path)}</span></li>`).join("")}
+        </ul>
+        <label class="confirmation-box">
+          <input id="meshnet-remote-confirm" type="checkbox"${this._remoteSettingsConfirmed ? " checked" : ""}>
+          <span>I confirm one remote RF write to this exact node. A timeout can have an unknown outcome and will not be retried.</span>
+        </label>
+        <div class="operator-actions">
+          <button class="operator-button primary" id="meshnet-remote-apply" type="button"${this._remoteSettingsBusy != null || !this._remoteSettingsConfirmed ? " disabled" : ""}>${this._remoteSettingsBusy === "apply" ? "Applying…" : "Apply once and verify"}</button>
+        </div>
+      </section>
+    `;
+  }
+
+  _remoteSettingsStatusClass() {
+    const kind = this._remoteSettingsStatus && this._remoteSettingsStatus.kind;
+    return ["good", "warn", "bad"].includes(kind) ? kind : "";
+  }
+
+  _traceroutePanel(nodes, gateways) {
+    const compatibleGateways = this._remoteGatewayCandidates(gateways);
+    const compatibleNodes = this._remoteNodeCandidates(nodes);
+    const selectedGateway = compatibleGateways.some(
+      (gateway) => gateway.gateway_id === this._tracerouteGatewayId,
+    ) ? this._tracerouteGatewayId : compatibleGateways[0] && compatibleGateways[0].gateway_id || "";
+    const selectedTarget = compatibleNodes.some(
+      (node) => `meshtastic:${this._meshtasticNodeId(node)}` === this._tracerouteTargetNode,
+    ) ? this._tracerouteTargetNode : compatibleNodes[0]
+      ? `meshtastic:${this._meshtasticNodeId(compatibleNodes[0])}`
+      : "";
+    const pending = this._tracerouteConfirmation
+      && this._tracerouteConfirmation.gateway_id === selectedGateway
+      && this._tracerouteConfirmation.target_node === selectedTarget;
+    const result = this._tracerouteResultFor(selectedGateway, selectedTarget);
+    const cooldown = this._tracerouteCooldownActive(selectedGateway, selectedTarget);
+    return `
+      <section class="panel" id="meshnet-traceroute-panel">
+        <h2>Manual traceroute</h2>
+        <div class="field-help">This sends RF traffic. It is never run by polling, graph animation, startup, or automation. One attempt starts an integration-wide one-hour cooldown.</div>
+        <div class="operator-controls">
+          <label>Gateway
+            <select id="meshnet-traceroute-gateway"${compatibleGateways.length ? "" : " disabled"}>
+              ${this._operatorGatewayOptions(compatibleGateways, selectedGateway)}
+            </select>
+          </label>
+          <label>Exact destination
+            <select id="meshnet-traceroute-target"${compatibleNodes.length ? "" : " disabled"}>
+              ${this._operatorTargetOptions(compatibleNodes, selectedTarget, { traceroute: true })}
+            </select>
+          </label>
+          <div class="operator-actions">
+            <button class="operator-button" id="meshnet-traceroute-start" type="button"${this._tracerouteBusy || this._tracerouteStatusLoading || !this._tracerouteStatusReady || cooldown || !selectedGateway || !selectedTarget ? " disabled" : ""}>${this._tracerouteBusy ? "Waiting for route…" : this._tracerouteStatusLoading ? "Checking cooldown…" : "Traceroute"}</button>
+            <button class="operator-button" id="meshnet-traceroute-status-reload" type="button"${this._tracerouteStatusLoading || this._tracerouteBusy ? " disabled" : ""}>${this._tracerouteStatusLoading ? "Checking…" : "Reload persisted status"}</button>
+          </div>
+          ${this._tracerouteGlobalStatusPanel()}
+          ${pending ? `
+            <div class="confirmation-box">
+              <span aria-hidden="true">⚠</span>
+              <span>Confirm one unicast RouteDiscovery packet to <strong>${this._escape(selectedTarget)}</strong>. Do not repeat after a timeout.</span>
+            </div>
+            <div class="operator-actions">
+              <button class="operator-button primary" id="meshnet-traceroute-confirm" type="button"${this._tracerouteBusy ? " disabled" : ""}>Confirm one traceroute</button>
+              <button class="operator-button" id="meshnet-traceroute-cancel" type="button"${this._tracerouteBusy ? " disabled" : ""}>Cancel</button>
+            </div>
+          ` : ""}
+          ${result ? this._tracerouteResultPanel(result) : ""}
+          <div class="operator-status ${this._tracerouteStatusClass()}" id="meshnet-traceroute-status" role="status" aria-live="polite">${this._escape(this._tracerouteStatus ? this._tracerouteStatus.text : "")}</div>
+        </div>
+      </section>
+    `;
+  }
+
+  _tracerouteResultPanel(result) {
+    const route = result.forward_route || [];
+    const reverse = result.reverse_route || [];
+    const towards = result.snr_towards || [];
+    const back = result.snr_back || [];
+    return `
+      <section class="operator-card">
+        <h3>Most recent explicit result</h3>
+        ${result.correlation_id ? `<div class="field-help">Correlation ${this._escape(result.correlation_id)}</div>` : ""}
+        <div class="field-help">Gateway: ${this._escape(result.gateway_id)}</div>
+        ${result.completed_at ? `<div class="field-help">Completed: ${this._escape(this._timestampDisplay(result.completed_at))}</div>` : ""}
+        <div><strong>Forward route</strong>${route.length ? `<ol class="route-list">${route.map((hop) => `<li>${this._escape(hop)}</li>`).join("")}</ol>` : '<div class="field-help">No forward hops reported.</div>'}</div>
+        <div><strong>Reverse route</strong>${reverse.length ? `<ol class="route-list">${reverse.map((hop) => `<li>${this._escape(hop)}</li>`).join("")}</ol>` : '<div class="field-help">No reverse hops reported.</div>'}</div>
+        ${towards.length ? `<div class="field-help">Forward SNR: ${this._escape(this._formatTracerouteSnr(towards))}</div>` : ""}
+        ${back.length ? `<div class="field-help">Reverse SNR: ${this._escape(this._formatTracerouteSnr(back))}</div>` : ""}
+        ${result.next_allowed_at ? `<div class="field-help">Next permitted attempt: ${this._escape(this._timestampDisplay(result.next_allowed_at))}</div>` : ""}
+      </section>
+    `;
+  }
+
+  _tracerouteGlobalStatusPanel() {
+    const status = this._tracerouteGlobalStatus;
+    if (!status) {
+      return this._tracerouteStatusLoading
+        ? '<div class="field-help">Checking the persisted global cooldown…</div>'
+        : '<div class="field-help warn">Persisted cooldown has not been verified. RF control remains locked.</div>';
+    }
+    if (status.status !== "cooldown") {
+      return '<div class="field-help good">No persisted global traceroute cooldown is active.</div>';
+    }
+    return `
+      <div class="operator-card">
+        <strong>Global cooldown active</strong>
+        <div class="field-help">Reserved by ${this._escape(status.gateway_id)} → ${this._escape(status.target_node)}</div>
+        <div class="field-help">Next permitted attempt: ${this._escape(this._timestampDisplay(status.next_allowed_at))}</div>
+      </div>
+    `;
+  }
+
+  _formatTracerouteSnr(values) {
+    return values.map((value) => `${Number(value)} dB`).join(" · ");
+  }
+
+  _tracerouteStatusClass() {
+    const kind = this._tracerouteStatus && this._tracerouteStatus.kind;
+    return ["good", "warn", "bad"].includes(kind) ? kind : "";
   }
 
   _composerFocusState() {
@@ -1091,6 +1594,21 @@ class MeshNetPanel extends HTMLElement {
       "meshnet-channel",
       "meshnet-priority",
       "meshnet-node-sort",
+      "meshnet-message-conversation",
+      "meshnet-graph-limit",
+      "meshnet-remote-gateway",
+      "meshnet-remote-target",
+      "meshnet-remote-load",
+      "meshnet-remote-preview",
+      "meshnet-remote-confirm",
+      "meshnet-remote-apply",
+      "meshnet-controller-key-copy",
+      "meshnet-traceroute-gateway",
+      "meshnet-traceroute-target",
+      "meshnet-traceroute-start",
+      "meshnet-traceroute-status-reload",
+      "meshnet-traceroute-confirm",
+      "meshnet-traceroute-cancel",
     ];
     if (!active || !this.contains(active) || !fieldIds.includes(active.id)) return null;
     return {
@@ -1105,6 +1623,7 @@ class MeshNetPanel extends HTMLElement {
     if (!active || !this.contains(active)) return null;
     const id = typeof active.id === "string" ? active.id : "";
     let isSetting = id.startsWith("meshnet-setting-")
+      || id.startsWith("meshnet-remote-setting-")
       || [
         "meshnet-settings-gateway",
         "meshnet-settings-preview",
@@ -1112,13 +1631,15 @@ class MeshNetPanel extends HTMLElement {
         "meshnet-settings-critical",
         "meshnet-settings-reload",
         "meshnet-view-mesh",
+        "meshnet-view-messages",
         "meshnet-view-settings",
       ].includes(id);
     try {
       isSetting = isSetting
         || (typeof active.hasAttribute === "function"
           && (active.hasAttribute("data-setting-index")
-            || active.hasAttribute("data-setting-clear-index")));
+            || active.hasAttribute("data-setting-clear-index")
+            || active.hasAttribute("data-remote-setting-index")));
     } catch (_ignored) {
       // A disappearing browser control is not an active settings editor.
     }
@@ -1131,6 +1652,7 @@ class MeshNetPanel extends HTMLElement {
   }
 
   _panelInteractionActive() {
+    if (this._graphDrag) return true;
     if (this._composerFocusState() || this._settingsFocusState()) return true;
     const active = this._activePanelElement();
     if (!active || !this.contains(active)) return false;
@@ -1186,6 +1708,7 @@ class MeshNetPanel extends HTMLElement {
     return `
       <nav class="view-tabs" aria-label="MeshNet views">
         <button id="meshnet-view-mesh" class="view-tab${this._activeView === "mesh" ? " active" : ""}" type="button" data-meshnet-view="mesh"${this._activeView === "mesh" ? ' aria-current="page"' : ""}>Mesh</button>
+        <button id="meshnet-view-messages" class="view-tab${this._activeView === "messages" ? " active" : ""}" type="button" data-meshnet-view="messages"${this._activeView === "messages" ? ' aria-current="page"' : ""}>Messages</button>
         <button id="meshnet-view-settings" class="view-tab${this._activeView === "settings" ? " active" : ""}" type="button" data-meshnet-view="settings"${this._activeView === "settings" ? ' aria-current="page"' : ""}>Gateway settings</button>
       </nav>
     `;
@@ -1203,12 +1726,16 @@ class MeshNetPanel extends HTMLElement {
   }
 
   _switchView(view) {
-    const next = view === "settings" ? "settings" : "mesh";
+    const next = ["mesh", "messages", "settings"].includes(view) ? view : "mesh";
     if (this._activeView === next) return;
+    if (this._activeView === "mesh" && next !== "mesh") this._stopGraphAnimation();
     this._activeView = next;
     this._safeRender("render");
     if (next === "settings" && !this._settingsSnapshot && this._settingsBusy !== "get") {
       void this._loadGatewaySettings();
+    }
+    if (next === "messages" && !this._messageLoading) {
+      void this._loadMessages(100);
     }
   }
 
@@ -2339,6 +2866,396 @@ class MeshNetPanel extends HTMLElement {
     return type === "select" && this._settingScalar(value);
   }
 
+  _messageString(value, maximum = 256, { required = false } = {}) {
+    if (value == null && !required) return null;
+    if (typeof value !== "string") return null;
+    if ((required && !value) || value.length > maximum) return null;
+    return value;
+  }
+
+  _messageTextIsValid(value) {
+    if (typeof value !== "string" || !value) return false;
+    try {
+      const bytes = new TextEncoder().encode(value);
+      if (!bytes.length || bytes.length > 237) return false;
+      return new TextDecoder("utf-8", { fatal: true }).decode(bytes) === value;
+    } catch (_ignored) {
+      return false;
+    }
+  }
+
+  _sanitizeMessageRecord(record) {
+    if (!record || typeof record !== "object" || Array.isArray(record)) return null;
+    const messageId = this._messageString(record.message_id, 256, { required: true });
+    const protocol = this._messageString(record.protocol, 32, { required: true });
+    const gatewayId = this._messageString(record.gateway_id, 128, { required: true });
+    const sender = this._messageString(record.sender, 128);
+    const receiver = this._messageString(record.receiver, 128);
+    const text = record.text;
+    const direction = record.direction;
+    const timestamp = this._messageString(record.timestamp, 64, { required: true });
+    const raw = record.raw == null ? {} : record.raw;
+    if (
+      !messageId
+      || !protocol
+      || !gatewayId
+      || (record.sender != null && sender == null)
+      || (record.receiver != null && receiver == null)
+      || !this._messageTextIsValid(text)
+      || !["rx", "tx"].includes(direction)
+      || !timestamp
+      || !Number.isFinite(Date.parse(timestamp))
+      || !raw
+      || typeof raw !== "object"
+      || Array.isArray(raw)
+    ) return null;
+
+    let channel = null;
+    if (record.channel != null) {
+      const value = typeof record.channel === "number"
+        && Number.isSafeInteger(record.channel)
+        ? String(record.channel)
+        : record.channel;
+      if (typeof value !== "string" || !/^[0-7]$/.test(value)) return null;
+      channel = value;
+    }
+    const messageType = ["broadcast", "direct", "group", "emergency"].includes(
+      record.message_type,
+    ) ? record.message_type : "broadcast";
+    const priority = ["normal", "high", "emergency"].includes(record.priority)
+      ? record.priority
+      : "normal";
+    const encrypted = record.encrypted == null ? null : record.encrypted;
+    if (encrypted != null && typeof encrypted !== "boolean") return null;
+    const hops = record.hops == null ? null : record.hops;
+    if (hops != null && (!Number.isSafeInteger(hops) || hops < 0 || hops > 255)) return null;
+
+    const explicitDelivery = Object.prototype.hasOwnProperty.call(record, "delivery");
+    let delivery = explicitDelivery ? record.delivery : null;
+    if (delivery != null && !["broadcast", "channel", "direct", "unknown"].includes(delivery)) {
+      return null;
+    }
+    let peerNodeKey = this._messageString(record.peer_node_key, 128);
+    if (record.peer_node_key != null && peerNodeKey == null) return null;
+    if (!delivery) {
+      if (messageType === "direct" && direction === "tx" && receiver) {
+        delivery = "direct";
+        peerNodeKey = peerNodeKey || receiver;
+      } else if (this._messageIsBroadcastReceiver(receiver) && channel != null) {
+        delivery = channel === "0" ? "broadcast" : "channel";
+      } else {
+        delivery = "unknown";
+      }
+    }
+    if (delivery === "direct" && !peerNodeKey) return null;
+    if (delivery === "broadcast" && channel !== "0") return null;
+    if (delivery === "channel" && (channel == null || channel === "0")) return null;
+
+    const safeRaw = {};
+    if (["blocked", "queued", "sent", "failed"].includes(raw.status)) {
+      safeRaw.status = raw.status;
+    }
+    if (typeof raw.last_error_code === "string" && raw.last_error_code.length <= 64) {
+      safeRaw.last_error_code = raw.last_error_code;
+    }
+    return {
+      message_id: messageId,
+      protocol,
+      gateway_id: gatewayId,
+      sender,
+      receiver,
+      channel,
+      text,
+      message_type: messageType,
+      priority,
+      encrypted,
+      hops,
+      timestamp,
+      direction,
+      delivery,
+      peer_node_key: delivery === "direct" ? peerNodeKey : null,
+      raw: safeRaw,
+    };
+  }
+
+  _messageIsBroadcastReceiver(value) {
+    if (value == null) return false;
+    const normalized = String(value).trim().toLowerCase();
+    return ["^all", "!ffffffff", "ffffffff", "4294967295"].includes(normalized);
+  }
+
+  _validateMessagesResponse(response) {
+    if (!Array.isArray(response)) {
+      throw { name: "PanelSchemaError", code: "messages_not_array" };
+    }
+    return response.slice(-500)
+      .map((record) => this._sanitizeMessageRecord(record))
+      .filter((record) => record != null);
+  }
+
+  async _loadMessages(limit = 100, render = true) {
+    const boundedLimit = Number.isSafeInteger(limit) && limit >= 1 && limit <= 500
+      ? limit
+      : 100;
+    const generation = ++this._messageRequestGeneration;
+    this._messageLoading = true;
+    this._messageError = null;
+    try {
+      const response = await this._withTimeout(
+        this._hass.callWS({ type: "meshnet/messages", limit: boundedLimit }),
+        15000,
+      );
+      const messages = this._validateMessagesResponse(response);
+      if (generation !== this._messageRequestGeneration) return messages;
+      this._messages = messages;
+      this._messageLoading = false;
+      this._messageError = null;
+      this._markOperationSuccess("messages_load");
+      if (render && this._activeView === "messages") this._safeRender("render");
+      return messages;
+    } catch (error) {
+      if (generation !== this._messageRequestGeneration) return [];
+      this._messageLoading = false;
+      this._messageError = "Message history unavailable";
+      if (!this._failureWasRecorded(error)) {
+        this._recordFailure(
+          "messages_load",
+          this._safeErrorCode(error) === "timeout" ? "timeout" : "websocket",
+          error,
+        );
+      }
+      if (render && this._activeView === "messages") this._safeRender("render");
+      return [];
+    }
+  }
+
+  _messageConversationKey(message) {
+    if (!message || typeof message !== "object") return "unknown";
+    if (message.delivery === "direct" && typeof message.peer_node_key === "string"
+      && message.peer_node_key) {
+      return `direct:${message.peer_node_key}`;
+    }
+    if (message.delivery === "channel" && /^[1-7]$/.test(String(message.channel))) {
+      return `channel:${message.channel}`;
+    }
+    if (message.delivery === "broadcast" && String(message.channel) === "0") {
+      return "broadcast:0";
+    }
+    return "unknown";
+  }
+
+  _messageNodeForPeer(peerKey, nodes) {
+    const peer = String(peerKey || "");
+    const canonicalPeer = this._parseMeshtasticNodeId(peer);
+    return nodes.find((node) => {
+      if (!node || typeof node !== "object") return false;
+      if (String(node.node_key || "") === peer || String(node.node_id || "") === peer) return true;
+      const nodeId = this._meshtasticNodeId(node);
+      return Boolean(canonicalPeer && nodeId === canonicalPeer);
+    }) || null;
+  }
+
+  _messagePeerLabel(peerKey, nodes) {
+    const node = this._messageNodeForPeer(peerKey, nodes);
+    if (!node) return String(peerKey || "Unknown peer");
+    const label = this._nodeName(node);
+    const nodeId = this._meshtasticNodeId(node) || String(node.node_id || node.node_key || "");
+    return nodeId && !label.includes(nodeId) ? `${label} · ${nodeId}` : label;
+  }
+
+  _messageConversations(messages, nodes) {
+    const safeNodes = Array.isArray(nodes)
+      ? nodes.filter((node) => node && typeof node === "object" && !Array.isArray(node))
+      : [];
+    const groups = new Map([
+      ["broadcast:0", {
+        key: "broadcast:0",
+        kind: "broadcast",
+        label: "Broadcast / Primary",
+        messages: [],
+      }],
+    ]);
+    (Array.isArray(messages) ? messages : []).forEach((candidate) => {
+      const message = this._sanitizeMessageRecord(candidate);
+      if (!message) return;
+      const key = this._messageConversationKey(message);
+      if (!groups.has(key)) {
+        let kind = "unknown";
+        let label = "Unknown delivery";
+        if (key === "broadcast:0") {
+          kind = "broadcast";
+          label = "Broadcast / Primary";
+        } else if (key.startsWith("channel:")) {
+          kind = "channel";
+          label = `Channel ${key.slice("channel:".length)}`;
+        } else if (key.startsWith("direct:")) {
+          kind = "direct";
+          label = this._messagePeerLabel(key.slice("direct:".length), safeNodes);
+        }
+        groups.set(key, { key, kind, label, messages: [] });
+      }
+      groups.get(key).messages.push(message);
+    });
+    const rank = (conversation) => conversation.kind === "broadcast"
+      ? 0
+      : conversation.kind === "channel"
+        ? 1
+        : conversation.kind === "direct"
+          ? 2
+          : 3;
+    return [...groups.values()].sort((left, right) => rank(left) - rank(right)
+      || (left.kind === "channel" ? Number(left.key.slice(8)) - Number(right.key.slice(8)) : 0)
+      || this._compareText(left.label, right.label)
+      || this._compareText(left.key, right.key));
+  }
+
+  _selectMessageConversation(key, conversations, syncDraft = false) {
+    const selected = conversations.find((conversation) => conversation.key === key)
+      || conversations.find((conversation) => conversation.key === "broadcast:0")
+      || conversations[0]
+      || { key: "broadcast:0", kind: "broadcast", messages: [] };
+    this._messageConversation = selected.key;
+    if (syncDraft) {
+      if (selected.kind === "direct") {
+        this._draft.delivery = "direct";
+        this._draft.recipient = selected.key.slice("direct:".length);
+      } else {
+        this._draft.delivery = "broadcast";
+        this._draft.recipient = "";
+        this._draft.channel = selected.kind === "channel"
+          ? selected.key.slice("channel:".length)
+          : "0";
+      }
+    }
+    return selected;
+  }
+
+  _messageTimestampLabel(value) {
+    const timestamp = Date.parse(value);
+    return Number.isFinite(timestamp) ? new Date(timestamp).toLocaleString() : "Unknown time";
+  }
+
+  _renderMessages(focusState = null) {
+    const snapshot = this._snapshot || { nodes: {}, gateways: {}, recent_messages: [] };
+    const nodes = this._nodesWithExactMeshtasticNameHints(
+      Object.values(snapshot.nodes || {}).filter(
+        (node) => node && typeof node === "object" && !Array.isArray(node),
+      ),
+    );
+    const gateways = Object.values(snapshot.gateways || {}).filter(
+      (gateway) => gateway && typeof gateway === "object" && !Array.isArray(gateway),
+    );
+    const conversations = this._messageConversations(this._messages, nodes);
+    const selected = this._selectMessageConversation(this._messageConversation, conversations);
+    const directDelivery = this._draft.delivery === "direct";
+    const recipientCount = this._recipientChoices(nodes)
+      .filter((choice) => !choice.ambiguous && !choice.invalidIdentity).length;
+    this.innerHTML = `
+      <style>
+        :host { display: block; min-height: 100vh; color: var(--primary-text-color); background: var(--primary-background-color); font-family: var(--paper-font-body1_-_font-family); }
+        .messages-wrap { max-width: 1180px; margin: 0 auto; padding: 16px; box-sizing: border-box; }
+        .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+        h1 { margin: 0; font-size: 22px; font-weight: 500; }
+        .view-tabs { display: flex; gap: 6px; margin: 12px 0; }
+        .view-tab, button { border: 1px solid var(--divider-color); border-radius: 7px; padding: 8px 12px; color: var(--primary-text-color); background: var(--card-background-color); cursor: pointer; font: inherit; }
+        .view-tab.active, .send-button { border-color: var(--primary-color); color: var(--text-primary-color, #fff); background: var(--primary-color); }
+        button:disabled { cursor: default; opacity: 0.55; }
+        .messages-grid { display: grid; grid-template-columns: minmax(210px, 290px) minmax(0, 1fr); gap: 12px; }
+        .card { border: 1px solid var(--divider-color); border-radius: 9px; background: var(--card-background-color); padding: 12px; min-width: 0; }
+        .conversation-select, .composer select, .composer textarea { width: 100%; box-sizing: border-box; border: 1px solid var(--divider-color); border-radius: 6px; padding: 8px; color: var(--primary-text-color); background: var(--card-background-color); font: inherit; }
+        .timeline { min-height: 260px; max-height: 52vh; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+        .message-row { max-width: min(82%, 720px); border-radius: 9px; padding: 9px 11px; background: var(--secondary-background-color); overflow-wrap: anywhere; }
+        .message-row.tx { align-self: end; background: color-mix(in srgb, var(--primary-color) 18%, var(--card-background-color)); }
+        .message-meta, .label, .field-help { color: var(--secondary-text-color); font-size: 11px; }
+        .composer { display: grid; gap: 9px; border-top: 1px solid var(--divider-color); padding-top: 12px; }
+        .composer label { display: grid; gap: 4px; color: var(--secondary-text-color); font-size: 12px; }
+        .composer-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+        .composer textarea { min-height: 84px; resize: vertical; }
+        .send-status { min-height: 18px; font-size: 12px; }
+        .good { color: var(--success-color, #168047); } .warn { color: var(--warning-color, #b26a00); } .bad { color: var(--error-color, #d32f2f); }
+        @media (max-width: 780px) { .messages-wrap { padding: 10px; } .messages-grid { grid-template-columns: 1fr; } }
+      </style>
+      <div class="messages-wrap">
+        <div class="toolbar">
+          <div><h1>MeshNet Messages</h1><div class="label">Cached local message history</div></div>
+          <button id="meshnet-messages-reload" type="button"${this._messageLoading ? " disabled" : ""}>${this._messageLoading ? "Loading…" : "Reload history"}</button>
+        </div>
+        ${this._viewTabs()}
+        <div class="messages-grid">
+          <aside class="card">
+            <label class="label" for="meshnet-message-conversation">Conversation</label>
+            <select class="conversation-select" id="meshnet-message-conversation">
+              ${conversations.map((conversation) => `<option value="${this._escape(conversation.key)}"${this._selected(selected.key, conversation.key)}>${this._escape(conversation.label)} · ${conversation.messages.length}</option>`).join("")
+                || '<option value="broadcast:0">Broadcast / Primary · 0</option>'}
+            </select>
+            <p class="field-help">Direct threads use exact node identity. Duplicate names never merge conversations.</p>
+            ${this._messageError ? `<p class="bad">${this._escape(this._messageError)}</p>` : ""}
+          </aside>
+          <main class="card">
+            <div class="timeline" id="meshnet-message-timeline" aria-live="polite">
+              ${selected.messages.slice(-200).map((message) => `
+                <article class="message-row ${message.direction === "tx" ? "tx" : "rx"}">
+                  <div>${this._escape(message.text)}</div>
+                  <div class="message-meta">${this._escape(message.sender || "unknown")} → ${this._escape(message.receiver || (message.channel == null ? "unknown" : `Channel ${message.channel}`))} · ${this._escape(this._messageTimestampLabel(message.timestamp))}${message.raw.status ? ` · ${this._escape(message.raw.status)}` : ""}</div>
+                </article>
+              `).join("") || '<div class="label">No messages in this conversation.</div>'}
+            </div>
+            <form class="composer" id="meshnet-send-form">
+              <div class="composer-controls">
+                <label>Delivery
+                  <select id="meshnet-delivery">
+                    <option value="broadcast"${this._selected(this._draft.delivery, "broadcast")}>Broadcast / channel</option>
+                    <option value="direct"${this._selected(this._draft.delivery, "direct")}>Direct</option>
+                  </select>
+                </label>
+                <label>Channel
+                  <select id="meshnet-channel">
+                    ${Array.from({ length: 8 }, (_item, channel) => `<option value="${channel}"${this._selected(this._draft.channel, channel)}>${channel === 0 ? "Primary (0)" : `Channel ${channel}`}</option>`).join("")}
+                  </select>
+                </label>
+              </div>
+              <label>Direct recipient
+                <select id="meshnet-recipient"${directDelivery && recipientCount ? " required" : " disabled"}>${this._recipientOptions(nodes)}</select>
+              </label>
+              <label>Gateway
+                <select id="meshnet-gateway">${this._gatewayOptions(gateways)}</select>
+              </label>
+              <label>Message
+                <textarea id="meshnet-message" required placeholder="Type a local mesh message">${this._escape(this._draft.message)}</textarea>
+              </label>
+              <label>Priority
+                <select id="meshnet-priority">
+                  <option value="normal"${this._selected(this._draft.priority, "normal")}>Normal</option>
+                  <option value="high"${this._selected(this._draft.priority, "high")}>High</option>
+                  <option value="emergency"${this._selected(this._draft.priority, "emergency")}>Emergency</option>
+                </select>
+              </label>
+              <button class="send-button" id="meshnet-send-button" type="submit"${this._sending || (directDelivery && !recipientCount) ? " disabled" : ""}>${this._sending ? "Sending…" : "Send"}</button>
+              <div class="send-status ${this._statusClass()}" role="status" aria-live="polite">${this._escape(this._sendStatus ? this._sendStatus.text : "")}</div>
+            </form>
+          </main>
+        </div>
+      </div>
+    `;
+    this._safeStep("bind_views", "binding", () => this._bindViewControls());
+    this._safeStep("bind_messages", "binding", () => this._bindMessageControls(conversations));
+    this._safeStep("bind_composer", "binding", () => this._bindComposer());
+    this._safeStep("restore_focus", "focus", () => this._restoreComposerFocus(focusState));
+  }
+
+  _bindMessageControls(conversations) {
+    const selector = this.querySelector("#meshnet-message-conversation");
+    if (selector) {
+      selector.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
+      selector.addEventListener("change", () => {
+        this._selectMessageConversation(selector.value, conversations, true);
+        this._safeRender("render");
+      });
+    }
+    const reload = this.querySelector("#meshnet-messages-reload");
+    if (reload) reload.addEventListener("click", () => void this._loadMessages(100));
+  }
+
   _bindComposer() {
     const form = this.querySelector("#meshnet-send-form");
     if (!form) return;
@@ -2376,6 +3293,1197 @@ class MeshNetPanel extends HTMLElement {
         () => this._sendMessage(event),
       );
     });
+  }
+
+  _bindAdvancedControls() {
+    const remoteGateway = this.querySelector("#meshnet-remote-gateway");
+    const remoteTarget = this.querySelector("#meshnet-remote-target");
+    const remoteLoad = this.querySelector("#meshnet-remote-load");
+    const remoteForm = this.querySelector("#meshnet-remote-settings-form");
+    const remoteConfirm = this.querySelector("#meshnet-remote-confirm");
+    const remoteApply = this.querySelector("#meshnet-remote-apply");
+    const copyKey = this.querySelector("#meshnet-controller-key-copy");
+    const traceGateway = this.querySelector("#meshnet-traceroute-gateway");
+    const traceTarget = this.querySelector("#meshnet-traceroute-target");
+    const traceStart = this.querySelector("#meshnet-traceroute-start");
+    const traceStatusReload = this.querySelector("#meshnet-traceroute-status-reload");
+    const traceConfirm = this.querySelector("#meshnet-traceroute-confirm");
+    const traceCancel = this.querySelector("#meshnet-traceroute-cancel");
+    [
+      remoteGateway,
+      remoteTarget,
+      remoteLoad,
+      remoteConfirm,
+      remoteApply,
+      copyKey,
+      traceGateway,
+      traceTarget,
+      traceStart,
+      traceStatusReload,
+      traceConfirm,
+      traceCancel,
+    ].filter(Boolean).forEach((control) => {
+      control.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
+    });
+    if (remoteGateway) {
+      remoteGateway.addEventListener("change", () => {
+        this._resetRemoteSelection(remoteGateway.value, remoteTarget && remoteTarget.value || "");
+        this._safeRender("render");
+      });
+    }
+    if (remoteTarget) {
+      remoteTarget.addEventListener("change", () => {
+        this._resetRemoteSelection(remoteGateway && remoteGateway.value || "", remoteTarget.value);
+        this._safeRender("render");
+      });
+    }
+    if (remoteLoad) {
+      remoteLoad.addEventListener("click", () => {
+        this._safeStep("remote_control_event", "binding", () => {
+          void this._loadRemoteSettings(
+            remoteGateway && remoteGateway.value || "",
+            remoteTarget && remoteTarget.value || "",
+          );
+        });
+      });
+    }
+    this.querySelectorAll("[data-remote-setting-index]").forEach((input) => {
+      input.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
+      const eventName = input.type === "checkbox" || input.tagName === "SELECT"
+        ? "change"
+        : "input";
+      input.addEventListener(eventName, () => {
+        this._safeStep("remote_control_event", "binding", () => {
+          this._updateRemoteSettingsDraft(input);
+        });
+      });
+    });
+    if (remoteForm) {
+      remoteForm.addEventListener("submit", (event) => {
+        this._safeStep(
+          "remote_control_event",
+          "binding",
+          () => this._previewRemoteSettings(event),
+        );
+      });
+    }
+    if (remoteConfirm) {
+      remoteConfirm.addEventListener("change", () => {
+        this._remoteSettingsConfirmed = remoteConfirm.checked === true;
+        if (remoteApply) {
+          remoteApply.disabled = !this._remoteSettingsConfirmed
+            || this._remoteSettingsBusy != null;
+        }
+      });
+    }
+    if (remoteApply) {
+      remoteApply.addEventListener("click", () => {
+        this._safeStep(
+          "remote_control_event",
+          "binding",
+          () => this._applyRemoteSettings(),
+        );
+      });
+    }
+    if (copyKey) {
+      copyKey.addEventListener("click", () => {
+        this._safeStep("remote_control_event", "binding", () => {
+          void this._copyControllerPublicKey();
+        });
+      });
+    }
+    if (traceGateway) {
+      traceGateway.addEventListener("change", () => {
+        this._tracerouteGatewayId = traceGateway.value;
+        this._tracerouteConfirmation = null;
+        this._tracerouteStatus = null;
+        this._safeRender("render");
+      });
+    }
+    if (traceTarget) {
+      traceTarget.addEventListener("change", () => {
+        this._tracerouteTargetNode = traceTarget.value;
+        this._tracerouteConfirmation = null;
+        this._tracerouteStatus = null;
+        this._safeRender("render");
+      });
+    }
+    const requestTrace = () => this._requestTraceroute(
+      traceGateway && traceGateway.value || this._tracerouteGatewayId,
+      traceTarget && traceTarget.value || this._tracerouteTargetNode,
+    );
+    if (traceStart) {
+      traceStart.addEventListener("click", () => {
+        this._safeStep("traceroute_event", "binding", () => requestTrace());
+      });
+    }
+    if (traceStatusReload) {
+      traceStatusReload.addEventListener("click", () => {
+        this._safeStep("traceroute_event", "binding", () => {
+          void this._loadTracerouteStatus({ force: true });
+        });
+      });
+    }
+    if (traceConfirm) {
+      traceConfirm.addEventListener("click", () => {
+        this._safeStep("traceroute_event", "binding", () => requestTrace());
+      });
+    }
+    if (traceCancel) {
+      traceCancel.addEventListener("click", () => {
+        this._tracerouteConfirmation = null;
+        this._tracerouteStatus = { kind: "warn", text: "Traceroute cancelled before transmission." };
+        this._safeRender("render");
+      });
+    }
+    this._maybeLoadTracerouteStatus();
+  }
+
+  _resetRemoteSelection(gatewayId, targetNode) {
+    this._remoteRequestGeneration += 1;
+    this._remoteGatewayId = gatewayId;
+    this._remoteTargetNode = targetNode;
+    this._remoteSettingsSnapshot = null;
+    this._remoteSettingsDraft = {};
+    this._remoteSettingsPreview = null;
+    this._remoteSettingsConfirmed = false;
+    this._remoteSettingsStatus = null;
+    this._remoteSettingsBusy = null;
+  }
+
+  _updateRemoteSettingsDraft(input) {
+    const index = Number.parseInt(input.getAttribute("data-remote-setting-index"), 10);
+    const field = this._remoteSettingsFields()[index];
+    if (!field || !field.writable || !this._remoteSettingsSnapshot) return;
+    const value = this._readRemoteSettingInput(field, input);
+    if (this._settingValuesEqual(value, field.value)) {
+      delete this._remoteSettingsDraft[field.path];
+    } else {
+      this._remoteSettingsDraft[field.path] = value;
+    }
+    this._remoteSettingsPreview = null;
+    this._remoteSettingsConfirmed = false;
+    this._remoteSettingsStatus = Object.keys(this._remoteSettingsDraft).length
+      ? { kind: "warn", text: "Draft changed. Preview it before any remote write." }
+      : null;
+    const preview = this.querySelector("#meshnet-remote-preview-result");
+    if (preview && typeof preview.remove === "function") preview.remove();
+    const button = this.querySelector("#meshnet-remote-preview");
+    if (button) button.disabled = !Object.keys(this._remoteSettingsDraft).length;
+  }
+
+  _readRemoteSettingInput(field, input) {
+    if (field.type === "boolean") return input.checked === true;
+    if (field.type === "select") {
+      const optionIndex = Number.parseInt(input.value, 10);
+      return optionIndex >= 0 && optionIndex < field.options.length
+        ? field.options[optionIndex].value
+        : field.value;
+    }
+    return input.value;
+  }
+
+  async _copyControllerPublicKey() {
+    const snapshot = this._remoteSettingsSnapshot;
+    const clipboard = typeof navigator !== "undefined" && navigator.clipboard;
+    if (!snapshot || !clipboard || typeof clipboard.writeText !== "function") {
+      this._remoteSettingsStatus = {
+        kind: "warn",
+        text: "Clipboard access is unavailable. Select and copy the displayed value manually.",
+      };
+      this._safeRender("render");
+      return;
+    }
+    try {
+      await clipboard.writeText(snapshot.controller.public_key);
+      this._remoteSettingsStatus = { kind: "good", text: "Controller public key copied." };
+    } catch (error) {
+      this._recordFailure("remote_control_event", "lifecycle", error);
+      this._remoteSettingsStatus = {
+        kind: "warn",
+        text: "Clipboard access was denied. Select and copy the displayed value manually.",
+      };
+    }
+    this._safeRender("render");
+  }
+
+  _remoteSettingsChanges() {
+    const fields = new Map(
+      this._remoteSettingsFields().map((field) => [field.path, field]),
+    );
+    const draftPaths = Object.keys(this._remoteSettingsDraft);
+    if (!draftPaths.length || draftPaths.length > 32) {
+      throw { name: "ValidationError", code: "invalid_format" };
+    }
+    const changes = {};
+    draftPaths.forEach((path) => {
+      const field = fields.get(path);
+      if (!field || !field.writable) {
+        throw { name: "ValidationError", code: "invalid_format" };
+      }
+      const value = this._coerceRemoteSettingValue(
+        field,
+        this._remoteSettingsDraft[path],
+      );
+      if (!this._settingValuesEqual(value, field.value)) changes[path] = value;
+    });
+    if (!Object.keys(changes).length) {
+      throw { name: "ValidationError", code: "invalid_format" };
+    }
+    return changes;
+  }
+
+  _coerceRemoteSettingValue(field, value) {
+    if (field.type === "boolean") {
+      if (typeof value !== "boolean") throw { name: "ValidationError", code: "invalid_format" };
+      return value;
+    }
+    if (field.type === "integer" || field.type === "number") {
+      if (!["string", "number"].includes(typeof value) || typeof value === "boolean") {
+        throw { name: "ValidationError", code: "invalid_format" };
+      }
+      const text = typeof value === "string" ? value.trim() : value;
+      const number = Number(text);
+      if (
+        text === ""
+        || !Number.isFinite(number)
+        || (field.type === "integer" && !Number.isSafeInteger(number))
+        || (field.min != null && number < field.min)
+        || (field.max != null && number > field.max)
+      ) throw { name: "ValidationError", code: "invalid_format" };
+      return number;
+    }
+    if (field.type === "select") {
+      if (!field.options.some((option) => this._settingValuesEqual(option.value, value))) {
+        throw { name: "ValidationError", code: "invalid_format" };
+      }
+      return value;
+    }
+    if (field.type !== "string" || typeof value !== "string") {
+      throw { name: "ValidationError", code: "invalid_format" };
+    }
+    const byteLength = new TextEncoder().encode(value).length;
+    if (
+      byteLength < 1
+      || byteLength > field.max_length
+      || [...value].some((character) => character.codePointAt(0) < 32)
+    ) throw { name: "ValidationError", code: "invalid_format" };
+    return value;
+  }
+
+  async _loadRemoteSettings(gatewayId, targetNode) {
+    if (
+      this._remoteSettingsBusy != null
+      || !this._hass
+      || typeof this._hass.callWS !== "function"
+    ) return;
+    if (!this._validOperatorGatewayId(gatewayId) || !this._isExactRemoteTarget(targetNode)) {
+      this._remoteSettingsStatus = { kind: "bad", text: "Choose one exact gateway and target node." };
+      this._safeRender("render");
+      return;
+    }
+    const generation = ++this._remoteRequestGeneration;
+    this._remoteGatewayId = gatewayId;
+    this._remoteTargetNode = targetNode;
+    this._remoteSettingsSnapshot = null;
+    this._remoteSettingsDraft = {};
+    this._remoteSettingsPreview = null;
+    this._remoteSettingsConfirmed = false;
+    this._remoteSettingsBusy = "get";
+    this._remoteSettingsStatus = { kind: "warn", text: "Loading remote settings with one read-only request…" };
+    this._safeRender("render");
+    try {
+      const response = await this._withTimeout(this._hass.callWS({
+        type: "meshnet/remote_settings/get",
+        gateway_id: gatewayId,
+        target_node: targetNode,
+      }), 65000);
+      if (generation !== this._remoteRequestGeneration) return;
+      this._remoteSettingsSnapshot = this._sanitizeRemoteSettingsSnapshot(
+        response,
+        gatewayId,
+        targetNode,
+      );
+      this._remoteSettingsStatus = {
+        kind: "good",
+        text: "Remote settings loaded. Edit returned fields, then preview.",
+      };
+      this._markOperationSuccess("remote_settings_get");
+    } catch (error) {
+      if (generation !== this._remoteRequestGeneration) return;
+      this._remoteSettingsSnapshot = null;
+      this._remoteSettingsDraft = {};
+      this._remoteSettingsPreview = null;
+      this._remoteSettingsConfirmed = false;
+      this._recordFailure(
+        "remote_settings_get",
+        this._safeErrorCode(error) === "timeout" ? "timeout" : this._safeErrorType(error) === "PanelSchemaError" ? "schema" : "websocket",
+        error,
+      );
+      this._remoteSettingsStatus = {
+        kind: "bad",
+        text: this._remoteAdminErrorText(error, "get"),
+      };
+    } finally {
+      if (generation === this._remoteRequestGeneration) {
+        this._remoteSettingsBusy = null;
+        this._safeRender("render");
+      }
+    }
+  }
+
+  async _previewRemoteSettings(event = null) {
+    if (event && typeof event.preventDefault === "function") event.preventDefault();
+    const snapshot = this._remoteSettingsSnapshot;
+    if (
+      this._remoteSettingsBusy != null
+      || !snapshot
+      || !this._hass
+      || typeof this._hass.callWS !== "function"
+    ) return;
+    let changes;
+    try {
+      changes = this._remoteSettingsChanges();
+    } catch (error) {
+      this._remoteSettingsDraft = {};
+      this._remoteSettingsPreview = null;
+      this._remoteSettingsConfirmed = false;
+      this._recordFailure("remote_settings_preview", "validation", error);
+      this._remoteSettingsStatus = { kind: "bad", text: "The remote settings draft was invalid and has been cleared." };
+      this._safeRender("render");
+      return;
+    }
+    const generation = this._remoteRequestGeneration;
+    this._remoteSettingsBusy = "preview";
+    this._remoteSettingsPreview = null;
+    this._remoteSettingsConfirmed = false;
+    this._remoteSettingsStatus = { kind: "warn", text: "Preparing a value-free remote write preview…" };
+    this._safeRender("render");
+    try {
+      const response = await this._withTimeout(this._hass.callWS({
+        type: "meshnet/remote_settings/preview",
+        gateway_id: snapshot.gateway_id,
+        target_node: snapshot.target_node,
+        revision: snapshot.revision,
+        changes,
+      }), 65000);
+      if (
+        generation !== this._remoteRequestGeneration
+        || this._remoteSettingsSnapshot !== snapshot
+      ) return;
+      this._remoteSettingsPreview = this._validateRemoteSettingsPreview(
+        response,
+        snapshot,
+        changes,
+      );
+      this._remoteSettingsStatus = {
+        kind: "good",
+        text: "Preview ready. Review it and explicitly confirm the one remote write.",
+      };
+      this._markOperationSuccess("remote_settings_preview");
+    } catch (error) {
+      if (
+        generation !== this._remoteRequestGeneration
+        || this._remoteSettingsSnapshot !== snapshot
+      ) return;
+      this._remoteSettingsDraft = {};
+      this._remoteSettingsPreview = null;
+      this._remoteSettingsConfirmed = false;
+      this._recordFailure(
+        "remote_settings_preview",
+        this._safeErrorCode(error) === "timeout" ? "timeout" : this._safeErrorType(error) === "PanelSchemaError" ? "schema" : "websocket",
+        error,
+      );
+      this._remoteSettingsStatus = {
+        kind: "bad",
+        text: this._remoteAdminErrorText(error, "preview"),
+      };
+    } finally {
+      if (
+        generation === this._remoteRequestGeneration
+        && this._remoteSettingsSnapshot === snapshot
+      ) {
+        this._remoteSettingsBusy = null;
+        this._safeRender("render");
+      }
+    }
+  }
+
+  async _applyRemoteSettings() {
+    const snapshot = this._remoteSettingsSnapshot;
+    const preview = this._remoteSettingsPreview;
+    if (this._remoteSettingsBusy != null || !snapshot || !preview) return;
+    if (this._remoteSettingsConfirmed !== true) {
+      this._remoteSettingsStatus = {
+        kind: "bad",
+        text: "Confirm the one remote radio write before applying it.",
+      };
+      this._safeRender("render");
+      return;
+    }
+    const generation = this._remoteRequestGeneration;
+    this._remoteSettingsBusy = "apply";
+    this._remoteSettingsStatus = { kind: "warn", text: "Applying once and verifying by readback…" };
+    this._safeRender("render");
+    try {
+      const response = await this._withTimeout(this._hass.callWS({
+        type: "meshnet/remote_settings/apply",
+        gateway_id: snapshot.gateway_id,
+        target_node: snapshot.target_node,
+        revision: snapshot.revision,
+        preview_id: preview.preview_id,
+        confirm_remote: true,
+      }), 130000);
+      if (
+        generation !== this._remoteRequestGeneration
+        || this._remoteSettingsSnapshot !== snapshot
+        || this._remoteSettingsPreview !== preview
+      ) return;
+      const applied = this._validateRemoteSettingsApply(response, snapshot, preview);
+      this._remoteSettingsDraft = {};
+      this._remoteSettingsPreview = null;
+      this._remoteSettingsConfirmed = false;
+      this._remoteSettingsStatus = applied.status === "verified"
+        ? { kind: "good", text: "Remote settings applied and verified." }
+        : { kind: "warn", text: "Remote write completed, but readback did not verify every setting. Inspect the node locally before another write." };
+      this._markOperationSuccess("remote_settings_apply");
+    } catch (error) {
+      if (
+        generation !== this._remoteRequestGeneration
+        || this._remoteSettingsSnapshot !== snapshot
+        || this._remoteSettingsPreview !== preview
+      ) return;
+      this._remoteSettingsDraft = {};
+      this._remoteSettingsPreview = null;
+      this._remoteSettingsConfirmed = false;
+      this._recordFailure(
+        "remote_settings_apply",
+        this._safeErrorCode(error) === "timeout" ? "timeout" : this._safeErrorType(error) === "PanelSchemaError" ? "schema" : "websocket",
+        error,
+      );
+      this._remoteSettingsStatus = {
+        kind: "warn",
+        text: this._remoteAdminErrorText(error, "apply"),
+      };
+    } finally {
+      if (generation === this._remoteRequestGeneration) {
+        this._remoteSettingsBusy = null;
+        this._safeRender("render");
+      }
+    }
+  }
+
+  _validOperatorGatewayId(value) {
+    return typeof value === "string"
+      && value.length >= 1
+      && value.length <= 128
+      && value === value.trim();
+  }
+
+  _operatorErrorCode(error) {
+    try {
+      return error && typeof error.code === "string" ? error.code : "";
+    } catch (_ignored) {
+      return "";
+    }
+  }
+
+  _remoteAdminErrorText(error, phase = "get") {
+    const fixed = {
+      remote_admin_gateway_not_found: "The selected gateway is unavailable. Refresh the panel and choose a connected gateway.",
+      remote_admin_requires_bluetooth: "Choose a connected Meshtastic Bluetooth gateway; remote administration never falls back to another transport.",
+      remote_admin_target_invalid: "Choose one exact Meshtastic node ID. Names and broadcast destinations are not accepted.",
+      remote_admin_target_unknown: "The target is not in the controller radio’s node database. Wait for NodeInfo, then load again.",
+      remote_admin_target_public_key_unavailable: "The target public key is unavailable. Wait for verified NodeInfo before testing access again.",
+      remote_admin_controller_public_key_unavailable: "The controller public key is unavailable. Inspect the local radio with the official app.",
+      remote_admin_controller_unauthorized: "The target has not authorized this controller public key. Add the displayed key locally on the target, then load again.",
+      remote_admin_session_rejected: "The remote administration session was rejected or expired. Load settings again; no write was retried.",
+      remote_admin_no_route: "No mesh route to the target is available. Check passive last-seen evidence and try later.",
+      remote_admin_no_response: "The target did not respond. Check passive last-seen evidence and try later.",
+      remote_admin_duty_cycle_limited: "The radio refused more traffic because of duty-cycle limits. Wait before another explicit request.",
+      remote_admin_rate_limited: "Remote administration is rate-limited. Wait before another explicit request.",
+      remote_admin_command_forbidden: "That remote operation is outside MeshNet’s reviewed settings allowlist. Use the official app locally.",
+      remote_admin_snapshot_invalid: "The remote settings response failed validation. No fields were retained; inspect the target locally.",
+      remote_admin_revision_conflict: "Remote settings changed after loading. Reload the target before preparing another preview.",
+      remote_admin_changes_invalid: "The remote settings draft was rejected and cleared. Reload live values before editing again.",
+      remote_admin_preview_expired: "The remote preview expired or was already consumed. Reload the target before another write.",
+      remote_admin_confirmation_required: "Explicitly confirm the exact remote radio write before applying it.",
+      remote_admin_unknown_outcome: "The remote write could not be verified. Do not repeat it blindly; reload and inspect the node first.",
+      remote_admin_unavailable: "Remote administration is unavailable. Confirm the Bluetooth gateway is connected and supported.",
+      unauthorized: "Administrator access is required for remote node administration.",
+    };
+    const mapped = fixed[this._operatorErrorCode(error)];
+    if (mapped) return mapped;
+    if (phase === "preview") {
+      return "The preview failed validation or could not be prepared. The draft has been cleared.";
+    }
+    if (phase === "apply") {
+      return "The remote write outcome is unknown. Do not repeat it blindly; reload and inspect the node first.";
+    }
+    return "Remote settings could not be loaded. Verify the gateway and target, then try one explicit load.";
+  }
+
+  _tracerouteErrorText(error, phase = "request") {
+    const fixed = {
+      traceroute_gateway_not_found: "The selected traceroute gateway is unavailable. Refresh and choose a connected gateway.",
+      traceroute_requires_bluetooth: "Choose a connected Meshtastic Bluetooth gateway for traceroute.",
+      traceroute_gateway_disconnected: "The selected traceroute gateway is disconnected. Reconnect it before trying again.",
+      traceroute_target_invalid: "Choose one exact Meshtastic node. Names and broadcast destinations are not accepted.",
+      traceroute_target_unknown: "The destination is not in the current node database. Wait for NodeInfo before trying again.",
+      traceroute_target_self: "Choose a remote node; a gateway cannot traceroute itself.",
+      traceroute_cooldown: "The global traceroute cooldown is active. Wait and reload persisted status before another attempt.",
+      traceroute_rate_limited: "Traceroute is rate-limited. Wait and reload persisted status before another attempt.",
+      traceroute_duty_cycle_limited: "The radio refused more traffic because of duty-cycle limits. Wait before another attempt.",
+      traceroute_no_route: "No route was found. The global cooldown may still be active; do not retry blindly.",
+      traceroute_no_response: "The destination did not respond. The global cooldown may still be active; do not retry blindly.",
+      traceroute_timeout: "Traceroute timed out. RF may have been sent and the global cooldown is active; do not retry blindly.",
+      traceroute_invalid_response: "The traceroute response failed validation. RF may have been sent; reload persisted status.",
+      traceroute_failed: "Traceroute did not complete. RF may have been sent and the global cooldown may be active; do not retry blindly.",
+      traceroute_status_failed: "Persisted traceroute status could not be verified. RF control remains locked; reload status before trying again.",
+      unauthorized: "Administrator access is required to view traceroute status or send a traceroute.",
+    };
+    const mapped = fixed[this._operatorErrorCode(error)];
+    if (mapped) return mapped;
+    return phase === "status"
+      ? "Persisted traceroute status could not be verified. RF control remains locked; reload status before trying again."
+      : "Traceroute did not return a verified result. RF may have been sent and the global cooldown is active; do not retry blindly.";
+  }
+
+  _remoteAllowedSettingPaths() {
+    return new Set([
+      "owner.long_name",
+      "owner.short_name",
+      "config.display.compass_north_top",
+      "config.display.compass_orientation",
+      "config.display.enable_message_bubbles",
+      "config.display.flip_screen",
+      "config.display.gps_format",
+      "config.display.heading_bold",
+      "config.display.units",
+      "config.display.use_12h_clock",
+      "config.display.use_long_node_name",
+      "config.display.wake_on_tap_or_motion",
+    ]);
+  }
+
+  _sanitizeRemoteSettingsSnapshot(response, gatewayId, targetNode) {
+    if (
+      !response
+      || typeof response !== "object"
+      || Array.isArray(response)
+      || response.schema_version !== 1
+      || response.gateway_id !== gatewayId
+      || response.target_node !== targetNode
+      || typeof response.revision !== "string"
+      || !/^[0-9a-f]{64}$/.test(response.revision)
+      || !response.controller
+      || typeof response.controller !== "object"
+      || Array.isArray(response.controller)
+      || response.controller.public_key_copy_only !== true
+      || !response.target
+      || typeof response.target !== "object"
+      || Array.isArray(response.target)
+      || !Array.isArray(response.categories)
+      || response.categories.length > 8
+    ) throw { name: "PanelSchemaError", code: "invalid_format" };
+    const controllerNode = this._requiredRemoteNodeId(response.controller.node_id);
+    const targetId = this._requiredRemoteNodeId(response.target.node_id);
+    if (targetId !== targetNode) throw { name: "PanelSchemaError", code: "invalid_format" };
+    const allowedCategories = new Set(["owner", "config.display"]);
+    const seenCategories = new Set();
+    const seenPaths = new Set();
+    let fieldCount = 0;
+    const categories = response.categories.map((category) => {
+      if (
+        !category
+        || typeof category !== "object"
+        || Array.isArray(category)
+        || !Array.isArray(category.fields)
+        || category.fields.length > 32
+      ) throw { name: "PanelSchemaError", code: "invalid_format" };
+      const key = this._requiredSettingPath(category.key);
+      if (!allowedCategories.has(key) || seenCategories.has(key)) {
+        throw { name: "PanelSchemaError", code: "invalid_format" };
+      }
+      seenCategories.add(key);
+      const fields = category.fields.map((field) => {
+        fieldCount += 1;
+        if (fieldCount > 32) throw { name: "PanelSchemaError", code: "invalid_format" };
+        const sanitized = this._sanitizeRemoteSettingsField(field, key);
+        if (seenPaths.has(sanitized.path)) {
+          throw { name: "PanelSchemaError", code: "invalid_format" };
+        }
+        seenPaths.add(sanitized.path);
+        return sanitized;
+      });
+      if (!fields.length) throw { name: "PanelSchemaError", code: "invalid_format" };
+      return {
+        key,
+        label: this._requiredSettingText(category.label, 96),
+        fields,
+      };
+    });
+    if (!categories.length || !fieldCount) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    return {
+      schema_version: 1,
+      gateway_id: gatewayId,
+      target_node: targetNode,
+      revision: response.revision,
+      controller: {
+        node_id: controllerNode,
+        short_name: this._optionalSettingText(response.controller.short_name, 64),
+        public_key: this._sanitizeControllerPublicKey(response.controller.public_key),
+        public_key_copy_only: true,
+      },
+      target: {
+        node_id: targetId,
+        long_name: this._optionalSettingText(response.target.long_name, 96),
+        short_name: this._optionalSettingText(response.target.short_name, 64),
+        public_key_available: response.target.public_key_available === true,
+        remote_admin_eligible: response.target.remote_admin_eligible !== false,
+      },
+      categories,
+    };
+  }
+
+  _requiredRemoteNodeId(value) {
+    if (!this._isExactRemoteTarget(value)) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    return value;
+  }
+
+  _sanitizeControllerPublicKey(value) {
+    if (typeof value !== "string" || !/^base64:[A-Za-z0-9+/]{43}=$/.test(value)) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    try {
+      const decoder = typeof atob === "function" ? atob : null;
+      if (!decoder || decoder(value.slice(7)).length !== 32) {
+        throw new Error("invalid");
+      }
+    } catch (_ignored) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    return value;
+  }
+
+  _sanitizeRemoteSettingsField(field, categoryKey) {
+    if (!field || typeof field !== "object" || Array.isArray(field)) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    const path = this._requiredSettingPath(field.path);
+    const allowed = this._remoteAllowedSettingPaths();
+    if (
+      !allowed.has(path)
+      || (categoryKey === "owner" && !path.startsWith("owner."))
+      || (categoryKey === "config.display" && !path.startsWith("config.display."))
+      || field.writable !== true
+    ) throw { name: "PanelSchemaError", code: "invalid_format" };
+    const type = ["boolean", "integer", "number", "select", "string"].includes(field.type)
+      ? field.type
+      : null;
+    if (!type) throw { name: "PanelSchemaError", code: "invalid_format" };
+    const numeric = (name) => {
+      if (field[name] == null) return null;
+      return typeof field[name] === "number" && Number.isFinite(field[name])
+        ? field[name]
+        : NaN;
+    };
+    const min = numeric("min");
+    const max = numeric("max");
+    const step = numeric("step");
+    if (
+      [min, max, step].some(Number.isNaN)
+      || (min != null && max != null && min > max)
+      || (step != null && step <= 0)
+    ) throw { name: "PanelSchemaError", code: "invalid_format" };
+    const options = type === "select"
+      ? this._sanitizeRemoteOptions(field.options)
+      : [];
+    const maxLength = path === "owner.short_name" ? 4 : path === "owner.long_name" ? 40 : 128;
+    const sanitized = {
+      path,
+      label: this._requiredSettingText(field.label, 96),
+      type,
+      value: field.value,
+      writable: true,
+      options,
+      min,
+      max,
+      step,
+      max_length: maxLength,
+    };
+    try {
+      const validatedValue = this._coerceRemoteSettingValue(sanitized, field.value);
+      if (!this._settingValuesEqual(validatedValue, field.value)) {
+        throw new Error("coercion mismatch");
+      }
+    } catch (_ignored) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    return sanitized;
+  }
+
+  _sanitizeRemoteOptions(value) {
+    if (!Array.isArray(value) || !value.length || value.length > 64) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    const seen = new Set();
+    return value.map((option) => {
+      if (!option || typeof option !== "object" || Array.isArray(option)) {
+        throw { name: "PanelSchemaError", code: "invalid_format" };
+      }
+      const optionValue = option.value;
+      if (
+        !["string", "number"].includes(typeof optionValue)
+        || typeof optionValue === "boolean"
+        || (typeof optionValue === "number" && !Number.isSafeInteger(optionValue))
+      ) throw { name: "PanelSchemaError", code: "invalid_format" };
+      const identity = `${typeof optionValue}:${String(optionValue)}`;
+      if (seen.has(identity)) throw { name: "PanelSchemaError", code: "invalid_format" };
+      seen.add(identity);
+      return {
+        value: optionValue,
+        label: this._requiredSettingText(option.label, 96),
+      };
+    });
+  }
+
+  _validateRemoteSettingsPreview(response, snapshot, changes) {
+    if (
+      !response
+      || typeof response !== "object"
+      || Array.isArray(response)
+      || response.schema_version !== 1
+      || response.gateway_id !== snapshot.gateway_id
+      || response.target_node !== snapshot.target_node
+      || response.revision !== snapshot.revision
+      || typeof response.preview_id !== "string"
+      || response.preview_id.length < 32
+      || response.preview_id.length > 128
+      || response.requires_confirmation !== true
+      || !Array.isArray(response.changes)
+      || !response.changes.length
+      || response.changes.length > 32
+      || typeof response.expires_at !== "string"
+      || !Number.isFinite(Date.parse(response.expires_at))
+    ) throw { name: "PanelSchemaError", code: "invalid_format" };
+    const fields = new Map(
+      this._remoteSettingsFields(snapshot).map((field) => [field.path, field]),
+    );
+    const expected = Object.keys(changes);
+    const seen = new Set();
+    const previewChanges = response.changes.map((change) => {
+      if (!change || typeof change !== "object" || Array.isArray(change)) {
+        throw { name: "PanelSchemaError", code: "invalid_format" };
+      }
+      const path = this._requiredSettingPath(change.path);
+      const field = fields.get(path);
+      if (!field || !Object.hasOwn(changes, path) || seen.has(path) || change.label !== field.label) {
+        throw { name: "PanelSchemaError", code: "invalid_format" };
+      }
+      seen.add(path);
+      return { path, label: field.label };
+    });
+    if (seen.size !== expected.length || expected.some((path) => !seen.has(path))) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    return {
+      preview_id: response.preview_id,
+      gateway_id: snapshot.gateway_id,
+      target_node: snapshot.target_node,
+      revision: snapshot.revision,
+      changes: previewChanges,
+      requires_confirmation: true,
+      expires_at: response.expires_at,
+    };
+  }
+
+  _validateRemoteSettingsApply(response, snapshot, preview) {
+    if (
+      !response
+      || typeof response !== "object"
+      || Array.isArray(response)
+      || response.schema_version !== 1
+      || !["verified", "readback_mismatch"].includes(response.status)
+      || response.gateway_id !== snapshot.gateway_id
+      || response.target_node !== snapshot.target_node
+      || !Array.isArray(response.verified)
+      || !Array.isArray(response.unverified)
+      || response.verified.length > 32
+      || response.unverified.length > 32
+    ) throw { name: "PanelSchemaError", code: "invalid_format" };
+    const expected = preview.changes.map((change) => change.path);
+    const verified = response.verified.map((path) => this._requiredSettingPath(path));
+    const unverified = response.unverified.map((path) => this._requiredSettingPath(path));
+    const combined = [...verified, ...unverified];
+    if (
+      new Set(combined).size !== combined.length
+      || combined.length !== expected.length
+      || expected.some((path) => !combined.includes(path))
+      || (response.status === "verified" && (!verified.length || unverified.length))
+      || (response.status === "readback_mismatch" && !unverified.length)
+    ) throw { name: "PanelSchemaError", code: "invalid_format" };
+    return { status: response.status, verified, unverified };
+  }
+
+  _maybeLoadTracerouteStatus() {
+    if (
+      !this._connected
+      || this._activeView !== "mesh"
+      || this._tracerouteStatusAttempted
+      || this._tracerouteStatusLoading
+      || !this._hass
+      || typeof this._hass.callWS !== "function"
+    ) return;
+    void this._loadTracerouteStatus();
+  }
+
+  async _loadTracerouteStatus({ force = false } = {}) {
+    if (
+      this._tracerouteStatusLoading
+      || this._tracerouteBusy
+      || !this._hass
+      || typeof this._hass.callWS !== "function"
+      || (!force && this._tracerouteStatusAttempted)
+    ) return;
+    const generation = ++this._tracerouteStatusRequestGeneration;
+    this._tracerouteStatusAttempted = true;
+    this._tracerouteStatusLoading = true;
+    this._tracerouteStatusReady = false;
+    this._tracerouteConfirmation = null;
+    this._tracerouteStatus = { kind: "warn", text: "Checking the persisted global traceroute cooldown…" };
+    this._safeRender("render");
+    try {
+      const response = await this._withTimeout(this._hass.callWS({
+        type: "meshnet/traceroute/status",
+      }), 15000);
+      if (generation !== this._tracerouteStatusRequestGeneration) return;
+      const status = this._sanitizeTracerouteStatus(response);
+      this._tracerouteGlobalStatus = status;
+      this._tracerouteStatusReady = true;
+      if (status.result) {
+        this._tracerouteResults[status.target_node] = status.result;
+      }
+      this._tracerouteStatus = this._tracerouteCooldownActive("", "")
+        ? {
+          kind: "warn",
+          text: `Global cooldown active until ${this._timestampDisplay(status.next_allowed_at)}.`,
+        }
+        : { kind: "good", text: "Persisted traceroute status loaded. No global cooldown is active." };
+      this._markOperationSuccess("traceroute_status");
+    } catch (error) {
+      if (generation !== this._tracerouteStatusRequestGeneration) return;
+      this._tracerouteGlobalStatus = null;
+      this._tracerouteStatusReady = false;
+      this._recordFailure(
+        "traceroute_status",
+        this._safeErrorCode(error) === "timeout" ? "timeout" : this._safeErrorType(error) === "PanelSchemaError" ? "schema" : "websocket",
+        error,
+      );
+      this._tracerouteStatus = {
+        kind: "bad",
+        text: this._tracerouteErrorText(error, "status"),
+      };
+    } finally {
+      if (generation === this._tracerouteStatusRequestGeneration) {
+        this._tracerouteStatusLoading = false;
+        this._safeRender("render");
+      }
+    }
+  }
+
+  _sanitizeTracerouteStatus(response) {
+    if (
+      !response
+      || typeof response !== "object"
+      || Array.isArray(response)
+      || response.schema_version !== 1
+      || response.scope !== "integration"
+      || !["available", "cooldown"].includes(response.status)
+      || typeof response.reserved !== "boolean"
+      || !Number.isSafeInteger(response.remaining_seconds)
+      || response.remaining_seconds < 0
+      || response.remaining_seconds > 86400
+    ) throw { name: "PanelSchemaError", code: "invalid_format" };
+    const gatewayId = response.gateway_id == null ? null : response.gateway_id;
+    const targetNode = response.target_node == null ? null : response.target_node;
+    if (
+      (gatewayId == null) !== (targetNode == null)
+      || (gatewayId != null && !this._validOperatorGatewayId(gatewayId))
+      || (targetNode != null && !this._isExactTracerouteTarget(targetNode))
+      || (response.status === "cooldown" && (
+        response.reserved !== true
+        || response.remaining_seconds < 1
+        || gatewayId == null
+      ))
+      || (response.status === "available" && (
+        response.reserved !== false
+        || response.remaining_seconds !== 0
+      ))
+    ) throw { name: "PanelSchemaError", code: "invalid_format" };
+    const timestamp = (value, required = false) => {
+      if (value == null && !required) return null;
+      return this._validatedTimestamp(value);
+    };
+    const reservedAt = timestamp(response.reserved_at, response.status === "cooldown");
+    const nextAllowedAt = timestamp(response.next_allowed_at, response.status === "cooldown");
+    const resultUpdatedAt = timestamp(response.result_updated_at);
+    let result = null;
+    if (response.result != null) {
+      if (gatewayId == null || targetNode == null || resultUpdatedAt == null) {
+        throw { name: "PanelSchemaError", code: "invalid_format" };
+      }
+      result = this._sanitizeTracerouteResult(response.result, gatewayId, targetNode, {
+        persisted: true,
+      });
+      result.next_allowed_at = nextAllowedAt;
+    }
+    return {
+      schema_version: 1,
+      status: response.status,
+      reserved: response.reserved,
+      gateway_id: gatewayId,
+      target_node: targetNode,
+      reserved_at: reservedAt,
+      next_allowed_at: nextAllowedAt,
+      remaining_seconds: response.remaining_seconds,
+      result_updated_at: resultUpdatedAt,
+      result,
+      loaded_at_ms: Date.now(),
+    };
+  }
+
+  async _requestTraceroute(gatewayId, targetNode) {
+    if (this._tracerouteBusy) return;
+    if (!this._validOperatorGatewayId(gatewayId) || !this._isExactTracerouteTarget(targetNode)) {
+      this._tracerouteConfirmation = null;
+      this._tracerouteStatus = { kind: "bad", text: "Choose one exact gateway and Meshtastic destination." };
+      this._safeRender("render");
+      return;
+    }
+    this._tracerouteGatewayId = gatewayId;
+    this._tracerouteTargetNode = targetNode;
+    if (!this._tracerouteStatusReady) {
+      this._tracerouteConfirmation = null;
+      this._tracerouteStatus = {
+        kind: "bad",
+        text: "Load the persisted traceroute status before enabling RF control.",
+      };
+      this._safeRender("render");
+      return;
+    }
+    if (this._tracerouteCooldownActive(gatewayId, targetNode)) {
+      const nextAllowedAt = this._tracerouteGlobalStatus
+        && this._tracerouteGlobalStatus.next_allowed_at;
+      this._tracerouteConfirmation = null;
+      this._tracerouteStatus = {
+        kind: "warn",
+        text: nextAllowedAt
+          ? `Global cooldown active until ${this._timestampDisplay(nextAllowedAt)}.`
+          : "Global cooldown is active. Reload persisted status before another traceroute.",
+      };
+      this._safeRender("render");
+      return;
+    }
+    if (
+      !this._tracerouteConfirmation
+      || this._tracerouteConfirmation.gateway_id !== gatewayId
+      || this._tracerouteConfirmation.target_node !== targetNode
+    ) {
+      this._tracerouteConfirmation = { gateway_id: gatewayId, target_node: targetNode };
+      this._tracerouteStatus = {
+        kind: "warn",
+        text: "Review the RF notice, then confirm this one traceroute.",
+      };
+      this._safeRender("render");
+      return;
+    }
+    if (!this._hass || typeof this._hass.callWS !== "function") return;
+    const generation = ++this._tracerouteRequestGeneration;
+    this._tracerouteConfirmation = null;
+    this._tracerouteBusy = true;
+    this._tracerouteStatus = { kind: "warn", text: "One traceroute submitted; waiting for the correlated result…" };
+    this._safeRender("render");
+    try {
+      const response = await this._withTimeout(this._hass.callWS({
+        type: "meshnet/traceroute",
+        gateway_id: gatewayId,
+        target_node: targetNode,
+      }), 130000);
+      if (generation !== this._tracerouteRequestGeneration) return;
+      const result = this._sanitizeTracerouteResult(response, gatewayId, targetNode);
+      this._tracerouteResults[targetNode] = result;
+      const nextAllowedAt = result.next_allowed_at
+        || new Date(Date.now() + 3600 * 1000).toISOString();
+      this._tracerouteGlobalStatus = {
+        schema_version: 1,
+        status: "cooldown",
+        reserved: true,
+        gateway_id: gatewayId,
+        target_node: targetNode,
+        reserved_at: result.completed_at || new Date(Date.now()).toISOString(),
+        next_allowed_at: nextAllowedAt,
+        remaining_seconds: 3600,
+        result_updated_at: result.completed_at,
+        result,
+        loaded_at_ms: Date.now(),
+      };
+      this._tracerouteStatusReady = true;
+      this._tracerouteStatus = result.next_allowed_at
+        ? { kind: "good", text: `Traceroute complete. Next permitted attempt: ${this._timestampDisplay(result.next_allowed_at)}.` }
+        : { kind: "good", text: "Traceroute complete. The server still enforces the one-hour cooldown." };
+      this._markOperationSuccess("traceroute_request");
+    } catch (error) {
+      if (generation !== this._tracerouteRequestGeneration) return;
+      this._recordFailure(
+        "traceroute_request",
+        this._safeErrorCode(error) === "timeout" ? "timeout" : this._safeErrorType(error) === "PanelSchemaError" ? "schema" : "websocket",
+        error,
+      );
+      const failedAt = Date.now();
+      this._tracerouteGlobalStatus = {
+        schema_version: 1,
+        status: "cooldown",
+        reserved: true,
+        gateway_id: gatewayId,
+        target_node: targetNode,
+        reserved_at: new Date(failedAt).toISOString(),
+        next_allowed_at: new Date(failedAt + 3600 * 1000).toISOString(),
+        remaining_seconds: 3600,
+        result_updated_at: null,
+        result: null,
+        loaded_at_ms: failedAt,
+      };
+      this._tracerouteStatusReady = true;
+      this._tracerouteStatus = {
+        kind: "warn",
+        text: this._tracerouteErrorText(error, "request"),
+      };
+    } finally {
+      if (generation === this._tracerouteRequestGeneration) {
+        this._tracerouteBusy = false;
+        this._safeRender("render");
+      }
+    }
+  }
+
+  _sanitizeTracerouteResult(response, gatewayId, targetNode, { persisted = false } = {}) {
+    if (
+      !response
+      || typeof response !== "object"
+      || Array.isArray(response)
+      || response.schema_version !== 1
+      || response.gateway_id !== gatewayId
+      || response.destination !== targetNode
+      || (!persisted && response.status !== "complete")
+      || (!persisted && (
+        typeof response.correlation_id !== "string"
+        || response.correlation_id.length < 1
+        || response.correlation_id.length > 128
+      ))
+      || (persisted && (
+        Object.hasOwn(response, "status")
+        || Object.hasOwn(response, "correlation_id")
+      ))
+    ) throw { name: "PanelSchemaError", code: "invalid_format" };
+    const route = (value) => {
+      if (value == null) return [];
+      if (
+        !Array.isArray(value)
+        || value.length > 64
+        || value.some((hop) => !this._isExactTracerouteTarget(hop))
+      ) throw { name: "PanelSchemaError", code: "invalid_format" };
+      return value.slice();
+    };
+    const forwardRoute = route(response.forward_route);
+    const reverseRoute = route(response.reverse_route);
+    if (response.source != null && !this._isExactTracerouteTarget(response.source)) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    if (
+      response.channel != null
+      && (!Number.isSafeInteger(response.channel) || response.channel < 0 || response.channel > 7)
+    ) throw { name: "PanelSchemaError", code: "invalid_format" };
+    const completedAt = response.completed_at == null
+      ? null
+      : this._validatedTimestamp(response.completed_at);
+    const nextAllowedAt = response.next_allowed_at == null
+      ? null
+      : this._validatedTimestamp(response.next_allowed_at);
+    const snr = (value) => {
+      if (value == null) return [];
+      if (
+        !Array.isArray(value)
+        || value.length > 64
+        || value.some((item) => (
+          typeof item !== "number"
+          || !Number.isFinite(item)
+          || item < -128
+          || item > 128
+        ))
+      ) throw { name: "PanelSchemaError", code: "invalid_format" };
+      return value.slice();
+    };
+    return {
+      schema_version: 1,
+      status: "complete",
+      gateway_id: gatewayId,
+      destination: targetNode,
+      correlation_id: persisted ? null : response.correlation_id,
+      source: response.source || null,
+      channel: response.channel == null ? null : response.channel,
+      completed_at: completedAt,
+      forward_route: forwardRoute,
+      reverse_route: reverseRoute,
+      snr_towards: snr(response.snr_towards),
+      snr_back: snr(response.snr_back),
+      next_allowed_at: nextAllowedAt,
+    };
+  }
+
+  _validatedTimestamp(value) {
+    if (typeof value !== "string" || value.length > 64 || !Number.isFinite(Date.parse(value))) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    return value;
+  }
+
+  _timestampDisplay(value) {
+    const timestamp = Date.parse(value);
+    return Number.isFinite(timestamp) ? new Date(timestamp).toLocaleString() : "unknown time";
+  }
+
+  _tracerouteResultFor(gatewayId, targetNode) {
+    const result = this._tracerouteResults[targetNode];
+    return result && result.gateway_id === gatewayId ? result : null;
+  }
+
+  _tracerouteCooldownActive(gatewayId, targetNode) {
+    const global = this._tracerouteGlobalStatus;
+    if (global) {
+      if (global.status === "cooldown" && global.reserved === true) {
+        const deadline = Date.parse(global.next_allowed_at);
+        const relativeDeadline = Number.isFinite(global.loaded_at_ms)
+          ? global.loaded_at_ms + global.remaining_seconds * 1000
+          : Number.NaN;
+        if (
+          (Number.isFinite(deadline) && deadline > Date.now())
+          || (Number.isFinite(relativeDeadline) && relativeDeadline > Date.now())
+        ) return true;
+      }
+      // A successfully loaded integration-wide "available" record is more
+      // authoritative than a result timestamp interpreted on the browser clock.
+      return false;
+    }
+    return Object.values(this._tracerouteResults).some((result) => (
+      result
+      && result.next_allowed_at
+      && Date.parse(result.next_allowed_at) > Date.now()
+    ));
   }
 
   _bindNodeControls() {
@@ -3212,6 +5320,44 @@ class MeshNetPanel extends HTMLElement {
     return Array.isArray(route) ? route : null;
   }
 
+  _neighborIdentifiers(node, nowMs = Date.now()) {
+    if (!node || String(node.protocol || "").trim().toLowerCase() !== "meshtastic") return null;
+    if (this._meshtasticIdentityInvalid(node)) return null;
+    const routing = node.routing && typeof node.routing === "object" && !Array.isArray(node.routing)
+      ? node.routing
+      : null;
+    if (!routing || routing.neighbors_via_mqtt !== false) return null;
+    if (!Array.isArray(routing.neighbors) || routing.neighbors.length > 64) return null;
+    if (!Number.isSafeInteger(routing.neighbor_count)
+      || routing.neighbor_count < 0
+      || routing.neighbor_count > 64
+      || routing.neighbor_count !== routing.neighbors.length) {
+      return null;
+    }
+    const observedAt = typeof routing.neighbors_updated_at === "string"
+      && routing.neighbors_updated_at.length <= 64
+      ? this._timestampMs(routing.neighbors_updated_at)
+      : null;
+    // NeighborInfo is intentionally short-lived graph evidence. One hour
+    // bounds stale topology, while five minutes tolerates HA/browser skew.
+    const maximumAgeMs = 60 * 60 * 1000;
+    const maximumFutureSkewMs = 5 * 60 * 1000;
+    if (observedAt == null
+      || !Number.isFinite(nowMs)
+      || nowMs - observedAt > maximumAgeMs
+      || observedAt - nowMs > maximumFutureSkewMs) {
+      return null;
+    }
+    const source = this._meshtasticNodeId(node);
+    if (!source || String(node.node_id || "") !== source) return null;
+    const neighbors = [...new Set(routing.neighbors.filter((value) => {
+      if (typeof value !== "string" || value.length > 9) return false;
+      const canonical = this._parseMeshtasticNodeId(value);
+      return Boolean(canonical && value === canonical);
+    }))];
+    return { source, neighbors };
+  }
+
   _hopsGatewayId(node) {
     const connectivity = node && node.connectivity;
     if (String(node && node.protocol || "").trim().toLowerCase() !== "meshtastic") return "";
@@ -3241,7 +5387,106 @@ class MeshNetPanel extends HTMLElement {
     return aliasIndex.has(alias) ? aliasIndex.get(alias) : null;
   }
 
-  _passiveTopology(nodes, gateways) {
+  _normalizeGraphLimit(value) {
+    if (typeof value === "string" && !["20", "50", "100"].includes(value)) return 50;
+    const parsed = typeof value === "string" ? Number.parseInt(value, 10) : value;
+    return [20, 50, 100].includes(parsed) ? parsed : 50;
+  }
+
+  _recentGraphNodes(nodes, limit = this._graphLimit) {
+    const boundedLimit = this._normalizeGraphLimit(limit);
+    return (Array.isArray(nodes) ? nodes : [])
+      .filter((node) => node && node.node_key != null && String(node.node_key))
+      .map((node, index) => ({ node, index }))
+      .sort((left, right) => this._compareLastSeen(left.node, right.node)
+        || this._compareText(left.node.node_key, right.node.node_key)
+        || left.index - right.index)
+      .slice(0, boundedLimit)
+      .map((item) => item.node);
+  }
+
+  _graphLocation(value, { zeroPairIsMissing = false } = {}) {
+    const source = value && typeof value === "object" ? value : null;
+    if (source && Object.prototype.hasOwnProperty.call(source, "precision_bits")) {
+      const precisionBits = source.precision_bits;
+      // Meshtastic documents 19 bits as roughly 45 m precision. Coarser
+      // privacy-obfuscated positions are useful on a map, but not as physical
+      // spring lengths because they can imply a route geometry that is not real.
+      if (!Number.isSafeInteger(precisionBits) || precisionBits < 19 || precisionBits > 32) {
+        return null;
+      }
+    }
+    const latitude = this._validCoordinate(source && source.latitude, -90, 90);
+    const longitude = this._validCoordinate(source && source.longitude, -180, 180);
+    if (latitude == null || longitude == null) return null;
+    if (zeroPairIsMissing && latitude === 0 && longitude === 0) return null;
+    return { latitude, longitude };
+  }
+
+  _nodeGraphLocation(node) {
+    return this._graphLocation(node && node.location, {
+      zeroPairIsMissing: String(node && node.protocol || "").trim().toLowerCase() === "meshtastic",
+    });
+  }
+
+  _gatewayGraphLocation(gateway, nodes) {
+    const direct = this._graphLocation(gateway && gateway.location, {
+      zeroPairIsMissing: true,
+    });
+    if (direct) return { ...direct, source: "radio_gps", label: "Radio GPS" };
+
+    const localNodeId = gateway && gateway.local_node_id != null
+      ? String(gateway.local_node_id)
+      : "";
+    if (localNodeId) {
+      const canonicalLocalId = this._parseMeshtasticNodeId(localNodeId);
+      const localNode = (Array.isArray(nodes) ? nodes : []).find((node) => {
+        if (!node || typeof node !== "object") return false;
+        if (String(node.node_key || "") === localNodeId || String(node.node_id || "") === localNodeId) {
+          return true;
+        }
+        return Boolean(canonicalLocalId && this._meshtasticNodeId(node) === canonicalLocalId);
+      });
+      const radio = this._nodeGraphLocation(localNode);
+      if (radio) return { ...radio, source: "radio_gps", label: "Radio GPS" };
+    }
+
+    const fallback = this._graphLocation(this._hass && this._hass.config, {
+      zeroPairIsMissing: true,
+    });
+    return fallback ? {
+      ...fallback,
+      source: "home_assistant_fallback",
+      label: "Home Assistant location fallback",
+    } : null;
+  }
+
+  _haversineMeters(left, right) {
+    const a = this._graphLocation(left);
+    const b = this._graphLocation(right);
+    if (!a || !b) return null;
+    const radians = (degrees) => degrees * Math.PI / 180;
+    const latitudeDelta = radians(b.latitude - a.latitude);
+    const longitudeDelta = radians(b.longitude - a.longitude);
+    const latitudeA = radians(a.latitude);
+    const latitudeB = radians(b.latitude);
+    const haversine = Math.sin(latitudeDelta / 2) ** 2
+      + Math.cos(latitudeA) * Math.cos(latitudeB) * Math.sin(longitudeDelta / 2) ** 2;
+    const bounded = Math.min(1, Math.max(0, haversine));
+    const distance = 6371008.8 * 2 * Math.atan2(Math.sqrt(bounded), Math.sqrt(1 - bounded));
+    return Number.isFinite(distance) ? distance : null;
+  }
+
+  _edgeTargetLength(distanceMeters) {
+    const neutral = 140;
+    if (typeof distanceMeters !== "number" || !Number.isFinite(distanceMeters) || distanceMeters < 0) {
+      return neutral;
+    }
+    const compressed = 70 + 42 * Math.log10(1 + distanceMeters / 100);
+    return Math.min(320, Math.max(70, compressed));
+  }
+
+  _passiveTopology(nodes, gateways, limit) {
     const allNodes = nodes.filter(
       (node) => node && node.node_key != null && String(node.node_key),
     );
@@ -3260,23 +5505,40 @@ class MeshNetPanel extends HTMLElement {
         evidenceGateways.add(gatewayId);
       }
       const route = this._routeIdentifiers(node);
-      if (!route) return;
-      for (let index = 1; index < route.length; index += 1) {
-        const left = this._resolveRouteIdentifier(allAliases, route[index - 1]);
-        const right = this._resolveRouteIdentifier(allAliases, route[index]);
-        if (left && right && left !== right) {
-          evidenceNodes.add(left);
-          evidenceNodes.add(right);
+      if (route) {
+        for (let index = 1; index < route.length; index += 1) {
+          const left = this._resolveRouteIdentifier(allAliases, route[index - 1]);
+          const right = this._resolveRouteIdentifier(allAliases, route[index]);
+          if (left && right && left !== right) {
+            evidenceNodes.add(left);
+            evidenceNodes.add(right);
+          }
         }
       }
+      const neighborEvidence = this._neighborIdentifiers(node);
+      if (!neighborEvidence) return;
+      const source = this._resolveRouteIdentifier(allAliases, neighborEvidence.source);
+      neighborEvidence.neighbors.forEach((neighbor) => {
+        const target = this._resolveRouteIdentifier(allAliases, neighbor);
+        if (source && target && source !== target) {
+          evidenceNodes.add(source);
+          evidenceNodes.add(target);
+        }
+      });
     });
 
-    const orderedNodes = this._sortNodes(allNodes, "favorites_recent").sort((left, right) => {
-      const evidenceDifference = Number(evidenceNodes.has(String(right.node_key)))
-        - Number(evidenceNodes.has(String(left.node_key)));
-      return evidenceDifference || this._compareNodes(left, right, "favorites_recent");
-    });
-    const visibleNodes = orderedNodes.slice(0, 36);
+    const explicitLimit = arguments.length >= 3;
+    const orderedNodes = explicitLimit
+      ? this._recentGraphNodes(allNodes, limit)
+      : this._sortNodes(allNodes, "favorites_recent").sort((left, right) => {
+        const evidenceDifference = Number(evidenceNodes.has(String(right.node_key)))
+          - Number(evidenceNodes.has(String(left.node_key)));
+        return evidenceDifference || this._compareNodes(left, right, "favorites_recent");
+      });
+    // Calls from older extensions omitted the limit and retain the historical
+    // 36-node projection. The built-in panel always supplies its 20/50/100
+    // selector value.
+    const visibleNodes = explicitLimit ? orderedNodes : orderedNodes.slice(0, 36);
     const orderedGateways = [...allGateways].sort((left, right) => {
       const evidenceDifference = Number(evidenceGateways.has(String(right.gateway_id)))
         - Number(evidenceGateways.has(String(left.gateway_id)));
@@ -3284,11 +5546,21 @@ class MeshNetPanel extends HTMLElement {
         || this._compareText(left.name || left.gateway_id, right.name || right.gateway_id)
         || this._compareText(left.gateway_id, right.gateway_id);
     });
-    const visibleGateways = orderedGateways.slice(0, 8);
+    const visibleGateways = orderedGateways.slice(0, 8).map((gateway) => ({
+      ...gateway,
+      _graph_location: this._gatewayGraphLocation(gateway, allNodes),
+    }));
     const visibleAliases = this._aliasIndex(visibleNodes);
     const gatewayKeys = new Map(
       visibleGateways.map((gateway) => [String(gateway.gateway_id), `gateway:${gateway.gateway_id}`]),
     );
+    const endpointLocations = new Map();
+    visibleNodes.forEach((node) => {
+      endpointLocations.set(`node:${node.node_key}`, this._nodeGraphLocation(node));
+    });
+    visibleGateways.forEach((gateway) => {
+      endpointLocations.set(`gateway:${gateway.gateway_id}`, gateway._graph_location || null);
+    });
     const edges = [];
     const edgeKeys = new Set();
     const addEdge = (from, to, type) => {
@@ -3297,7 +5569,17 @@ class MeshNetPanel extends HTMLElement {
       const key = `${type}:${endpoints[0]}:${endpoints[1]}`;
       if (edgeKeys.has(key)) return;
       edgeKeys.add(key);
-      edges.push({ from, to, type });
+      const distance = this._haversineMeters(
+        endpointLocations.get(from),
+        endpointLocations.get(to),
+      );
+      edges.push({
+        from,
+        to,
+        type,
+        distance_meters: distance,
+        target_length: this._edgeTargetLength(distance),
+      });
     };
 
     visibleNodes.forEach((node) => {
@@ -3305,6 +5587,18 @@ class MeshNetPanel extends HTMLElement {
       const gatewayKey = gatewayKeys.get(this._hopsGatewayId(node));
       if (typeof hops === "number" && Number.isFinite(hops) && hops === 0 && gatewayKey) {
         addEdge(gatewayKey, `node:${node.node_key}`, "direct");
+      }
+      const neighborEvidence = this._neighborIdentifiers(node);
+      if (neighborEvidence) {
+        const source = this._resolveRouteIdentifier(visibleAliases, neighborEvidence.source);
+        neighborEvidence.neighbors.forEach((neighbor) => {
+          const target = this._resolveRouteIdentifier(visibleAliases, neighbor);
+          if (source && target) {
+            // NeighborInfo establishes the passive edge. Only independently
+            // validated node coordinates may size its physical-distance spring.
+            addEdge(`node:${source}`, `node:${target}`, "neighbor");
+          }
+        });
       }
       const route = this._routeIdentifiers(node);
       if (!route) return;
@@ -3327,51 +5621,46 @@ class MeshNetPanel extends HTMLElement {
   _graph(topology) {
     const width = 1000;
     const height = 640;
-    const centerX = 585;
-    const centerY = height / 2;
-    const radius = Math.min(360, 115 + topology.nodes.length * 4);
-    const points = new Map();
-    topology.gateways.forEach((gateway, index) => {
-      const spacing = height / (topology.gateways.length + 1);
-      points.set(`gateway:${gateway.gateway_id}`, {
-        x: 105,
-        y: spacing * (index + 1),
-        kind: "gateway",
-        item: gateway,
-      });
-    });
-    topology.nodes.forEach((node, index) => {
-      const angle = (Math.PI * 2 * index) / Math.max(topology.nodes.length, 1) - Math.PI / 2;
-      points.set(`node:${node.node_key}`, {
-        x: centerX + Math.cos(angle) * radius,
-        y: centerY + Math.sin(angle) * radius,
-        kind: "node",
-        item: node,
-      });
-    });
+    const points = this._ensureGraphPositions(topology, width, height);
     const shown = topology.totalNodes > topology.nodes.length
       ? `Showing ${topology.nodes.length} of ${topology.totalNodes} nodes`
       : `${topology.nodes.length} nodes`;
+    const fallbackCount = topology.gateways.filter(
+      (gateway) => gateway._graph_location
+        && gateway._graph_location.source === "home_assistant_fallback",
+    ).length;
     return `
       <section class="topology">
         <div class="topology-heading">
           <strong class="topology-copy">
             <span>Cached passive topology — no traceroutes sent</span>
-            <span class="topology-note">Edges are last received evidence, not a live route.</span>
+            <span class="topology-note">Edges are last received evidence, not a live route. Fresh locally received NeighborInfo expires after one hour. Distance changes spring length only.</span>
+            ${fallbackCount ? `<span class="topology-note">${fallbackCount} gateway${fallbackCount === 1 ? " uses" : "s use"} Home Assistant location fallback.</span>` : ""}
           </strong>
+          <label class="sort-control">Most recent
+            <select id="meshnet-graph-limit">
+              ${[20, 50, 100].map((limit) => `<option value="${limit}"${this._selected(this._graphLimit, limit)}>${limit}</option>`).join("")}
+            </select>
+          </label>
           <span class="label">${shown} · ${topology.gateways.length} gateways</span>
         </div>
-        <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Cached passive mesh topology; no traceroutes sent">
+        <svg id="meshnet-topology-graph" viewBox="0 0 ${width} ${height}" role="img" aria-label="Cached passive mesh topology; no traceroutes sent">
         ${topology.edges.map((edge) => {
           const a = points.get(edge.from);
           const b = points.get(edge.to);
           if (!a || !b) return "";
-          return `<line class="link ${edge.type === "direct" ? "direct-link" : "route-link"}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"></line>`;
+          const distance = edge.distance_meters == null
+            ? "Physical distance unavailable"
+            : `${Math.round(edge.distance_meters)} m great-circle distance`;
+          const evidence = edge.type === "neighbor"
+            ? "Fresh local-RF NeighborInfo"
+            : edge.type === "direct" ? "Direct local-RF observation" : "Cached route evidence";
+          return `<line class="link ${edge.type === "direct" ? "direct-link" : "route-link"}" data-graph-from="${this._escape(edge.from)}" data-graph-to="${this._escape(edge.to)}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"><title>${this._escape(`${evidence}; ${distance}`)}</title></line>`;
         }).join("")}
         ${topology.gateways.map((gateway) => {
           const point = points.get(`gateway:${gateway.gateway_id}`);
           return `
-          <g>
+          <g data-graph-key="${this._escape(`gateway:${gateway.gateway_id}`)}">
             <title>${this._escape(gateway.name || gateway.gateway_id)}</title>
             <circle class="gateway ${gateway.connected ? "" : "offline"}" cx="${point.x}" cy="${point.y}" r="18"></circle>
             <text x="${point.x + 24}" y="${point.y + 4}">${this._escape(String(gateway.name || gateway.gateway_id).slice(0, 20))}</text>
@@ -3380,7 +5669,7 @@ class MeshNetPanel extends HTMLElement {
         ${topology.nodes.map((node) => {
           const point = points.get(`node:${node.node_key}`);
           return `
-          <g>
+          <g data-graph-key="${this._escape(`node:${node.node_key}`)}">
             <title>${this._escape(this._nodeName(node))}</title>
             <circle class="node ${node.online ? "" : "offline"}" cx="${point.x}" cy="${point.y}" r="14"></circle>
             <text x="${point.x + 19}" y="${point.y + 4}">${this._escape(this._nodeCompactName(node).slice(0, 18))}</text>
@@ -3390,6 +5679,286 @@ class MeshNetPanel extends HTMLElement {
         </svg>
       </section>
     `;
+  }
+
+  _ensureGraphPositions(topology, width, height) {
+    const keys = [
+      ...topology.gateways.map((gateway) => `gateway:${gateway.gateway_id}`),
+      ...topology.nodes.map((node) => `node:${node.node_key}`),
+    ];
+    const visible = new Set(keys);
+    [...this._graphPositions.keys()].forEach((key) => {
+      if (!visible.has(key)) this._graphPositions.delete(key);
+    });
+    keys.forEach((key, index) => {
+      if (this._graphPositions.has(key)) return;
+      const isGateway = key.startsWith("gateway:");
+      const angle = (Math.PI * 2 * index) / Math.max(keys.length, 1) - Math.PI / 2;
+      const radius = Math.min(width, height) * (isGateway ? 0.22 : 0.36);
+      this._graphPositions.set(key, {
+        x: width / 2 + Math.cos(angle) * radius,
+        y: height / 2 + Math.sin(angle) * radius,
+        vx: 0,
+        vy: 0,
+        fixed: false,
+      });
+    });
+    return this._graphPositions;
+  }
+
+  _finiteGraphNumber(value, fallback = 0) {
+    return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+  }
+
+  _forceStep(positions, edges, options = {}) {
+    const width = Math.max(100, this._finiteGraphNumber(options.width, 1000));
+    const height = Math.max(100, this._finiteGraphNumber(options.height, 640));
+    const maximumPadding = Math.max(0, Math.min(width, height) / 2 - 1);
+    const padding = Math.min(
+      maximumPadding,
+      Math.max(0, this._finiteGraphNumber(options.padding, 24)),
+    );
+    const source = positions instanceof Map ? positions : new Map();
+    const keys = [...source.keys()].slice(0, 108);
+    const result = new Map();
+    keys.forEach((key, index) => {
+      const original = source.get(key) || {};
+      const angle = (Math.PI * 2 * index) / Math.max(keys.length, 1);
+      const fallbackX = width / 2 + Math.cos(angle) * Math.min(width, height) * 0.2;
+      const fallbackY = height / 2 + Math.sin(angle) * Math.min(width, height) * 0.2;
+      result.set(key, {
+        x: Math.min(width - padding, Math.max(padding, this._finiteGraphNumber(original.x, fallbackX))),
+        y: Math.min(height - padding, Math.max(padding, this._finiteGraphNumber(original.y, fallbackY))),
+        vx: Math.min(30, Math.max(-30, this._finiteGraphNumber(original.vx, 0))),
+        vy: Math.min(30, Math.max(-30, this._finiteGraphNumber(original.vy, 0))),
+        fixed: original.fixed === true,
+      });
+    });
+
+    for (let leftIndex = 0; leftIndex < keys.length; leftIndex += 1) {
+      const left = result.get(keys[leftIndex]);
+      for (let rightIndex = leftIndex + 1; rightIndex < keys.length; rightIndex += 1) {
+        const right = result.get(keys[rightIndex]);
+        let dx = right.x - left.x;
+        let dy = right.y - left.y;
+        if (dx === 0 && dy === 0) {
+          dx = (rightIndex % 2 ? 1 : -1) * 0.01;
+          dy = 0.01;
+        }
+        const distanceSquared = Math.max(100, dx * dx + dy * dy);
+        const distance = Math.sqrt(distanceSquared);
+        const force = Math.min(2.4, 8500 / distanceSquared);
+        const fx = force * dx / distance;
+        const fy = force * dy / distance;
+        if (!left.fixed) { left.vx -= fx; left.vy -= fy; }
+        if (!right.fixed) { right.vx += fx; right.vy += fy; }
+      }
+    }
+
+    (Array.isArray(edges) ? edges : []).slice(0, 512).forEach((edge) => {
+      const left = result.get(edge && edge.from);
+      const right = result.get(edge && edge.to);
+      if (!left || !right) return;
+      const dx = right.x - left.x;
+      const dy = right.y - left.y;
+      const distance = Math.max(0.01, Math.sqrt(dx * dx + dy * dy));
+      const rawTarget = edge.target_length == null ? edge.targetLength : edge.target_length;
+      const target = typeof rawTarget === "number" && Number.isFinite(rawTarget)
+        ? Math.min(400, Math.max(40, rawTarget))
+        : this._edgeTargetLength(null);
+      const force = Math.min(2.5, Math.max(-2.5, (distance - target) * 0.018));
+      const fx = force * dx / distance;
+      const fy = force * dy / distance;
+      if (!left.fixed) { left.vx += fx; left.vy += fy; }
+      if (!right.fixed) { right.vx -= fx; right.vy -= fy; }
+    });
+
+    result.forEach((point) => {
+      if (point.fixed) {
+        point.vx = 0;
+        point.vy = 0;
+        return;
+      }
+      point.vx = Math.min(30, Math.max(-30, point.vx * 0.82));
+      point.vy = Math.min(30, Math.max(-30, point.vy * 0.82));
+      point.x = Math.min(width - padding, Math.max(padding, point.x + point.vx));
+      point.y = Math.min(height - padding, Math.max(padding, point.y + point.vy));
+    });
+    return result;
+  }
+
+  _applyGraphPositions() {
+    if (typeof this.querySelector !== "function") return;
+    const svg = this.querySelector("#meshnet-topology-graph");
+    if (!svg || typeof svg.querySelectorAll !== "function") return;
+    svg.querySelectorAll("[data-graph-from][data-graph-to]").forEach((line) => {
+      const left = this._graphPositions.get(line.getAttribute("data-graph-from"));
+      const right = this._graphPositions.get(line.getAttribute("data-graph-to"));
+      if (!left || !right) return;
+      line.setAttribute("x1", String(left.x));
+      line.setAttribute("y1", String(left.y));
+      line.setAttribute("x2", String(right.x));
+      line.setAttribute("y2", String(right.y));
+    });
+    svg.querySelectorAll("[data-graph-key]").forEach((group) => {
+      const point = this._graphPositions.get(group.getAttribute("data-graph-key"));
+      if (!point || typeof group.querySelector !== "function") return;
+      const circle = group.querySelector("circle");
+      const text = group.querySelector("text");
+      if (circle) {
+        circle.setAttribute("cx", String(point.x));
+        circle.setAttribute("cy", String(point.y));
+      }
+      if (text) {
+        const radius = circle && Number(circle.getAttribute("r")) === 18 ? 24 : 19;
+        text.setAttribute("x", String(point.x + radius));
+        text.setAttribute("y", String(point.y + 4));
+      }
+    });
+  }
+
+  _startGraphAnimation(topology) {
+    this._stopGraphAnimation();
+    this._graphAnimationTopology = topology;
+    this._graphAnimationIterations = 0;
+    const reducedMotion = typeof window.matchMedia === "function"
+      && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (reducedMotion) {
+      for (let iteration = 0; iteration < 24; iteration += 1) {
+        this._graphPositions = this._forceStep(this._graphPositions, topology.edges, {
+          width: 1000,
+          height: 640,
+          padding: 24,
+        });
+      }
+      this._applyGraphPositions();
+      return;
+    }
+    if (typeof window.requestAnimationFrame !== "function") return;
+    const tick = () => {
+      this._graphAnimationFrame = null;
+      if (!this._connected || this._activeView !== "mesh" || this._graphAnimationTopology !== topology) {
+        return;
+      }
+      this._graphPositions = this._forceStep(this._graphPositions, topology.edges, {
+        width: 1000,
+        height: 640,
+        padding: 24,
+      });
+      this._applyGraphPositions();
+      this._graphAnimationIterations += 1;
+      if (this._graphAnimationIterations < 240) {
+        this._graphAnimationFrame = window.requestAnimationFrame(tick);
+      }
+    };
+    this._graphAnimationFrame = window.requestAnimationFrame(tick);
+  }
+
+  _stopGraphAnimation() {
+    if (this._graphAnimationFrame != null && typeof window.cancelAnimationFrame === "function") {
+      window.cancelAnimationFrame(this._graphAnimationFrame);
+    }
+    this._graphAnimationFrame = null;
+    this._graphAnimationTopology = null;
+    this._graphAnimationIterations = 0;
+    if (typeof this._graphDragCleanup === "function") {
+      const cleanup = this._graphDragCleanup;
+      this._graphDragCleanup = null;
+      cleanup();
+    }
+    this._graphDrag = null;
+  }
+
+  _bindGraphControls(topology) {
+    if (typeof this.querySelector !== "function") return;
+    const limit = this.querySelector("#meshnet-graph-limit");
+    if (limit) {
+      limit.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
+      limit.addEventListener("change", () => {
+        this._graphLimit = this._normalizeGraphLimit(limit.value);
+        this._safeRender("render");
+      });
+    }
+    const svg = this.querySelector("#meshnet-topology-graph");
+    if (!svg) return;
+    this._startGraphAnimation(topology);
+    this._graphDragCleanup = this._bindGraphDrag(svg);
+  }
+
+  _bindGraphDrag(svg) {
+    if (!svg || typeof svg.addEventListener !== "function") return () => {};
+    const pointForEvent = (event) => {
+      const bounds = svg.getBoundingClientRect();
+      const viewBox = svg.viewBox && svg.viewBox.baseVal
+        ? svg.viewBox.baseVal
+        : { x: 0, y: 0, width: 1000, height: 640 };
+      const width = bounds.width > 0 ? bounds.width : 1;
+      const height = bounds.height > 0 ? bounds.height : 1;
+      return {
+        x: Math.min(viewBox.x + viewBox.width, Math.max(viewBox.x,
+          viewBox.x + (event.clientX - bounds.left) * viewBox.width / width)),
+        y: Math.min(viewBox.y + viewBox.height, Math.max(viewBox.y,
+          viewBox.y + (event.clientY - bounds.top) * viewBox.height / height)),
+      };
+    };
+    const pointerDown = (event) => {
+      const element = event.target && typeof event.target.closest === "function"
+        ? event.target.closest("[data-graph-key]")
+        : null;
+      const key = element && element.dataset && element.dataset.graphKey
+        ? element.dataset.graphKey
+        : element && typeof element.getAttribute === "function"
+          ? element.getAttribute("data-graph-key")
+          : "";
+      const position = this._graphPositions.get(key);
+      if (!position) return;
+      if (typeof event.preventDefault === "function") event.preventDefault();
+      position.fixed = true;
+      position.vx = 0;
+      position.vy = 0;
+      this._graphDrag = { key, pointerId: event.pointerId };
+      if (typeof svg.setPointerCapture === "function") {
+        try { svg.setPointerCapture(event.pointerId); } catch (_ignored) { /* best effort */ }
+      }
+    };
+    const pointerMove = (event) => {
+      if (!this._graphDrag || this._graphDrag.pointerId !== event.pointerId) return;
+      const position = this._graphPositions.get(this._graphDrag.key);
+      if (!position) return;
+      const point = pointForEvent(event);
+      position.x = point.x;
+      position.y = point.y;
+      position.vx = 0;
+      position.vy = 0;
+      position.fixed = true;
+      if (typeof event.preventDefault === "function") event.preventDefault();
+      this._applyGraphPositions();
+    };
+    const pointerEnd = (event) => {
+      if (!this._graphDrag || this._graphDrag.pointerId !== event.pointerId) return;
+      const position = this._graphPositions.get(this._graphDrag.key);
+      if (position) position.fixed = false;
+      if (typeof svg.releasePointerCapture === "function") {
+        try { svg.releasePointerCapture(event.pointerId); } catch (_ignored) { /* best effort */ }
+      }
+      this._graphDrag = null;
+    };
+    const listeners = [
+      ["pointerdown", pointerDown],
+      ["pointermove", pointerMove],
+      ["pointerup", pointerEnd],
+      ["pointercancel", pointerEnd],
+    ];
+    listeners.forEach(([name, callback]) => svg.addEventListener(name, callback));
+    let active = true;
+    const cleanup = () => {
+      if (!active) return;
+      active = false;
+      listeners.forEach(([name, callback]) => svg.removeEventListener(name, callback));
+      this._graphDrag = null;
+      if (this._graphDragCleanup === cleanup) this._graphDragCleanup = null;
+    };
+    return cleanup;
   }
 
   _stat(label, value) {

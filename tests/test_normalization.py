@@ -681,13 +681,13 @@ def test_meshcore_node_omits_non_scalar_device_fields_and_sensors() -> None:
             "firmware": {"version": "bad"},
             "role": ["bad-role"],
             "sensors": {
-                "valid": 12.5,
+                "temperature": 12.5,
                 "nested": {"value": 1},
                 "sequence": [1, 2],
                 7: "bad-key",
             },
             "telemetry": {
-                "finite": 4,
+                "humidity": 4,
                 "not_finite": float("nan"),
             },
         },
@@ -702,4 +702,4 @@ def test_meshcore_node_omits_non_scalar_device_fields_and_sensors() -> None:
     assert node.hardware_model is None
     assert node.firmware_version is None
     assert node.role is None
-    assert node.sensors == {"valid": 12.5, "finite": 4}
+    assert node.sensors == {"temperature": 12.5, "humidity": 4}

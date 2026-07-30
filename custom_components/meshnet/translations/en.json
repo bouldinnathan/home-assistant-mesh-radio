@@ -218,7 +218,7 @@
   "services": {
     "send_message": {
       "name": "Send mesh message",
-      "description": "Sends a text message through a connected MeshNet gateway.",
+      "description": "Sends or durably queues a text message and can return a versioned correlation ID and submission status.",
       "fields": {
         "target_node": { "name": "Target node", "description": "Optional full Meshtastic node ID, node number, or exact unique cached short/long name; MeshCore destinations are also accepted. Choose a node in the MeshNet panel when possible." },
         "gateway_id": { "name": "Gateway ID", "description": "Optional advanced gateway override. Leave empty to use a connected gateway automatically." },
@@ -230,7 +230,7 @@
     },
     "broadcast_message": {
       "name": "Broadcast mesh message",
-      "description": "Broadcasts a text message through a connected MeshNet gateway.",
+      "description": "Broadcasts or durably queues a text message and can return a versioned correlation ID and submission status.",
       "fields": {
         "gateway_id": { "name": "Gateway ID", "description": "Optional advanced gateway override. Leave empty to use a connected gateway automatically." },
         "message": { "name": "Message", "description": "Text to broadcast over the mesh radio." },
