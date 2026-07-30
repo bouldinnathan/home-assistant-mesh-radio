@@ -6,6 +6,9 @@ import logging
 from typing import Any
 
 import pytest
+
+pytest.importorskip("google.protobuf")
+
 from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 
 from custom_components.meshnet.meshtastic_settings import (
