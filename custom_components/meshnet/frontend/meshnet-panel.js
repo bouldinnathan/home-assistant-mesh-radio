@@ -1215,6 +1215,8 @@ class MeshNetPanel extends HTMLElement {
   _renderSettings(focusState = null) {
     const snapshot = this._settingsSnapshot;
     const fields = this._settingsFields(snapshot);
+    const editableCount = this._settingsEditableCount(snapshot);
+    const readOnlyCount = fields.length - editableCount;
     const hasChanges = Object.keys(this._settingsDraft).length > 0;
     const busy = this._settingsBusy != null;
     this.innerHTML = `
@@ -1329,7 +1331,8 @@ class MeshNetPanel extends HTMLElement {
           ${!snapshot && this._settingsBusy !== "get" && !this._settingsStatus ? '<div class="settings-status warn">Choose a gateway to load its supported settings.</div>' : ""}
           ${snapshot ? `
             <div class="field-help">${this._escape(`${snapshot.name} · ${snapshot.protocol} over ${snapshot.transport} · revision ${snapshot.revision}`)}</div>
-            ${snapshot.writable ? "" : `<div class="settings-status warn">Read only${snapshot.read_only_reason ? ` · ${this._escape(snapshot.read_only_reason)}` : ""}</div>`}
+            <div class="settings-status ${editableCount > 0 ? "good" : "warn"}">${editableCount} editable · ${readOnlyCount} read-only</div>
+            ${editableCount === 0 ? `<div class="settings-status warn">${fields.length > 0 ? "No settings can be edited safely right now." : "This gateway did not report any settings."}${snapshot.read_only_reason ? ` ${this._escape(snapshot.read_only_reason)}` : ""}</div>` : ""}
             ${this._settingsWarningList(snapshot.warnings)}
             <form id="meshnet-settings-form">
               ${snapshot.categories.map((category) => `
@@ -1344,7 +1347,7 @@ class MeshNetPanel extends HTMLElement {
                     )).join("") || '<div class="label">No settings in this category.</div>'}
                   </div>
                 </section>
-              `).join("") || '<div class="settings-status warn">This gateway did not report editable categories.</div>'}
+              `).join("") || '<div class="settings-status warn">This gateway did not report any settings categories.</div>'}
               <div class="settings-actions">
                 <button class="settings-button primary" id="meshnet-settings-preview" type="submit"${busy || !snapshot.writable || !hasChanges || this._settingsPreview ? " disabled" : ""}>${this._settingsBusy === "preview" ? "Preparing preview…" : "Preview changes"}</button>
                 <span class="label">Preview is required before Apply. A stale revision is rejected by Home Assistant.</span>
@@ -1384,20 +1387,26 @@ class MeshNetPanel extends HTMLElement {
     return snapshot.categories.flatMap((category) => category.fields);
   }
 
+  _settingsEditableCount(snapshot = this._settingsSnapshot) {
+    if (!snapshot || !snapshot.writable) return 0;
+    return this._settingsFields(snapshot).filter((field) => field.writable).length;
+  }
+
   _settingsField(field, index, snapshot) {
     const disabled = this._settingsBusy != null || !snapshot.writable || !field.writable;
     const value = Object.hasOwn(this._settingsDraft, field.path)
       ? this._settingsDraft[field.path]
       : field.value;
     const badges = [
+      snapshot.writable && field.writable ? '<span class="badge good">Editable</span>' : "",
       field.critical ? '<span class="badge warn">Critical</span>' : "",
       field.requires_reconnect ? '<span class="badge warn">Reconnect required</span>' : "",
       field.type === "secret" && field.configured ? '<span class="badge good">Configured</span>' : "",
     ].join("");
-    const reason = !snapshot.writable
-      ? snapshot.read_only_reason
-      : !field.writable
-        ? field.read_only_reason
+    const reason = !field.writable && field.read_only_reason
+      ? field.read_only_reason
+      : !snapshot.writable
+        ? snapshot.read_only_reason
         : "";
     return `
       <div class="settings-field">
@@ -1733,8 +1742,11 @@ class MeshNetPanel extends HTMLElement {
       this._settingsGatewayId = validated.selected
         ? validated.selected.gateway_id
         : gatewayId;
+      const editableCount = this._settingsEditableCount(validated.selected);
       this._settingsStatus = validated.selected
-        ? { kind: "good", text: "Gateway settings loaded. Edit values, then preview." }
+        ? editableCount > 0
+          ? { kind: "good", text: "Gateway settings loaded. Edit values, then preview." }
+          : { kind: "warn", text: "Gateway settings loaded read-only. Review the explanation above." }
         : { kind: "warn", text: "No configurable gateway was returned." };
       this._markOperationSuccess("settings_get");
     } catch (error) {
@@ -2021,6 +2033,7 @@ class MeshNetPanel extends HTMLElement {
       ? field.type
       : null;
     if (!type) throw { name: "PanelSchemaError", code: "invalid_format" };
+    const writable = field.writable === true;
     if (Array.isArray(field.options) && field.options.length > 256) {
       throw { name: "PanelSchemaError", code: "invalid_format" };
     }
@@ -2041,14 +2054,14 @@ class MeshNetPanel extends HTMLElement {
         };
       })
       : [];
-    if (type === "select" && !options.length) {
+    if (type === "select" && writable && !options.length) {
       throw { name: "PanelSchemaError", code: "invalid_format" };
     }
     let value = type === "secret" ? "" : field.value;
     if (value != null && !this._settingValueMatchesType(type, value)) {
       throw { name: "PanelSchemaError", code: "invalid_format" };
     }
-    if (field.writable === true && type !== "secret" && value == null) {
+    if (writable && type !== "secret" && value == null) {
       throw { name: "PanelSchemaError", code: "invalid_format" };
     }
     const numeric = (key) => {
@@ -2063,15 +2076,16 @@ class MeshNetPanel extends HTMLElement {
     const max = numeric("max");
     const step = numeric("step");
     if (
-      ((type === "integer" || type === "number") && field.writable === true
+      (writable && (type === "integer" || type === "number")
         && (min == null || max == null))
-      || (min != null && max != null && min > max)
-      || (step != null && step <= 0)
-      || ((type === "integer" || type === "number") && value != null
+      || (writable && min != null && max != null && min > max)
+      || (writable && step != null && step <= 0)
+      || (writable && (type === "integer" || type === "number") && value != null
         && ((min != null && value < min) || (max != null && value > max)))
     ) throw { name: "PanelSchemaError", code: "invalid_format" };
     if (
       type === "select"
+      && writable
       && !options.some((option) => this._settingValuesEqual(option.value, value))
     ) throw { name: "PanelSchemaError", code: "invalid_format" };
     const maxLength = field.max_length == null
@@ -2086,6 +2100,7 @@ class MeshNetPanel extends HTMLElement {
     }
     if (
       type === "string"
+      && writable
       && value != null
       && maxLength != null
       && value.length > maxLength
@@ -2106,7 +2121,7 @@ class MeshNetPanel extends HTMLElement {
       max_length: maxLength,
       unit: this._optionalSettingText(field.unit, 32),
       description: this._optionalSettingText(field.description, 512),
-      writable: field.writable === true,
+      writable,
       read_only_reason: this._optionalSettingText(field.read_only_reason, 256),
       critical: field.critical === true,
       requires_reconnect: field.requires_reconnect === true,

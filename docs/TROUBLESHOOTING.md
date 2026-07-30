@@ -710,9 +710,11 @@ attempt; press **Reload live values** after updating instead of relying on an
 automatic retry.
 
 Choose an online, physically connected gateway and press **Reload live
-values**. Read-only behavior is expected for:
+values**. MeshNet 0.6.2 shows an exact `N editable · M read-only` summary and an
+**Editable** badge on every control that can enter the preview flow. Read-only
+behavior is expected for:
 
-- Meshtastic MQTT, serial, and TCP settings in 0.6.0;
+- Meshtastic MQTT, serial, and TCP settings in the current release;
 - MeshCore MQTT and REST bridges, which have no standardized verified settings
   contract;
 - a Meshtastic radio in managed mode;
@@ -725,6 +727,16 @@ only the writable fields reported by their current live schema. A field-level
 reason explains a capability gap. Do not use a raw console or remote RF admin
 command to bypass that guard; doing so bypasses MeshNet's validation and
 verification boundaries.
+
+If the page reports zero editable fields unexpectedly, download diagnostics
+without reloading the integration and inspect
+`runtime.gateway_settings.capability_observations`. `disconnected`,
+`unavailable`, `incomplete`, and `managed_mode` identify gateway-wide blocks.
+`no_writable_fields` means the provider did not expose a reviewed writable
+field. `all_claimed_writable_fields_rejected` means MeshNet's central contract
+validator downgraded every claimed field. The counts are cached from the last
+page read; collecting diagnostics performs no radio operation and exports no
+field paths, values, IDs, names, provider text, or secrets.
 
 ### A Gateway Settings Preview Expired or Became Stale
 

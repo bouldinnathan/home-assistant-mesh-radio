@@ -286,6 +286,14 @@ def test_want_config_records_feed_privacy_safe_settings_snapshot() -> None:
     client._settings.begin_refresh()
     client._config_id = 7412
 
+    # Some firmware streams the local node record before my_info. Retain it
+    # until the local node number arrives so owner-name controls do not vanish.
+    owner = mesh_pb2.FromRadio()
+    owner.node_info.num = 123
+    owner.node_info.user.long_name = "Local Owner"
+    owner.node_info.user.short_name = "HOME"
+    client._handle_from_radio(owner.SerializeToString())
+
     my_info = mesh_pb2.FromRadio()
     my_info.my_info.my_node_num = 123
     client._handle_from_radio(my_info.SerializeToString())
@@ -307,12 +315,6 @@ def test_want_config_records_feed_privacy_safe_settings_snapshot() -> None:
     channel.channel.settings.psk = b"never-project-channel-psk"
     client._handle_from_radio(channel.SerializeToString())
 
-    owner = mesh_pb2.FromRadio()
-    owner.node_info.num = 123
-    owner.node_info.user.long_name = "Local Owner"
-    owner.node_info.user.short_name = "HOME"
-    client._handle_from_radio(owner.SerializeToString())
-
     complete = mesh_pb2.FromRadio()
     complete.config_complete_id = 7412
     client._handle_from_radio(complete.SerializeToString())
@@ -321,6 +323,13 @@ def test_want_config_records_feed_privacy_safe_settings_snapshot() -> None:
     rendered = repr(snapshot)
     assert snapshot["available"] is True
     assert snapshot["complete"] is True
+    fields = {
+        field["path"]: field
+        for category in snapshot["categories"]
+        for field in category["fields"]
+    }
+    assert fields["owner.long_name"]["value"] == "Local Owner"
+    assert fields["owner.short_name"]["value"] == "HOME"
     assert "never-project-wifi-password" not in rendered
     assert "never-project-mqtt-user" not in rendered
     assert "never-project-mqtt-password" not in rendered
@@ -512,6 +521,106 @@ def test_local_admin_write_is_one_shot_and_requires_reconnect_readback(
             "commit_edit_settings",
         ]
         assert len({packet.id for packet in connection.admin_packets}) == 3
+
+    asyncio.run(run())
+
+
+def test_gateway_manager_reaches_real_ble_admin_write_and_readback() -> None:
+    """Prove the GUI server path remains writable through the real BLE stack."""
+
+    async def run() -> None:
+        from custom_components.meshnet.const import (
+            PROTOCOL_MESHTASTIC,
+            TRANSPORT_BLUETOOTH,
+        )
+        from custom_components.meshnet.gateway_settings import (
+            GatewaySettingsManager,
+        )
+        from custom_components.meshnet.meshtastic_client import MeshtasticClient
+        from custom_components.meshnet.models import GatewayConfig
+
+        async def noop(*_args: Any) -> None:
+            return None
+
+        ble_client, connection = _active_settings_client(behavior="ack")
+        adapter = MeshtasticClient(
+            SimpleNamespace(),
+            GatewayConfig(
+                gateway_id="gateway-1",
+                name="Test gateway",
+                protocol=PROTOCOL_MESHTASTIC,
+                transport=TRANSPORT_BLUETOOTH,
+                ble_address="00:00:00:00:00:00",
+            ),
+            noop,
+            noop,
+            noop,
+            logging.getLogger(__name__),
+        )
+        adapter._ble_transport = SimpleNamespace(_client=ble_client)
+        adapter.status.connected = True
+        manager = GatewaySettingsManager(
+            SimpleNamespace(gateways={"gateway-1": adapter})
+        )
+
+        loaded = await manager.async_get("gateway-1")
+        snapshot = loaded["selected"]
+        fields = {
+            field["path"]: field
+            for category in snapshot["categories"]
+            for field in category["fields"]
+        }
+        assert snapshot["writable"] is True
+        assert fields["owner.short_name"]["writable"] is True
+        assert fields["owner.short_name"]["value"] == "OLD"
+        assert fields["config.bluetooth.fixed_pin"]["writable"] is True
+        assert fields["config.bluetooth.enabled"]["writable"] is False
+        capability = manager.diagnostic_snapshot()["capability_observations"][0]
+        assert capability["capability_state"] == "writable"
+        assert capability["source_complete"] is True
+        assert capability["claimed_writable_field_count"] >= 2
+        assert capability["schema_writable_field_count"] >= 2
+        assert capability["editable_field_count"] >= 2
+        assert capability["contract_downgraded_field_count"] == 0
+
+        preview = await manager.async_preview(
+            gateway_id="gateway-1",
+            revision=snapshot["revision"],
+            changes={"owner.short_name": "HOME"},
+        )
+        assert preview["requires_critical_confirmation"] is False
+        assert preview["changes"] == [
+            {
+                "path": "owner.short_name",
+                "label": "Short Name",
+                "before": "OLD",
+                "after": "HOME",
+                "secret": False,
+                "critical": False,
+                "requires_reconnect": True,
+            }
+        ]
+
+        applied = await manager.async_apply(
+            gateway_id="gateway-1",
+            revision=snapshot["revision"],
+            preview_id=preview["preview_id"],
+            confirm_critical=False,
+        )
+        assert applied["status"] == "verified"
+        assert applied["verified"] == ["owner.short_name"]
+        assert applied["unverified"] == []
+        assert connection.operations == [
+            "begin_edit_settings",
+            "set_owner",
+            "commit_edit_settings",
+        ]
+        updated_fields = {
+            field["path"]: field
+            for category in applied["snapshot"]["categories"]
+            for field in category["fields"]
+        }
+        assert updated_fields["owner.short_name"]["value"] == "HOME"
 
     asyncio.run(run())
 

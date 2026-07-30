@@ -255,6 +255,16 @@ def test_real_meshtastic_power_mask_obeys_server_frontend_integer_contract() -> 
 
     state = MeshtasticSettingsState()
     state.begin_refresh()
+    owner_record = mesh_pb2.FromRadio()
+    owner_record.node_info.num = 123
+    owner_record.node_info.user.long_name = "Test gateway"
+    owner_record.node_info.user.short_name = "TEST"
+    state.capture_from_radio(owner_record, my_node_num=123)
+    bluetooth_record = mesh_pb2.FromRadio()
+    bluetooth_record.config.bluetooth.enabled = True
+    bluetooth_record.config.bluetooth.fixed_pin = 123456
+    bluetooth_record.config.bluetooth.SetInParent()
+    state.capture_from_radio(bluetooth_record, my_node_num=123)
     record = mesh_pb2.FromRadio()
     record.config.power.powermon_enables = 0
     record.config.power.SetInParent()
@@ -286,6 +296,10 @@ def test_real_meshtastic_power_mask_obeys_server_frontend_integer_contract() -> 
     )
     assert power_mask["value"] == 0
     assert power_mask["max"] == 2**53 - 1
+    assert power_mask["read_only_reason"] == (
+        "This setting needs dedicated validation before MeshNet can edit it."
+    )
+    assert snapshot["writable"] is True
 
     response = {
         "gateways": [
@@ -310,6 +324,159 @@ def test_real_meshtastic_power_mask_obeys_server_frontend_integer_contract() -> 
   assert.ok(powerMask);
   assert.equal(powerMask.value, 0);
   assert.equal(powerMask.max, Number.MAX_SAFE_INTEGER);
+  assert.equal(powerMask.writable, false);
+  assert.match(panel._settingsField(powerMask, 2, response.selected), /dedicated validation/);
+  const ownerShortName = response.selected.categories
+    .flatMap((category) => category.fields)
+    .find((field) => field.path === "owner.short_name");
+  assert.ok(ownerShortName);
+  assert.equal(ownerShortName.writable, true);
+  const ownerHtml = panel._settingsField(ownerShortName, 0, response.selected);
+  assert.match(ownerHtml, />Editable</);
+  assert.doesNotMatch(ownerHtml, / disabled/);
+  const fixedPin = response.selected.categories
+    .flatMap((category) => category.fields)
+    .find((field) => field.path === "config.bluetooth.fixed_pin");
+  assert.ok(fixedPin);
+  assert.equal(fixedPin.writable, true);
+  assert.match(panel._settingsField(fixedPin, 1, response.selected), /type="password"/);
+"""
+    )
+
+
+def test_settings_render_distinguishes_editable_and_read_only_controls() -> None:
+    """Render mixed and gateway-wide read-only schemas without false affordances."""
+    _run_panel_script(
+        r"""
+  panel._bindViewControls = () => {};
+  panel._bindSettingsControls = () => {};
+  panel._restoreComposerFocus = () => {};
+  panel.querySelectorAll = () => [];
+  panel.querySelector = () => null;
+  const snapshot = panel._sanitizeSettingsSnapshot({
+    schema_version: 1,
+    gateway_id: "gateway-1",
+    name: "Test gateway",
+    protocol: "meshtastic",
+    transport: "bluetooth",
+    connected: true,
+    writable: true,
+    revision: "c".repeat(64),
+    fetched_at: "2026-07-30T12:00:00Z",
+    categories: [{
+      key: "device",
+      label: "Device",
+      fields: [
+        {
+          path: "owner.short_name",
+          label: "Short name",
+          type: "string",
+          value: "TEST",
+          max_length: 4,
+          writable: true,
+        },
+        {
+          path: "config.display.flip_screen",
+          label: "Flip screen",
+          type: "boolean",
+          value: false,
+          writable: true,
+        },
+        {
+          path: "config.future.mode",
+          label: "Future mode",
+          type: "select",
+          value: 99,
+          options: [{ value: 0, label: "Known mode" }],
+          writable: false,
+          read_only_reason: "This future value is displayed safely but cannot be edited.",
+        },
+      ],
+    }],
+    warnings: [],
+  });
+  panel._settingsSnapshot = snapshot;
+  panel._settingsGateways = [{
+    gateway_id: "gateway-1",
+    name: "Test gateway",
+    protocol: "meshtastic",
+    transport: "bluetooth",
+    connected: true,
+  }];
+  panel._settingsGatewayId = "gateway-1";
+  panel._renderSettings();
+  assert.match(panel.innerHTML, /2 editable · 1 read-only/);
+  assert.equal((panel.innerHTML.match(/>Editable<\/span>/g) || []).length, 2);
+  assert.match(panel.innerHTML, /id="meshnet-setting-2"[^>]* disabled/);
+  assert.match(panel.innerHTML, /Current: 99/);
+  assert.match(panel.innerHTML, /future value is displayed safely/);
+  assert.equal(panel.innerHTML.includes("No settings can be edited"), false);
+
+  panel._settingsSnapshot = {
+    ...snapshot,
+    connected: false,
+    writable: false,
+    read_only_reason: "Connect this gateway before editing its settings.",
+    revision: "d".repeat(64),
+  };
+  panel._renderSettings();
+  assert.match(panel.innerHTML, /0 editable · 3 read-only/);
+  assert.match(panel.innerHTML, /No settings can be edited safely right now/);
+  assert.match(panel.innerHTML, /Connect this gateway before editing/);
+  assert.equal((panel.innerHTML.match(/>Editable<\/span>/g) || []).length, 0);
+  assert.equal((panel.innerHTML.match(/data-setting-index="[012]" disabled/g) || []).length, 3);
+"""
+    )
+
+
+def test_read_only_settings_load_status_does_not_invite_editing() -> None:
+    """A successful read-only load must explain the state instead of saying edit."""
+    _run_panel_script(
+        r"""
+  panel._safeRender = () => true;
+  panel._hass = {
+    async callWS() {
+      return {
+        gateways: [{
+          gateway_id: "gateway-1",
+          name: "Test gateway",
+          protocol: "meshtastic",
+          transport: "bluetooth",
+          connected: true,
+        }],
+        selected: {
+          schema_version: 1,
+          gateway_id: "gateway-1",
+          name: "Test gateway",
+          protocol: "meshtastic",
+          transport: "bluetooth",
+          connected: true,
+          writable: false,
+          read_only_reason: "No reviewed settings were received.",
+          revision: "e".repeat(64),
+          fetched_at: "2026-07-30T12:00:00Z",
+          categories: [{
+            key: "radio",
+            label: "Radio",
+            fields: [{
+              path: "radio.region",
+              label: "Region",
+              type: "string",
+              value: "US",
+              writable: false,
+            }],
+          }],
+          warnings: [],
+        },
+      };
+    },
+  };
+  await panel._loadGatewaySettings("gateway-1");
+  assert.deepEqual(panel._settingsStatus, {
+    kind: "warn",
+    text: "Gateway settings loaded read-only. Review the explanation above.",
+  });
+  assert.equal(panel._settingsStatus.text.includes("Edit values"), false);
 """
     )
 
@@ -374,7 +541,8 @@ def test_settings_schema_failure_does_not_retry_on_every_hass_assignment() -> No
   await panel._loadGatewaySettings();
   assert.equal(settingsRequests, 2);
   assert.equal(panel._settingsSnapshot.gateway_id, "gateway-1");
-  assert.equal(panel._settingsStatus.kind, "good");
+  assert.equal(panel._settingsStatus.kind, "warn");
+  assert.match(panel._settingsStatus.text, /loaded read-only/);
 """
     )
 

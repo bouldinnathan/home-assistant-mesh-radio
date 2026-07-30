@@ -24,6 +24,7 @@ from typing import Any
 _MAX_STRING_LENGTH = 1024
 _MAX_REPEATED_VALUES = 128
 _MAX_NESTING_DEPTH = 8
+_MAX_PENDING_NODE_USERS = 512
 
 # Matching is intentionally broad.  False positives produce a configured
 # boolean, which is preferable to putting an unknown future credential in the
@@ -983,6 +984,8 @@ class MeshtasticSettingsState:
         self._metadata: Any | None = None
         self._my_info: Any | None = None
         self._device_ui: Any | None = None
+        self._local_node_num: int | None = None
+        self._pending_node_users: dict[int, Any] = {}
 
     @property
     def revision(self) -> int:
@@ -1025,6 +1028,8 @@ class MeshtasticSettingsState:
         self._metadata = None
         self._my_info = None
         self._device_ui = None
+        self._local_node_num = None
+        self._pending_node_users.clear()
         self._complete = False
         self._revision += 1
 
@@ -1057,6 +1062,9 @@ class MeshtasticSettingsState:
             changed = True
         if _has_field(from_radio, "my_info"):
             self._my_info = _clone_message(from_radio.my_info)
+            candidate_node_num = getattr(from_radio.my_info, "my_node_num", None)
+            if isinstance(candidate_node_num, int) and candidate_node_num >= 0:
+                self._local_node_num = candidate_node_num
             changed = True
         device_ui_field = "deviceuiConfig" if hasattr(from_radio, "deviceuiConfig") else "device_ui_config"
         if _has_field(from_radio, device_ui_field):
@@ -1065,9 +1073,33 @@ class MeshtasticSettingsState:
         if _has_field(from_radio, "node_info"):
             node_info = from_radio.node_info
             node_num = int(getattr(node_info, "num", -1))
-            if my_node_num is not None and node_num == my_node_num and _has_field(node_info, "user"):
-                self._owner = _clone_message(node_info.user)
+            effective_node_num = (
+                my_node_num if my_node_num is not None else self._local_node_num
+            )
+            if _has_field(node_info, "user"):
+                if effective_node_num is not None and node_num == effective_node_num:
+                    self._owner = _clone_message(node_info.user)
+                    changed = True
+                elif effective_node_num is None and node_num >= 0:
+                    if (
+                        node_num not in self._pending_node_users
+                        and len(self._pending_node_users) >= _MAX_PENDING_NODE_USERS
+                    ):
+                        self._pending_node_users.pop(
+                            next(iter(self._pending_node_users)), None
+                        )
+                    self._pending_node_users[node_num] = _clone_message(
+                        node_info.user
+                    )
+        effective_node_num = (
+            my_node_num if my_node_num is not None else self._local_node_num
+        )
+        if effective_node_num is not None:
+            pending_owner = self._pending_node_users.get(effective_node_num)
+            if pending_owner is not None:
+                self._owner = pending_owner
                 changed = True
+            self._pending_node_users.clear()
         if changed:
             self._revision += 1
 

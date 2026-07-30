@@ -1,5 +1,32 @@
 # Upgrade Guide
 
+## From 0.6.1
+
+0.6.2 makes the **Gateway settings** page distinguish working read-only fields
+from editable fields. It reports exact editable/read-only counts, marks each
+editable control, and gives a clear explanation when no setting can be changed
+safely. Known Meshtastic capability codes are shown as readable explanations.
+Unknown future enum values and out-of-range values that the server has already
+made read-only remain visible as disabled controls instead of rejecting the
+entire page.
+
+Meshtastic owner records are now retained when firmware sends the local
+`node_info` record before `my_info`, so the reviewed long-name and short-name
+controls do not disappear because of stream ordering. This does not make
+additional radio, security, channel, network, module, reset, or remote-admin
+fields writable.
+
+Privacy-safe diagnostics now cache the last settings capability decision for
+each configured gateway. They include fixed connection/capability states and
+aggregate source, accepted, editable, read-only, and contract-downgrade counts.
+They never trigger a settings read and contain no gateway IDs, names, field
+paths, labels, values, options, revision material, provider reasons, or secret
+state.
+
+No setting is changed during the upgrade or by opening/reloading the page.
+Only **Apply preview** can send a validated write. Restart Home Assistant and
+hard-refresh the browser after installing 0.6.2.
+
 ## From 0.6.0
 
 0.6.1 fixes the Gateway settings page rejecting a valid Meshtastic unsigned

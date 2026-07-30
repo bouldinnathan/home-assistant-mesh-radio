@@ -257,6 +257,181 @@ def test_malformed_writable_field_contracts_fail_read_only() -> None:
         assert "safety metadata" in field["read_only_reason"]
 
 
+def test_capability_diagnostics_explain_contract_downgrades_without_schema_data() -> None:
+    """Cache only counts and fixed states, never field or gateway details."""
+    gateway = _Gateway("private-gateway-id")
+    gateway.config.name = "Private bedroom radio"
+    gateway.raw["read_only_reason"] = "private person at private.example.test"
+    tx_power = gateway.raw["categories"][1]["fields"][0]
+    tx_power.update({"min": 31, "max": 30})
+    manager = _manager(gateway)
+
+    selected = _get(manager)["selected"]
+    diagnostics = manager.diagnostic_snapshot()
+    capability = diagnostics["capability_observations"][0]
+
+    assert selected["writable"] is True
+    assert capability == {
+        "diagnostic_id": "gateway_001",
+        "protocol": "meshtastic",
+        "transport": "bluetooth",
+        "observed": True,
+        "has_successful_snapshot": True,
+        "last_read_outcome": "success",
+        "capability_state": "writable",
+        "connected": True,
+        "source_available": True,
+        "source_complete": True,
+        "source_writable": True,
+        "source_category_count": 3,
+        "sanitized_category_count": 3,
+        "source_field_count": 4,
+        "sanitized_field_count": 4,
+        "claimed_writable_field_count": 4,
+        "schema_writable_field_count": 3,
+        "editable_field_count": 3,
+        "read_only_field_count": 1,
+        "contract_downgraded_field_count": 1,
+    }
+    rendered = json.dumps(diagnostics)
+    for private_value in (
+        "private-gateway-id",
+        "Private bedroom radio",
+        "private person",
+        "identity.long_name",
+        "radio.tx_power",
+        "never-return-this-secret",
+    ):
+        assert private_value not in rendered
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_state"),
+    [
+        ("disconnected", "disconnected"),
+        ("unavailable", "unavailable"),
+        ("incomplete", "incomplete"),
+        ("managed", "managed_mode"),
+        ("rejected", "all_claimed_writable_fields_rejected"),
+        ("provider_read_only", "no_writable_fields"),
+    ],
+)
+def test_capability_diagnostics_distinguish_read_only_states(
+    case: str,
+    expected_state: str,
+) -> None:
+    gateway = _Gateway(connected=case != "disconnected")
+    if case == "unavailable":
+        gateway.raw["available"] = False
+    elif case == "incomplete":
+        gateway.raw["complete"] = False
+    elif case == "managed":
+        gateway.raw["writable"] = False
+        gateway.raw["read_only_reason"] = (
+            "managed_mode_rejects_local_admin_changes"
+        )
+        for category in gateway.raw["categories"]:
+            for field in category["fields"]:
+                field["writable"] = False
+    elif case == "rejected":
+        gateway.raw["categories"] = [
+            {
+                "key": "radio",
+                "label": "Radio",
+                "fields": [
+                    {
+                        "path": "radio.power",
+                        "label": "Power",
+                        "type": "integer",
+                        "value": 20,
+                        "min": 31,
+                        "max": 30,
+                        "writable": True,
+                    }
+                ],
+            }
+        ]
+    elif case == "provider_read_only":
+        gateway.raw["writable"] = False
+        for category in gateway.raw["categories"]:
+            for field in category["fields"]:
+                field["writable"] = False
+
+    manager = _manager(gateway)
+    _get(manager)
+    capability = manager.diagnostic_snapshot()["capability_observations"][0]
+
+    assert capability["capability_state"] == expected_state
+    assert capability["editable_field_count"] == 0
+
+
+def test_capability_diagnostics_are_cached_only_and_invalidation_clears_them() -> None:
+    gateway = _Gateway()
+    original_getter = gateway.async_get_settings_snapshot
+    gateway.async_get_settings_snapshot = AsyncMock(side_effect=original_getter)
+    manager = _manager(gateway)
+
+    before = manager.diagnostic_snapshot()
+    assert before["capability_observations"][0]["observed"] is False
+    gateway.async_get_settings_snapshot.assert_not_awaited()
+
+    _get(manager)
+    first = manager.diagnostic_snapshot()
+    second = manager.diagnostic_snapshot()
+    gateway.async_get_settings_snapshot.assert_awaited_once()
+    assert first == second
+    assert first["capability_data_is_cached_only"] is True
+
+    manager.invalidate()
+    cleared = manager.diagnostic_snapshot()
+    assert cleared["capability_observations"][0]["observed"] is False
+    gateway.async_get_settings_snapshot.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_outcome"),
+    [
+        (RuntimeError("private provider failure at bedroom.local"), "provider_error"),
+        ("invalid private snapshot", "invalid_snapshot"),
+    ],
+)
+def test_capability_diagnostics_reduce_read_failures_to_fixed_categories(
+    failure: Any,
+    expected_outcome: str,
+) -> None:
+    gateway = _Gateway("private-gateway-id")
+    if isinstance(failure, Exception):
+        gateway.async_get_settings_snapshot = AsyncMock(side_effect=failure)
+    else:
+        gateway.async_get_settings_snapshot = AsyncMock(return_value=failure)
+    manager = _manager(gateway)
+
+    with pytest.raises(GatewaySettingsUnavailable):
+        _get(manager)
+    diagnostics = manager.diagnostic_snapshot()
+    capability = diagnostics["capability_observations"][0]
+
+    assert capability["observed"] is False
+    assert capability["has_successful_snapshot"] is False
+    assert capability["last_read_outcome"] == expected_outcome
+    assert diagnostics["settings_read_failure_counts"][expected_outcome] == 1
+    rendered = json.dumps(diagnostics)
+    assert "private-gateway-id" not in rendered
+    assert "bedroom.local" not in rendered
+    assert "invalid private snapshot" not in rendered
+
+
+def test_capability_diagnostic_observations_are_bounded_and_identity_free() -> None:
+    gateways = [_Gateway(f"private-gateway-{index:03d}") for index in range(70)]
+    manager = _manager(*gateways)
+
+    diagnostics = manager.diagnostic_snapshot()
+
+    assert len(diagnostics["capability_observations"]) == 64
+    assert diagnostics["capability_observation_truncated"] is True
+    assert "private-gateway" not in json.dumps(diagnostics)
+
+
 @pytest.mark.parametrize(
     "material",
     [
@@ -856,13 +1031,20 @@ def test_get_deadline_includes_adapter_read_and_clears_operation(
                 raise AssertionError("cancelled read resumed")
 
         monkeypatch.setattr(
-            settings_module, "SETTINGS_READ_TIMEOUT_SECONDS", 0.01
+            settings_module, "SETTINGS_READ_TIMEOUT_SECONDS", 0.05
         )
         manager = _manager(BlockingGateway())
 
         with pytest.raises(GatewaySettingsUnavailable):
             await manager.async_get()
-        assert manager.diagnostic_snapshot()["active_operation_count"] == 0
+        diagnostics = manager.diagnostic_snapshot()
+        assert diagnostics["active_operation_count"] == 0
+        assert diagnostics["settings_read_attempt_count"] == 1
+        assert diagnostics["settings_read_success_count"] == 0
+        assert diagnostics["settings_read_failure_counts"]["timeout"] == 1
+        capability = diagnostics["capability_observations"][0]
+        assert capability["last_read_outcome"] == "timeout"
+        assert capability["has_successful_snapshot"] is False
 
     asyncio.run(run())
 

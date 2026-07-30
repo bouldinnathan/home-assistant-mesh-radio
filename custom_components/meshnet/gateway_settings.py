@@ -23,12 +23,13 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from .const import TRANSPORT_MQTT, TRANSPORT_REST
+from .const import MAX_PANEL_GATEWAYS, TRANSPORT_MQTT, TRANSPORT_REST
 from .models import stable_json
 
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_PREVIEW_TTL_SECONDS = 300
 SETTINGS_READ_TIMEOUT_SECONDS = 30
+SETTINGS_READ_TIMEOUT_MARGIN_SECONDS = 1.0
 SETTINGS_APPLY_TIMEOUT_SECONDS = 120
 SETTINGS_QUIESCE_TIMEOUT_SECONDS = 5
 MAX_SETTINGS_CHANGES = 64
@@ -108,6 +109,54 @@ _SAFE_SNAPSHOT_WARNING_MESSAGES = {
         "reads at once."
     ),
 }
+_SAFE_READ_ONLY_REASON_MESSAGES = {
+    "managed_mode_rejects_local_admin_changes": (
+        "This radio is in managed mode; its firmware rejects local settings "
+        "changes."
+    ),
+    "confirmed_admin_write_and_verification_not_available": (
+        "This connection cannot safely confirm and verify settings changes."
+    ),
+    "no_received_setting_has_a_reviewed_write_contract": (
+        "The radio did not return any setting that MeshNet can edit safely."
+    ),
+    "radio_metadata_is_read_only": "Radio metadata is read-only.",
+    "hardware_identity_is_read_only": "Hardware identity is read-only.",
+    "channel_index_is_selected_by_category": (
+        "The channel index is selected by its category and is read-only."
+    ),
+    "security_settings_require_a_recovery_workflow": (
+        "Security settings require a dedicated recovery workflow."
+    ),
+    "this_module_can_disable_the_active_bluetooth_transport": (
+        "This module can disable the active Bluetooth connection."
+    ),
+    "the_active_bluetooth_transport_cannot_disable_itself": (
+        "The active Bluetooth connection cannot disable itself."
+    ),
+    "display_mode_can_disable_bluetooth_on_supported_hardware": (
+        "This display mode can disable Bluetooth on supported hardware."
+    ),
+    "setting_requires_dedicated_semantic_validation": (
+        "This setting needs dedicated validation before MeshNet can edit it."
+    ),
+}
+_CAPABILITY_REASON_CODES = frozenset(
+    {
+        "managed_mode_rejects_local_admin_changes",
+        "confirmed_admin_write_and_verification_not_available",
+        "no_received_setting_has_a_reviewed_write_contract",
+    }
+)
+_SETTINGS_READ_FAILURE_OUTCOMES = (
+    "timeout",
+    "provider_error",
+    "invalid_snapshot",
+)
+_SAFE_DIAGNOSTIC_PROTOCOLS = frozenset({"meshtastic", "meshcore"})
+_SAFE_DIAGNOSTIC_TRANSPORTS = frozenset(
+    {"bluetooth", "mqtt", "native", "rest", "serial", "tcp"}
+)
 _CONNECTION_SETTINGS_SAVE_WARNING = (
     "The radio accepted a connection credential, but Home Assistant could not "
     "save it. Update the gateway connection credential before restarting."
@@ -266,6 +315,27 @@ def _safe_scalar(value: Any) -> str | bool | int | float | None:
     return None
 
 
+def _public_read_only_reason(value: Any, *, maximum: int) -> str | None:
+    """Return fixed friendly text for known codes or one bounded provider reason."""
+    if not isinstance(value, str) or not value or len(value) > maximum:
+        return None
+    return _SAFE_READ_ONLY_REASON_MESSAGES.get(value, value)
+
+
+def _diagnostic_enum(value: Any, allowed: frozenset[str]) -> str:
+    """Return an allowlisted diagnostic enum without arbitrary config text."""
+    return value if isinstance(value, str) and value in allowed else "unknown"
+
+
+def _provider_read_timeout_seconds() -> float:
+    """Leave the aggregate deadline time to classify and unwind a stuck read."""
+    margin = min(
+        SETTINGS_READ_TIMEOUT_MARGIN_SECONDS,
+        SETTINGS_READ_TIMEOUT_SECONDS * 0.25,
+    )
+    return max(0.001, SETTINGS_READ_TIMEOUT_SECONDS - margin)
+
+
 def _iso_now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -279,6 +349,12 @@ class GatewaySettingsManager:
         self._previews: dict[str, _Preview] = {}
         self._accepting = True
         self._active_tasks: dict[asyncio.Task[Any], str] = {}
+        self._settings_read_attempt_count = 0
+        self._settings_read_success_count = 0
+        self._settings_read_failure_counts = {
+            outcome: 0 for outcome in _SETTINGS_READ_FAILURE_OUTCOMES
+        }
+        self._capability_observations: dict[str, dict[str, Any]] = {}
         # Keep low-entropy credentials (notably six-digit PINs) from becoming
         # guessable through the public revision. The key exists only for this
         # manager lifetime, just like its in-memory previews.
@@ -288,10 +364,39 @@ class GatewaySettingsManager:
         """Forget all secret-bearing previews during reload or shutdown."""
         for preview_id in tuple(self._previews):
             self._discard_preview(preview_id)
+        self._capability_observations.clear()
 
     def diagnostic_snapshot(self) -> dict[str, Any]:
-        """Return counts and safety limits without field paths or values."""
+        """Return cached aggregate capability data without reading a gateway."""
         self._cleanup_previews()
+        gateways = sorted(
+            getattr(self._coordinator, "gateways", {}).items(),
+            key=lambda item: item[0],
+        )
+        observations: list[dict[str, Any]] = []
+        for index, (gateway_id, gateway) in enumerate(
+            gateways[:MAX_PANEL_GATEWAYS], start=1
+        ):
+            cached = self._capability_observations.get(gateway_id)
+            if cached is None:
+                config = getattr(gateway, "config", None)
+                cached = {
+                    "protocol": _diagnostic_enum(
+                        getattr(config, "protocol", None),
+                        _SAFE_DIAGNOSTIC_PROTOCOLS,
+                    ),
+                    "transport": _diagnostic_enum(
+                        getattr(config, "transport", None),
+                        _SAFE_DIAGNOSTIC_TRANSPORTS,
+                    ),
+                    "observed": False,
+                    "has_successful_snapshot": False,
+                    "last_read_outcome": "not_attempted",
+                    "capability_state": "unknown",
+                }
+            observations.append(
+                {"diagnostic_id": f"gateway_{index:03d}", **copy.deepcopy(cached)}
+            )
         return {
             "schema_version": SETTINGS_SCHEMA_VERSION,
             "pending_preview_count": len(self._previews),
@@ -303,11 +408,22 @@ class GatewaySettingsManager:
             "active_operation_count": len(self._active_tasks),
             "preview_ttl_seconds": SETTINGS_PREVIEW_TTL_SECONDS,
             "read_timeout_seconds": SETTINGS_READ_TIMEOUT_SECONDS,
+            "provider_read_timeout_seconds": _provider_read_timeout_seconds(),
             "apply_timeout_seconds": SETTINGS_APPLY_TIMEOUT_SECONDS,
             "max_changes_per_preview": MAX_SETTINGS_CHANGES,
             "previews_persisted": False,
             "secrets_returned": False,
             "raw_commands_exposed": False,
+            "capability_data_is_cached_only": True,
+            "settings_read_attempt_count": self._settings_read_attempt_count,
+            "settings_read_success_count": self._settings_read_success_count,
+            "settings_read_failure_counts": dict(
+                self._settings_read_failure_counts
+            ),
+            "capability_observations": observations,
+            "capability_observation_truncated": (
+                len(gateways) > MAX_PANEL_GATEWAYS
+            ),
         }
 
     async def async_quiesce(self) -> bool:
@@ -633,29 +749,79 @@ class GatewaySettingsManager:
         return self._locks.setdefault(gateway_id, asyncio.Lock())
 
     async def _async_read_gateway(self, gateway: Any) -> dict[str, Any]:
+        self._settings_read_attempt_count += 1
         read_method = getattr(gateway, "async_get_settings_snapshot", None)
         if not callable(read_method):
+            self._record_settings_read_failure(gateway, "provider_error")
             raise GatewaySettingsUnavailable
         try:
             raw = await asyncio.wait_for(
-                read_method(), timeout=SETTINGS_READ_TIMEOUT_SECONDS
+                read_method(), timeout=_provider_read_timeout_seconds()
             )
         except asyncio.CancelledError:
             raise
+        except TimeoutError:
+            self._record_settings_read_failure(gateway, "timeout")
+            raise GatewaySettingsUnavailable from None
         except Exception as err:
+            self._record_settings_read_failure(gateway, "provider_error")
             raise GatewaySettingsUnavailable from err
-        return self._sanitize_snapshot(gateway, raw)
+        try:
+            snapshot = self._sanitize_snapshot(gateway, raw)
+        except asyncio.CancelledError:
+            raise
+        except GatewaySettingsError:
+            self._record_settings_read_failure(gateway, "invalid_snapshot")
+            raise
+        except Exception:
+            self._record_settings_read_failure(gateway, "invalid_snapshot")
+            raise GatewaySettingsUnavailable from None
+        self._settings_read_success_count += 1
+        return snapshot
+
+    def _record_settings_read_failure(self, gateway: Any, outcome: str) -> None:
+        """Retain only one fixed failure category and prior aggregate counts."""
+        if outcome not in self._settings_read_failure_counts:
+            outcome = "provider_error"
+        self._settings_read_failure_counts[outcome] += 1
+        config = getattr(gateway, "config", None)
+        gateway_id = str(getattr(config, "gateway_id", ""))
+        if not gateway_id:
+            return
+        previous = self._capability_observations.get(gateway_id)
+        if previous is None:
+            previous = {
+                "protocol": _diagnostic_enum(
+                    getattr(config, "protocol", None),
+                    _SAFE_DIAGNOSTIC_PROTOCOLS,
+                ),
+                "transport": _diagnostic_enum(
+                    getattr(config, "transport", None),
+                    _SAFE_DIAGNOSTIC_TRANSPORTS,
+                ),
+                "observed": False,
+                "has_successful_snapshot": False,
+                "capability_state": "unknown",
+            }
+        self._capability_observations[gateway_id] = {
+            **previous,
+            "last_read_outcome": outcome,
+        }
 
     def _sanitize_snapshot(self, gateway: Any, raw: Any) -> dict[str, Any]:
         if not isinstance(raw, Mapping):
             raise GatewaySettingsUnavailable
         categories: list[dict[str, Any]] = []
         field_count = 0
+        source_category_count = 0
+        source_field_count = 0
+        claimed_writable_field_count = 0
         seen_paths: set[str] = set()
         raw_categories = raw.get("categories")
         if not isinstance(raw_categories, list):
             raw_categories = []
         for raw_category in raw_categories[:MAX_SETTINGS_CATEGORIES]:
+            source_category_count += 1
             if not isinstance(raw_category, Mapping):
                 continue
             key = raw_category.get("key")
@@ -669,8 +835,14 @@ class GatewaySettingsManager:
             if not isinstance(raw_fields, list):
                 raw_fields = []
             for raw_field in raw_fields:
-                if field_count >= MAX_SETTINGS_FIELDS:
+                if source_field_count >= MAX_SETTINGS_FIELDS:
                     break
+                source_field_count += 1
+                if (
+                    isinstance(raw_field, Mapping)
+                    and raw_field.get("writable") is True
+                ):
+                    claimed_writable_field_count += 1
                 field = self._sanitize_field(raw_field)
                 if field is None:
                     continue
@@ -700,16 +872,20 @@ class GatewaySettingsManager:
             for field in category["fields"]
         )
         connected = bool(gateway.status.connected)
-        available = bool(raw.get("available", True))
-        complete = bool(raw.get("complete", True))
+        available = raw.get("available", True) is True
+        complete = raw.get("complete", True) is True
+        source_writable = raw.get("writable", any_writable) is True
         writable = bool(
-            raw.get("writable", any_writable)
+            source_writable
             and any_writable
             and connected
             and available
             and complete
         )
-        read_only_reason = raw.get("read_only_reason")
+        raw_read_only_reason = raw.get("read_only_reason")
+        read_only_reason = _public_read_only_reason(
+            raw_read_only_reason, maximum=512
+        )
         if not writable:
             if not connected:
                 read_only_reason = "Connect this gateway before editing its settings."
@@ -720,10 +896,66 @@ class GatewaySettingsManager:
                     "The live settings read was incomplete; reconnect and reload "
                     "before editing."
                 )
-            elif not isinstance(read_only_reason, str) or not read_only_reason:
+            elif not read_only_reason:
                 read_only_reason = "This gateway is read-only."
-        elif not isinstance(read_only_reason, str):
+        else:
             read_only_reason = None
+
+        schema_writable_field_count = sum(
+            field["writable"]
+            for category in categories
+            for field in category["fields"]
+        )
+        editable_field_count = schema_writable_field_count if writable else 0
+        capability_reason = raw_read_only_reason
+        raw_capabilities = raw.get("capabilities")
+        if (
+            capability_reason not in _CAPABILITY_REASON_CODES
+            and isinstance(raw_capabilities, Mapping)
+        ):
+            candidate = raw_capabilities.get("apply_reason")
+            capability_reason = (
+                candidate if candidate in _CAPABILITY_REASON_CODES else None
+            )
+        capability_state = self._capability_state(
+            connected=connected,
+            available=available,
+            complete=complete,
+            writable=writable,
+            source_writable=source_writable,
+            claimed_writable_field_count=claimed_writable_field_count,
+            schema_writable_field_count=schema_writable_field_count,
+            capability_reason=capability_reason,
+        )
+        gateway_id = str(gateway.config.gateway_id)
+        capability_observation = {
+            "protocol": _diagnostic_enum(
+                gateway.config.protocol, _SAFE_DIAGNOSTIC_PROTOCOLS
+            ),
+            "transport": _diagnostic_enum(
+                gateway.config.transport, _SAFE_DIAGNOSTIC_TRANSPORTS
+            ),
+            "observed": True,
+            "has_successful_snapshot": True,
+            "last_read_outcome": "success",
+            "capability_state": capability_state,
+            "connected": connected,
+            "source_available": available,
+            "source_complete": complete,
+            "source_writable": source_writable,
+            "source_category_count": source_category_count,
+            "sanitized_category_count": len(categories),
+            "source_field_count": source_field_count,
+            "sanitized_field_count": field_count,
+            "claimed_writable_field_count": claimed_writable_field_count,
+            "schema_writable_field_count": schema_writable_field_count,
+            "editable_field_count": editable_field_count,
+            "read_only_field_count": max(0, field_count - editable_field_count),
+            "contract_downgraded_field_count": max(
+                0,
+                claimed_writable_field_count - schema_writable_field_count,
+            ),
+        }
 
         secret_paths = {
             field["path"]
@@ -754,6 +986,7 @@ class GatewaySettingsManager:
         revision = hashlib.sha256(
             stable_json(revision_material).encode("utf-8")
         ).hexdigest()
+        self._capability_observations[gateway_id] = capability_observation
         return {
             "schema_version": SETTINGS_SCHEMA_VERSION,
             "gateway_id": gateway.config.gateway_id,
@@ -768,6 +1001,38 @@ class GatewaySettingsManager:
             "categories": categories,
             "warnings": warnings,
         }
+
+    @staticmethod
+    def _capability_state(
+        *,
+        connected: bool,
+        available: bool,
+        complete: bool,
+        writable: bool,
+        source_writable: bool,
+        claimed_writable_field_count: int,
+        schema_writable_field_count: int,
+        capability_reason: Any,
+    ) -> str:
+        """Collapse capability decisions to a fixed non-identifying enum."""
+        if not connected:
+            return "disconnected"
+        if not available:
+            return "unavailable"
+        if not complete:
+            return "incomplete"
+        if writable:
+            return "writable"
+        if capability_reason == "managed_mode_rejects_local_admin_changes":
+            return "managed_mode"
+        if (
+            claimed_writable_field_count > 0
+            and schema_writable_field_count == 0
+        ):
+            return "all_claimed_writable_fields_rejected"
+        if source_writable != bool(schema_writable_field_count):
+            return "source_contract_inconsistent"
+        return "no_writable_fields"
 
     def _secret_revision_fingerprint(
         self, raw: Any, *, secret_paths: set[str]
@@ -846,21 +1111,26 @@ class GatewaySettingsManager:
             "path": path,
             "label": label,
             "type": field_type,
-            "writable": bool(raw.get("writable")),
-            "critical": bool(raw.get("critical")),
-            "requires_reconnect": bool(raw.get("requires_reconnect")),
+            "writable": raw.get("writable") is True,
+            "critical": raw.get("critical") is True,
+            "requires_reconnect": raw.get("requires_reconnect") is True,
         }
         if secret:
             field["value"] = None
-            field["configured"] = bool(raw.get("configured"))
-            field["allow_clear"] = bool(raw.get("allow_clear"))
+            field["configured"] = raw.get("configured") is True
+            field["allow_clear"] = raw.get("allow_clear") is True
         else:
             field["value"] = _safe_scalar(raw.get("value"))
         unsafe_contract = False
-        for key, maximum in (("description", 512), ("unit", 32), ("read_only_reason", 256)):
+        for key, maximum in (("description", 512), ("unit", 32)):
             value = raw.get(key)
             if isinstance(value, str) and len(value) <= maximum:
                 field[key] = value
+        read_only_reason = _public_read_only_reason(
+            raw.get("read_only_reason"), maximum=256
+        )
+        if read_only_reason is not None:
+            field["read_only_reason"] = read_only_reason
         for key in ("min", "max", "step"):
             if key not in raw:
                 continue

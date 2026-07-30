@@ -21,7 +21,7 @@ from .coordinator import MeshNetCoordinator
 from .diagnostic_safety import safe_node_metadata
 from .models import NodeState, has_valid_location, timestamp_to_json
 
-_DIAGNOSTIC_SCHEMA_VERSION = 3
+_DIAGNOSTIC_SCHEMA_VERSION = 4
 _REDACTED = "**REDACTED**"
 _RUNTIME_TIMEOUT = 3.0
 _MAX_DIAGNOSTIC_NODES = MAX_PANEL_NODES

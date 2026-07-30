@@ -40,12 +40,16 @@ revision is also rejected instead of applying a stale edit.
 
 The live page is authoritative because firmware and installed provider-library
 capabilities can vary. A field shown as read-only includes the reason.
+Beginning with 0.6.2, the page also reports the exact number of controls that
+are currently editable and read-only. An **Editable** badge means both the live
+gateway capability and MeshNet's path-specific safety contract permit a
+preview; an enabled-looking value without that badge is not writable.
 
 | Radio | Transport | Live settings | Apply | Verification |
 | --- | --- | --- | --- | --- |
 | Meshtastic | Direct Bluetooth | Yes | Supported fields only | Correlated local admin response followed by a fresh full configuration read |
-| Meshtastic | USB serial | Yes | Read-only in 0.6.0 | Not applicable |
-| Meshtastic | TCP | Yes | Read-only in 0.6.0 | Not applicable |
+| Meshtastic | USB serial | Yes | Read-only in the current release | Not applicable |
+| Meshtastic | TCP | Yes | Read-only in the current release | Not applicable |
 | Meshtastic | MQTT JSON | No standardized local settings contract | Read-only | Not applicable |
 | MeshCore | Direct Bluetooth | Yes | Supported companion-radio fields | Command response and live field readback |
 | MeshCore | USB serial | Yes | Supported companion-radio fields | Command response and live field readback |
@@ -57,6 +61,13 @@ and module configuration fields delivered by the connected radio. The exact
 set follows the installed Meshtastic protobuf schema. Repeated/list fields,
 hardware identity and metadata, managed-mode configuration, and security key
 administration remain read-only or are omitted.
+
+The reviewed Meshtastic Bluetooth write allowlist currently contains the owner
+long and short names, the fixed Bluetooth PIN, and selected display preferences.
+The Bluetooth enable switch cannot disable the connection currently carrying
+the settings transaction. Other displayed fields remain read-only until they
+have path-specific validation, bounded command behavior, recovery analysis,
+and verified live readback.
 
 MeshCore local companion connections can expose validated changes such as the
 device name, coordinates and position advertisement policy, bounded transmit
@@ -135,6 +146,28 @@ Gateway Settings does not provide:
 These boundaries are intentional. A newly supported setting must have a typed
 schema, strict validation, a bounded local command, and a credible live
 verification path before it becomes writable.
+
+## Capability Diagnostics
+
+Downloading diagnostics does not read the radio. MeshNet reports only the last
+capability decision already cached by a settings page read under
+`runtime.gateway_settings.capability_observations`. Each configured gateway is
+represented by a generated `gateway_NNN` diagnostic index rather than its real
+ID. Useful fields include:
+
+- `capability_state`: a fixed state such as `writable`, `disconnected`,
+  `unavailable`, `incomplete`, `managed_mode`,
+  `all_claimed_writable_fields_rejected`, or `no_writable_fields`;
+- `source_available`, `source_complete`, and `source_writable`;
+- aggregate source/sanitized category and field counts;
+- claimed, schema-writable, currently editable, read-only, and
+  contract-downgraded field counts; and
+- a fixed `last_read_outcome` plus aggregate timeout, provider, and invalid
+  snapshot failure counters.
+
+No field path, category name, label, current value, option, raw provider reason,
+revision, configured-secret state, or radio identity is retained in this
+diagnostic cache.
 
 ## Uninstall and Recovery
 
