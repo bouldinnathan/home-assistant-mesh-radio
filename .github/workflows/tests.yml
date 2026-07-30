@@ -71,6 +71,7 @@ jobs:
           tests/test_clients.py
           tests/test_coordinator.py
           tests/test_diagnostics.py
+          tests/test_frontend_panel.py
           tests/test_gateway_settings.py
           tests/test_init.py
           tests/test_meshcore_settings.py

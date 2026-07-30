@@ -702,6 +702,13 @@ The dedicated **Gateway settings** tab requires MeshNet 0.6.0 and a Home
 Assistant administrator account. Restart Home Assistant after updating and
 hard-refresh the browser once if the older Mesh-only panel is still cached.
 
+MeshNet 0.6.0 could leave this page at **Loading gateway settings…** when a
+Meshtastic power-monitor field advertised JavaScript's maximum safe integer as
+its upper bound. Upgrade to 0.6.1, restart Home Assistant, and hard-refresh the
+panel. Beginning with 0.6.1, an incompatible schema stops after one automatic
+attempt; press **Reload live values** after updating instead of relying on an
+automatic retry.
+
 Choose an online, physically connected gateway and press **Reload live
 values**. Read-only behavior is expected for:
 

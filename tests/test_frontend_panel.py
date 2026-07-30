@@ -6,6 +6,7 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -167,6 +168,18 @@ def test_settings_schema_is_bounded_typed_and_scrubs_secret_values() -> None:
             critical: true,
             requires_reconnect: true,
           },
+          {
+            path: "config.power.powermon_enables",
+            label: "Power Monitor Enables",
+            type: "integer",
+            value: 0,
+            min: 0,
+            max: Number.MAX_SAFE_INTEGER,
+            writable: false,
+            read_only_reason: "setting_requires_dedicated_semantic_validation",
+            critical: false,
+            requires_reconnect: false,
+          },
         ],
       }],
       warnings: ["Changing region can disconnect the radio."],
@@ -180,6 +193,9 @@ def test_settings_schema_is_bounded_typed_and_scrubs_secret_values() -> None:
   assert.equal(secret.value, "");
   assert.equal(secret.allow_clear, true);
   assert.equal(secret.max_length, 64);
+  const powerMask = response.selected.categories[0].fields[4];
+  assert.equal(powerMask.path, "config.power.powermon_enables");
+  assert.equal(powerMask.max, Number.MAX_SAFE_INTEGER);
   const html = panel._settingsField(secret, 3, response.selected);
   assert.match(html, /type="password" value=""/);
   assert.match(html, /Configured/);
@@ -214,6 +230,236 @@ def test_settings_schema_is_bounded_typed_and_scrubs_secret_values() -> None:
     () => panel._sanitizeSettingsSnapshot(duplicatePath),
     (error) => error.name === "PanelSchemaError" && error.code === "invalid_format",
   );
+"""
+    )
+
+
+def test_real_meshtastic_power_mask_obeys_server_frontend_integer_contract() -> None:
+    """Keep the pinned uint64 protobuf projection loadable by the real panel.
+
+    ``powermon_enables`` is a uint64 in Meshtastic's pinned protobuf. The
+    server deliberately caps its UI metadata at JavaScript's exact-integer
+    boundary. Exercise the actual protobuf descriptor, the server sanitizer,
+    JSON serialization, and the panel validator together so those two bounds
+    cannot silently diverge again.
+    """
+    pytest.importorskip("meshtastic")
+    from meshtastic.protobuf import mesh_pb2
+
+    from custom_components.meshnet.gateway_settings import (
+        GatewaySettingsManager,
+    )
+    from custom_components.meshnet.meshtastic_settings import (
+        MeshtasticSettingsState,
+    )
+
+    state = MeshtasticSettingsState()
+    state.begin_refresh()
+    record = mesh_pb2.FromRadio()
+    record.config.power.powermon_enables = 0
+    record.config.power.SetInParent()
+    state.capture_from_radio(record, my_node_num=None)
+    state.mark_complete()
+
+    gateway = SimpleNamespace(
+        config=SimpleNamespace(
+            gateway_id="gateway-1",
+            name="Test gateway",
+            protocol="meshtastic",
+            transport="bluetooth",
+        ),
+        status=SimpleNamespace(connected=True),
+    )
+    manager = GatewaySettingsManager(SimpleNamespace())
+    snapshot = manager._sanitize_snapshot(
+        gateway,
+        state.public_snapshot(
+            transport="bluetooth",
+            write_supported=True,
+        ),
+    )
+    power_mask = next(
+        field
+        for category in snapshot["categories"]
+        for field in category["fields"]
+        if field["path"] == "config.power.powermon_enables"
+    )
+    assert power_mask["value"] == 0
+    assert power_mask["max"] == 2**53 - 1
+
+    response = {
+        "gateways": [
+            {
+                "gateway_id": "gateway-1",
+                "name": "Test gateway",
+                "protocol": "meshtastic",
+                "transport": "bluetooth",
+                "connected": True,
+                "locally_managed": True,
+            }
+        ],
+        "selected": snapshot,
+    }
+    encoded_response = json.dumps(response, separators=(",", ":"))
+    _run_panel_script(
+        f"""
+  const response = panel._validateSettingsResponse({encoded_response});
+  const powerMask = response.selected.categories
+    .flatMap((category) => category.fields)
+    .find((field) => field.path === "config.power.powermon_enables");
+  assert.ok(powerMask);
+  assert.equal(powerMask.value, 0);
+  assert.equal(powerMask.max, Number.MAX_SAFE_INTEGER);
+"""
+    )
+
+
+def test_settings_schema_failure_does_not_retry_on_every_hass_assignment() -> None:
+    """A bad response waits for explicit reload instead of hammering HA."""
+    _run_panel_script(
+        r"""
+  panel._safeRender = () => true;
+  panel._connected = true;
+  panel._activeView = "settings";
+  panel._loaded = true;
+  let settingsRequests = 0;
+  const validResponse = {
+    gateways: [{
+      gateway_id: "gateway-1",
+      name: "Test gateway",
+      protocol: "meshtastic",
+      transport: "bluetooth",
+      connected: true,
+      writable: false,
+    }],
+    selected: {
+      schema_version: 1,
+      gateway_id: "gateway-1",
+      name: "Test gateway",
+      protocol: "meshtastic",
+      transport: "bluetooth",
+      connected: true,
+      writable: false,
+      read_only_reason: "No writable settings",
+      revision: "a".repeat(64),
+      fetched_at: "2026-07-30T12:00:00Z",
+      categories: [],
+      warnings: [],
+    },
+  };
+  const hass = {
+    async callWS(payload) {
+      if (payload.type === "meshnet/panel_log") return { accepted: true };
+      if (payload.type !== "meshnet/settings/get") throw new Error("unexpected request");
+      settingsRequests += 1;
+      return settingsRequests === 1
+        ? { gateways: "invalid", selected: null }
+        : validResponse;
+    },
+  };
+  panel._hass = hass;
+
+  await panel._loadGatewaySettings();
+  assert.equal(settingsRequests, 1);
+  assert.equal(panel._settingsBusy, null);
+  assert.equal(panel._settingsSnapshot, null);
+  assert.equal(panel._settingsStatus.kind, "bad");
+
+  panel.hass = hass;
+  panel.hass = hass;
+  panel.hass = hass;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settingsRequests, 1);
+
+  await panel._loadGatewaySettings();
+  assert.equal(settingsRequests, 2);
+  assert.equal(panel._settingsSnapshot.gateway_id, "gateway-1");
+  assert.equal(panel._settingsStatus.kind, "good");
+"""
+    )
+
+
+def test_settings_render_has_one_loading_message_then_terminal_error() -> None:
+    """The visible page must settle instead of appearing permanently busy."""
+    _run_panel_script(
+        r"""
+  panel._connected = true;
+  panel._activeView = "settings";
+  panel.querySelectorAll = () => [];
+  panel.querySelector = () => null;
+  let resolveSettings;
+  panel._hass = {
+    callWS(payload) {
+      if (payload.type === "meshnet/panel_log") return Promise.resolve({ accepted: true });
+      return new Promise((resolve) => { resolveSettings = resolve; });
+    },
+  };
+
+  const request = panel._loadGatewaySettings();
+  await Promise.resolve();
+  assert.equal((panel.innerHTML.match(/Loading gateway settings…/g) || []).length, 1);
+
+  resolveSettings({ gateways: "invalid", selected: null });
+  await request;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(panel.innerHTML.includes("Loading gateway settings…"), false);
+  assert.equal(
+    (panel.innerHTML.match(/Gateway settings could not be loaded\./g) || []).length,
+    1,
+  );
+  assert.equal(panel._settingsBusy, null);
+"""
+    )
+
+
+def test_hung_settings_get_times_out_once_and_waits_for_manual_retry() -> None:
+    """A lost WebSocket response clears busy state without a retry storm."""
+    _run_panel_script(
+        r"""
+  let nextTimer = 0;
+  const timers = new Map();
+  window.setTimeout = (callback, delay) => {
+    nextTimer += 1;
+    timers.set(nextTimer, { callback, delay });
+    return nextTimer;
+  };
+  window.clearTimeout = (timer) => timers.delete(timer);
+  panel._safeRender = () => true;
+  panel._connected = true;
+  panel._activeView = "settings";
+  panel._loaded = true;
+  let settingsRequests = 0;
+  const hass = {
+    callWS(payload) {
+      if (payload.type === "meshnet/panel_log") return Promise.resolve({ accepted: true });
+      settingsRequests += 1;
+      return new Promise(() => {});
+    },
+  };
+  panel._hass = hass;
+
+  const request = panel._loadGatewaySettings();
+  await Promise.resolve();
+  const timeout = [...timers.values()].find((timer) => timer.delay === 35000);
+  assert.ok(timeout);
+  timeout.callback();
+  await request;
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(settingsRequests, 1);
+  assert.equal(panel._settingsBusy, null);
+  assert.equal(panel._settingsStatus.kind, "bad");
+  assert.equal(
+    panel._failureTelemetry.some(
+      (event) => event.operation === "settings_get" && event.error_code === "timeout",
+    ),
+    true,
+  );
+
+  panel.hass = hass;
+  panel.hass = hass;
+  await Promise.resolve();
+  assert.equal(settingsRequests, 1);
 """
     )
 

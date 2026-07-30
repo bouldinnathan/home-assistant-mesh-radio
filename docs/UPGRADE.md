@@ -1,5 +1,17 @@
 # Upgrade Guide
 
+## From 0.6.0
+
+0.6.1 fixes the Gateway settings page rejecting a valid Meshtastic unsigned
+64-bit bitmask bound that had already been clamped to JavaScript's maximum safe
+integer by the server. The page now accepts the same integer range as the
+server. A failed or future incompatible settings schema also stops after one
+automatic attempt instead of being retried on every Home Assistant state
+update; use **Reload live values** to make an explicit new attempt.
+
+No radio setting is changed during this upgrade. Restart Home Assistant and
+hard-refresh the browser after installing so the corrected panel module loads.
+
 ## From 0.5.11
 
 0.6.0 adds a dedicated **Gateway settings** tab to the admin-only MeshNet

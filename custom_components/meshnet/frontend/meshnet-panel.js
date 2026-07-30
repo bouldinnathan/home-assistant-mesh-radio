@@ -43,6 +43,7 @@ class MeshNetPanel extends HTMLElement {
     this._settingsBusy = null;
     this._settingsCriticalConfirmed = false;
     this._settingsRequestGeneration = 0;
+    this._settingsAutoLoadAttempted = false;
   }
 
   set hass(hass) {
@@ -80,6 +81,7 @@ class MeshNetPanel extends HTMLElement {
     this._settingsStatus = null;
     this._settingsCriticalConfirmed = false;
     this._settingsResultWarnings = [];
+    this._settingsAutoLoadAttempted = false;
     if (this._pollTimer != null) window.clearTimeout(this._pollTimer);
     this._pollTimer = null;
   }
@@ -103,6 +105,7 @@ class MeshNetPanel extends HTMLElement {
       && this._activeView === "settings"
       && !this._settingsSnapshot
       && this._settingsBusy == null
+      && !this._settingsAutoLoadAttempted
     ) void this._loadGatewaySettings(this._settingsGatewayId);
   }
 
@@ -1323,8 +1326,7 @@ class MeshNetPanel extends HTMLElement {
             </label>
             <button class="settings-button" id="meshnet-settings-reload" type="button"${busy ? " disabled" : ""}>Reload live values</button>
           </div>
-          ${this._settingsBusy === "get" && !snapshot ? '<div class="settings-status warn">Loading gateway settings…</div>' : ""}
-          ${!snapshot && this._settingsBusy !== "get" ? '<div class="settings-status warn">Choose a gateway to load its supported settings.</div>' : ""}
+          ${!snapshot && this._settingsBusy !== "get" && !this._settingsStatus ? '<div class="settings-status warn">Choose a gateway to load its supported settings.</div>' : ""}
           ${snapshot ? `
             <div class="field-help">${this._escape(`${snapshot.name} · ${snapshot.protocol} over ${snapshot.transport} · revision ${snapshot.revision}`)}</div>
             ${snapshot.writable ? "" : `<div class="settings-status warn">Read only${snapshot.read_only_reason ? ` · ${this._escape(snapshot.read_only_reason)}` : ""}</div>`}
@@ -1707,6 +1709,11 @@ class MeshNetPanel extends HTMLElement {
       || !this._hass
       || typeof this._hass.callWS !== "function"
     ) return;
+    // Home Assistant assigns ``hass`` whenever state changes. A failed schema
+    // must not turn those assignments into an unbounded settings-read loop.
+    // The visible reload button, gateway selection, or leaving/re-entering the
+    // tab can still start an explicit new attempt.
+    this._settingsAutoLoadAttempted = true;
     const generation = ++this._settingsRequestGeneration;
     this._settingsBusy = "get";
     this._settingsStatus = { kind: "warn", text: "Loading gateway settings…" };
@@ -2301,8 +2308,11 @@ class MeshNetPanel extends HTMLElement {
       || (
         typeof value === "number"
         && Number.isFinite(value)
-        && Math.abs(value) <= 1_000_000_000_000_000
-        && (!Number.isInteger(value) || Number.isSafeInteger(value))
+        && (
+          Number.isInteger(value)
+            ? Number.isSafeInteger(value)
+            : Math.abs(value) <= 1_000_000_000_000_000
+        )
       );
   }
 
