@@ -272,9 +272,9 @@ def test_remote_get_copies_controller_public_key_without_secret_projection(
     """The controller public key is copy-only; no other key material escapes."""
 
     async def run() -> None:
+        client, connection = _active_remote_client()
         from meshtastic.protobuf import admin_pb2
 
-        client, connection = _active_remote_client()
         caplog.set_level(logging.DEBUG)
 
         snapshot = await client.async_get_remote_settings_snapshot(TARGET_ID)

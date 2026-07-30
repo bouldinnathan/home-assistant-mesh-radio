@@ -71,6 +71,9 @@ def _load_coordinator_without_home_assistant(monkeypatch: pytest.MonkeyPatch):
         def __class_getitem__(cls, _item):
             return cls
 
+        async def async_shutdown(self) -> None:
+            """Match the coordinator lifecycle surface used by MeshNet."""
+
     class HomeAssistantError(Exception):
         pass
 
