@@ -1,3 +1,19 @@
+const MESH_CARD_IDS = Object.freeze([
+  "send-message",
+  "gateways",
+  "remote-admin",
+  "traceroute",
+  "neighbor-info",
+  "panel-diagnostics",
+  "nodes",
+  "recent-messages",
+  "rf-heat",
+]);
+const MESH_CARD_MIN_WIDTH = 280;
+const MESH_CARD_MAX_WIDTH = 720;
+const MESH_CARD_MIN_HEIGHT = 120;
+const MESH_CARD_MAX_HEIGHT = 1200;
+
 class MeshNetPanel extends HTMLElement {
   constructor() {
     super();
@@ -45,6 +61,12 @@ class MeshNetPanel extends HTMLElement {
     this._graphAnimationIterations = 0;
     this._graphDrag = null;
     this._graphDragCleanup = null;
+    // Mesh workspace layout belongs only to this attached panel instance. It
+    // deliberately never enters browser storage or Home Assistant state.
+    this._meshCardOrder = [...MESH_CARD_IDS];
+    this._meshCardSizes = new Map();
+    this._meshLayoutInteraction = null;
+    this._meshLayoutCleanup = null;
     this._remoteGatewayId = "";
     this._remoteTargetNode = "";
     this._remoteSettingsSnapshot = null;
@@ -122,7 +144,10 @@ class MeshNetPanel extends HTMLElement {
     this._neighborInfoStatusRequestGeneration += 1;
     this._settingsRequestGeneration += 1;
     this._stopGraphAnimation();
+    this._cancelMeshLayoutInteraction();
     this._graphPositions.clear();
+    this._meshCardOrder = [...MESH_CARD_IDS];
+    this._meshCardSizes.clear();
     this._messages = [];
     this._messageConversation = "broadcast:0";
     this._messageLoading = false;
@@ -737,6 +762,8 @@ class MeshNetPanel extends HTMLElement {
 
   _render() {
     const composerFocus = this._composerFocusState() || this._settingsFocusState();
+    const meshCardScroll = this._captureMeshCardScrollState();
+    this._cancelMeshLayoutInteraction();
     if (this._activeView === "settings") {
       this._renderSettings(composerFocus);
       return;
@@ -755,6 +782,10 @@ class MeshNetPanel extends HTMLElement {
       (gateway) => gateway && typeof gateway === "object" && !Array.isArray(gateway),
     );
     const sortedNodes = this._sortNodes(nodes, this._nodeSort);
+    const neighborInfoNodeKeys = new Set(
+      this._remoteNodeCandidates(nodes).map((node) => String(node.node_key)),
+    );
+    const neighborInfoGatewayAvailable = this._remoteGatewayCandidates(gateways).length > 0;
     const directDelivery = this._draft.delivery === "direct";
     const recipientChoices = this._recipientChoices(nodes);
     const unsafeRecipientKeys = new Set(
@@ -785,7 +816,7 @@ class MeshNetPanel extends HTMLElement {
         }
         .wrap {
           display: grid;
-          grid-template-columns: minmax(0, 1fr) 360px;
+          grid-template-columns: minmax(0, 1fr) max-content;
           gap: 16px;
           padding: 16px;
           box-sizing: border-box;
@@ -891,13 +922,70 @@ class MeshNetPanel extends HTMLElement {
           cursor: grabbing;
         }
         .side {
-          display: flex;
-          flex-direction: column;
+          display: grid;
+          align-content: start;
+          justify-items: start;
           gap: 12px;
         }
         .panel {
           padding: 12px;
-          overflow: hidden;
+          box-sizing: border-box;
+          width: 360px;
+          min-width: ${MESH_CARD_MIN_WIDTH}px;
+          max-width: min(${MESH_CARD_MAX_WIDTH}px, 48vw, calc(100vw - 32px));
+          min-height: ${MESH_CARD_MIN_HEIGHT}px;
+          position: relative;
+          overflow: auto;
+        }
+        .mesh-layout-help {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 8px;
+          box-sizing: border-box;
+          width: 360px;
+          max-width: calc(100vw - 32px);
+          color: var(--secondary-text-color);
+          font-size: 11px;
+        }
+        .mesh-layout-reset,
+        .mesh-card-layout-bar button,
+        .mesh-card-resize-handle {
+          border: 1px solid var(--divider-color);
+          border-radius: 5px;
+          padding: 3px 6px;
+          color: var(--secondary-text-color);
+          background: var(--card-background-color);
+          cursor: pointer;
+          font: inherit;
+        }
+        .mesh-card-layout-bar {
+          display: flex;
+          align-items: center;
+          justify-content: flex-end;
+          gap: 4px;
+          margin: -5px -5px 6px 0;
+          min-height: 24px;
+        }
+        .mesh-card-drag-handle {
+          cursor: grab !important;
+          touch-action: none;
+        }
+        .mesh-card-drag-handle:active { cursor: grabbing !important; }
+        .mesh-card-resize-handle {
+          position: absolute;
+          right: 3px;
+          bottom: 3px;
+          z-index: 2;
+          cursor: nwse-resize;
+          touch-action: none;
+        }
+        .panel.mesh-card-dragging { opacity: 0.68; }
+        .mesh-layout-reset:focus-visible,
+        .mesh-card-layout-bar button:focus-visible,
+        .mesh-card-resize-handle:focus-visible {
+          outline: 2px solid var(--primary-color);
+          outline-offset: 2px;
         }
         .panel h2 {
           margin: 0 0 8px;
@@ -1163,6 +1251,15 @@ class MeshNetPanel extends HTMLElement {
         text { fill: var(--primary-text-color); font-size: 12px; }
         @media (max-width: 900px) {
           .wrap { grid-template-columns: 1fr; padding: 10px; }
+          .side { width: 100%; }
+          .mesh-layout-help { width: 100%; max-width: 100%; }
+          .panel[data-mesh-card] {
+            min-width: 0;
+            width: 100% !important;
+            height: auto !important;
+            max-width: 100%;
+          }
+          .mesh-card-resize-handle { display: none; }
           .stats { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
           .topology svg { min-height: 360px; height: 56vh; }
         }
@@ -1185,8 +1282,12 @@ class MeshNetPanel extends HTMLElement {
           </div>
           ${this._graph(topology)}
         </main>
-        <aside class="side">
-          <section class="panel">
+        <aside class="side" id="meshnet-mesh-cards">
+          <div class="mesh-layout-help">
+            <span>Drag or use arrows to reorder. Resize from the corner on wider screens. Layout resets when you leave MeshNet.</span>
+            <button class="mesh-layout-reset" id="meshnet-layout-reset" type="button">Reset</button>
+          </div>
+          <section class="panel" data-mesh-card="send-message">
             <h2>Send message</h2>
             <form class="composer" id="meshnet-send-form">
               <label>
@@ -1239,7 +1340,7 @@ class MeshNetPanel extends HTMLElement {
               <div class="send-status ${this._statusClass()}" role="status" aria-live="polite">${this._escape(this._sendStatus ? this._sendStatus.text : "")}</div>
             </form>
           </section>
-          <section class="panel">
+          <section class="panel" data-mesh-card="gateways">
             <h2>Gateways</h2>
             ${gateways.map((gateway) => `
               <div class="row">
@@ -1252,7 +1353,7 @@ class MeshNetPanel extends HTMLElement {
           ${this._traceroutePanel(nodes, gateways)}
           ${this._neighborInfoPanel(nodes, gateways)}
           ${this._panelDiagnostics(snapshot.panel_metadata, nodes)}
-          <section class="panel">
+          <section class="panel" data-mesh-card="nodes">
             <div class="panel-heading">
               <h2>Nodes</h2>
               <label class="sort-control">
@@ -1273,6 +1374,7 @@ class MeshNetPanel extends HTMLElement {
                 <span class="node-actions">
                   <span class="${node.online ? "good" : "bad"}">${node.online ? "recent" : "stale"}</span>
                   <button class="node-message" type="button" data-message-node="${this._escape(node.node_key)}"${unsafeRecipientKeys.has(String(node.node_key)) ? ' disabled aria-disabled="true" title="Unsafe node identity; direct messaging is disabled"' : ""}>${unsafeRecipientKeys.has(String(node.node_key)) ? "Identity blocked" : "Message"}</button>
+                  <button class="node-message" type="button" data-neighbor-info-node="${this._escape(node.node_key)}"${neighborInfoNodeKeys.has(String(node.node_key)) && neighborInfoGatewayAvailable ? "" : ' disabled aria-disabled="true" title="NeighborInfo requires one exact valid Meshtastic node and a connected Bluetooth gateway"'}>NeighborInfo</button>
                 </span>
               </div>
             `).join("") || `<div class="label">Waiting for node data</div>`}
@@ -1281,7 +1383,7 @@ class MeshNetPanel extends HTMLElement {
             ${hintedNodeCount ? `<div class="label">${hintedNodeCount} display label${hintedNodeCount === 1 ? " uses" : "s use"} an unambiguous cached name from the same exact !ID. Records and send targets remain separate.</div>` : ""}
             ${favoriteLabelConfigured ? "" : '<div class="label">To pin favorites, add the Home Assistant device label “MeshNet Favorite”.</div>'}
           </section>
-          <section class="panel">
+          <section class="panel" data-mesh-card="recent-messages">
             <h2>Messages</h2>
             ${(Array.isArray(snapshot.recent_messages) ? snapshot.recent_messages : [])
               .filter((message) => message && typeof message === "object" && !Array.isArray(message))
@@ -1292,7 +1394,7 @@ class MeshNetPanel extends HTMLElement {
               </div>
             `).join("") || `<div class="label">No messages recorded</div>`}
           </section>
-          <section class="panel">
+          <section class="panel" data-mesh-card="rf-heat">
             <h2>RF Heat</h2>
             <div class="label">Cached SNR/RSSI may be stale or multi-hop and is not a distance estimate.</div>
             <div class="heat">
@@ -1312,6 +1414,7 @@ class MeshNetPanel extends HTMLElement {
       </div>
     `;
     this._safeStep("bind_views", "binding", () => this._bindViewControls());
+    this._safeStep("bind_mesh_layout", "binding", () => this._bindMeshCardLayout(meshCardScroll));
     this._safeStep("bind_composer", "binding", () => this._bindComposer());
     this._safeStep("bind_nodes", "binding", () => this._bindNodeControls());
     this._safeStep("bind_remote_controls", "binding", () => this._bindAdvancedControls());
@@ -1335,13 +1438,24 @@ class MeshNetPanel extends HTMLElement {
   }
 
   _remoteNodeCandidates(nodes) {
-    const seen = new Set();
-    return (Array.isArray(nodes) ? nodes : []).filter((node) => {
+    const candidates = (Array.isArray(nodes) ? nodes : []).filter((node) => {
       const nodeId = this._meshtasticNodeId(node);
-      if (!this._isExactRemoteTarget(nodeId) || seen.has(nodeId)) return false;
-      seen.add(nodeId);
+      if (
+        !this._isExactRemoteTarget(nodeId)
+        || node.identity_valid !== true
+        || node.node_key !== `meshtastic:${nodeId}`
+      ) return false;
       return true;
     });
+    const counts = new Map();
+    candidates.forEach((node) => {
+      const nodeId = this._meshtasticNodeId(node);
+      counts.set(nodeId, (counts.get(nodeId) || 0) + 1);
+    });
+    return this._sortNodes(
+      candidates.filter((node) => counts.get(this._meshtasticNodeId(node)) === 1),
+      "favorites_recent",
+    );
   }
 
   _isExactRemoteTarget(value) {
@@ -1370,12 +1484,14 @@ class MeshNetPanel extends HTMLElement {
 
   _operatorTargetOptions(nodes, selected, { traceroute = false } = {}) {
     if (!nodes.length) return '<option value="">No exact Meshtastic node available</option>';
-    return nodes.map((node) => {
+    return this._sortNodes(nodes, "favorites_recent").map((node) => {
       const nodeId = this._meshtasticNodeId(node);
       const value = traceroute ? `meshtastic:${nodeId}` : nodeId;
       const label = this._nodeName(node);
       const visible = label.includes(nodeId) ? label : `${label} · ${nodeId}`;
-      return `<option value="${this._escape(value)}"${this._selected(selected, value)}>${this._escape(visible)}</option>`;
+      const favorite = node.favorite === true ? "★ " : "";
+      const lastSeen = this._humanLastSeen(node.last_heard);
+      return `<option value="${this._escape(value)}"${this._selected(selected, value)}>${this._escape(`${favorite}${visible} · ${lastSeen}`)}</option>`;
     }).join("");
   }
 
@@ -1396,7 +1512,7 @@ class MeshNetPanel extends HTMLElement {
     const hasDraft = Object.keys(this._remoteSettingsDraft).length > 0;
     const busy = this._remoteSettingsBusy != null;
     return `
-      <section class="panel" id="meshnet-remote-admin-panel">
+      <section class="panel" id="meshnet-remote-admin-panel" data-mesh-card="remote-admin">
         <h2>Remote node administration</h2>
         <div class="field-help">Explicit Meshtastic Bluetooth requests only. Loading is read-only; every write requires a preview and a separate confirmation.</div>
         <div class="operator-controls">
@@ -1541,7 +1657,7 @@ class MeshNetPanel extends HTMLElement {
     const result = this._tracerouteResultFor(selectedGateway, selectedTarget);
     const cooldown = this._tracerouteCooldownActive(selectedGateway, selectedTarget);
     return `
-      <section class="panel" id="meshnet-traceroute-panel">
+      <section class="panel" id="meshnet-traceroute-panel" data-mesh-card="traceroute">
         <h2>Manual traceroute</h2>
         <div class="field-help">This sends RF traffic. It is never run by polling, graph animation, startup, or automation. One attempt starts an integration-wide one-minute cooldown.</div>
         <div class="operator-controls">
@@ -1648,7 +1764,7 @@ class MeshNetPanel extends HTMLElement {
       ? this._neighborInfoResult
       : null;
     return `
-      <section class="panel" id="meshnet-neighbor-info-panel">
+      <section class="panel" id="meshnet-neighbor-info-panel" data-mesh-card="neighbor-info">
         <h2>NeighborInfo request</h2>
         <div class="field-help warn"><strong>Experimental / newer firmware only.</strong> Verified on firmware 2.7.26 when Neighbor Info is enabled. Older firmware may reject or time out; the official Android app temporarily disabled this control because it was not working as expected.</div>
         <div class="field-help">This submits one application request with no MeshNet retry. Firmware may relay or retransmit reliable traffic. MeshNet never runs it during polling, startup, or graph animation. The server enforces 180-second global and same-target cooldowns.</div>
@@ -1797,13 +1913,18 @@ class MeshNetPanel extends HTMLElement {
   }
 
   _panelInteractionActive() {
-    if (this._graphDrag) return true;
+    if (this._graphDrag || this._meshLayoutInteraction) return true;
     if (this._composerFocusState() || this._settingsFocusState()) return true;
     const active = this._activePanelElement();
     if (!active || !this.contains(active)) return false;
-    if (active.id === "meshnet-send-button") return true;
+    if (["meshnet-send-button", "meshnet-layout-reset"].includes(active.id)) return true;
     try {
-      return typeof active.hasAttribute === "function" && active.hasAttribute("data-message-node");
+      return typeof active.hasAttribute === "function"
+        && (active.hasAttribute("data-message-node")
+          || active.hasAttribute("data-neighbor-info-node")
+          || active.hasAttribute("data-mesh-drag-handle")
+          || active.hasAttribute("data-mesh-resize-handle")
+          || active.hasAttribute("data-mesh-card-move"));
     } catch (_ignored) {
       return false;
     }
@@ -5173,6 +5294,383 @@ class MeshNetPanel extends HTMLElement {
     ));
   }
 
+  _isMeshCardId(value) {
+    return typeof value === "string" && MESH_CARD_IDS.includes(value);
+  }
+
+  _orderedMeshCards(availableIds) {
+    if (!Array.isArray(availableIds)) return [];
+    const available = new Set(
+      availableIds.filter((cardId) => this._isMeshCardId(cardId)),
+    );
+    return this._meshCardOrder.filter((cardId) => available.has(cardId));
+  }
+
+  _moveMeshCard(cardId, direction) {
+    if (!this._isMeshCardId(cardId) || !["earlier", "later"].includes(direction)) {
+      return false;
+    }
+    const index = this._meshCardOrder.indexOf(cardId);
+    const nextIndex = direction === "earlier" ? index - 1 : index + 1;
+    if (index < 0 || nextIndex < 0 || nextIndex >= this._meshCardOrder.length) {
+      return false;
+    }
+    const next = [...this._meshCardOrder];
+    [next[index], next[nextIndex]] = [next[nextIndex], next[index]];
+    this._meshCardOrder = next;
+    this._applyMeshCardOrder();
+    return true;
+  }
+
+  _moveMeshCardTo(cardId, targetId, after = false) {
+    if (
+      !this._isMeshCardId(cardId)
+      || !this._isMeshCardId(targetId)
+      || cardId === targetId
+      || typeof after !== "boolean"
+    ) return false;
+    const next = this._meshCardOrder.filter((candidate) => candidate !== cardId);
+    const targetIndex = next.indexOf(targetId);
+    if (targetIndex < 0) return false;
+    next.splice(targetIndex + (after ? 1 : 0), 0, cardId);
+    if (next.length !== MESH_CARD_IDS.length || new Set(next).size !== next.length) {
+      return false;
+    }
+    this._meshCardOrder = next;
+    this._applyMeshCardOrder();
+    return true;
+  }
+
+  _setMeshCardSize(cardId, width, height) {
+    if (
+      !this._isMeshCardId(cardId)
+      || !Number.isSafeInteger(width)
+      || !Number.isSafeInteger(height)
+      || width <= 0
+      || height <= 0
+    ) return false;
+    const size = {
+      width: Math.min(MESH_CARD_MAX_WIDTH, Math.max(MESH_CARD_MIN_WIDTH, width)),
+      height: Math.min(MESH_CARD_MAX_HEIGHT, Math.max(MESH_CARD_MIN_HEIGHT, height)),
+    };
+    this._meshCardSizes.set(cardId, size);
+    this._applyMeshCardSize(cardId);
+    return true;
+  }
+
+  _applyMeshCardSize(cardId) {
+    if (!this._isMeshCardId(cardId) || typeof this.querySelector !== "function") return;
+    const card = this.querySelector(`[data-mesh-card="${cardId}"]`);
+    if (!card || !card.style) return;
+    const size = this._meshCardSizes.get(cardId);
+    card.style.width = size ? `${size.width}px` : "";
+    card.style.height = size ? `${size.height}px` : "";
+  }
+
+  _applyMeshCardOrder() {
+    if (typeof this.querySelector !== "function") return;
+    const container = this.querySelector("#meshnet-mesh-cards");
+    if (!container || typeof container.querySelectorAll !== "function") return;
+    const cards = [...container.querySelectorAll("[data-mesh-card]")].filter(
+      (card) => card && this._isMeshCardId(card.getAttribute("data-mesh-card")),
+    );
+    const byId = new Map(cards.map(
+      (card) => [card.getAttribute("data-mesh-card"), card],
+    ));
+    for (const cardId of this._orderedMeshCards([...byId.keys()])) {
+      const card = byId.get(cardId);
+      if (card && typeof container.appendChild === "function") container.appendChild(card);
+      this._applyMeshCardSize(cardId);
+    }
+  }
+
+  _resetMeshCardLayout() {
+    this._meshCardOrder = [...MESH_CARD_IDS];
+    this._meshCardSizes.clear();
+    this._applyMeshCardOrder();
+  }
+
+  _meshCardControls(cardId) {
+    const label = cardId.replaceAll("-", " ");
+    return `
+      <div class="mesh-card-layout-bar" data-mesh-card-controls="${cardId}" aria-label="${this._escape(label)} card layout controls">
+        <button type="button" data-mesh-card-move="earlier" aria-label="Move ${this._escape(label)} card earlier" title="Move earlier">↑</button>
+        <button type="button" class="mesh-card-drag-handle" data-mesh-drag-handle="${cardId}" draggable="true" aria-label="Drag ${this._escape(label)} card" title="Drag to move">⠿</button>
+        <button type="button" data-mesh-card-move="later" aria-label="Move ${this._escape(label)} card later" title="Move later">↓</button>
+      </div>
+      <button type="button" class="mesh-card-resize-handle" data-mesh-resize-handle="${cardId}" aria-label="Resize ${this._escape(label)} card" title="Drag to resize; arrow keys resize">↘</button>
+    `;
+  }
+
+  _captureMeshCardScrollState() {
+    const state = new Map();
+    if (typeof this.querySelectorAll !== "function") return state;
+    this.querySelectorAll("[data-mesh-card]").forEach((card) => {
+      const cardId = card && typeof card.getAttribute === "function"
+        ? card.getAttribute("data-mesh-card")
+        : null;
+      if (!this._isMeshCardId(cardId)) return;
+      const top = card.scrollTop;
+      const left = card.scrollLeft;
+      if (Number.isFinite(top) && top >= 0 && Number.isFinite(left) && left >= 0) {
+        state.set(cardId, { top, left });
+      }
+    });
+    return state;
+  }
+
+  _restoreMeshCardScrollState(state) {
+    if (!(state instanceof Map) || typeof this.querySelector !== "function") return;
+    state.forEach((position, cardId) => {
+      if (!this._isMeshCardId(cardId) || !position) return;
+      const card = this.querySelector(`[data-mesh-card="${cardId}"]`);
+      if (!card) return;
+      card.scrollTop = position.top;
+      card.scrollLeft = position.left;
+    });
+  }
+
+  _cancelMeshLayoutInteraction() {
+    const cleanup = this._meshLayoutCleanup;
+    this._meshLayoutCleanup = null;
+    if (typeof cleanup === "function") {
+      try {
+        cleanup();
+      } catch (_ignored) {
+        // A disappearing pointer target has no remaining layout ownership.
+      }
+    }
+    this._meshLayoutInteraction = null;
+    if (typeof this.querySelectorAll === "function") {
+      this.querySelectorAll(".mesh-card-dragging").forEach(
+        (card) => card.classList && card.classList.remove("mesh-card-dragging"),
+      );
+    }
+  }
+
+  _finishMeshLayoutInteraction() {
+    this._cancelMeshLayoutInteraction();
+    this._queuePendingPollRender();
+  }
+
+  _startMeshCardResize(event, card, handle, cardId) {
+    if (
+      !event
+      || (event.button != null && event.button !== 0)
+      || !card
+      || !handle
+      || !this._isMeshCardId(cardId)
+      || typeof card.getBoundingClientRect !== "function"
+    ) return;
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const rect = card.getBoundingClientRect();
+    if (
+      ![startX, startY, rect.width, rect.height].every(
+        (value) => typeof value === "number" && Number.isFinite(value),
+      )
+    ) return;
+    if (typeof event.preventDefault === "function") event.preventDefault();
+    if (typeof event.stopPropagation === "function") event.stopPropagation();
+    this._cancelMeshLayoutInteraction();
+    const pointerId = event.pointerId;
+    this._meshLayoutInteraction = { kind: "resize", card_id: cardId };
+    if (typeof handle.setPointerCapture === "function" && pointerId != null) {
+      try {
+        handle.setPointerCapture(pointerId);
+      } catch (_ignored) {
+        // Pointer capture is an enhancement; bound handle listeners still work.
+      }
+    }
+    const move = (moveEvent) => {
+      if (
+        !this._meshLayoutInteraction
+        || this._meshLayoutInteraction.card_id !== cardId
+        || (pointerId != null && moveEvent.pointerId != null && moveEvent.pointerId !== pointerId)
+      ) return;
+      const width = Math.round(rect.width + moveEvent.clientX - startX);
+      const height = Math.round(rect.height + moveEvent.clientY - startY);
+      this._setMeshCardSize(cardId, width, height);
+    };
+    const finish = (finishEvent) => {
+      if (
+        !this._meshLayoutInteraction
+        || this._meshLayoutInteraction.kind !== "resize"
+        || this._meshLayoutInteraction.card_id !== cardId
+      ) return;
+      if (pointerId != null && finishEvent.pointerId != null && finishEvent.pointerId !== pointerId) return;
+      this._finishMeshLayoutInteraction();
+    };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", finish);
+    handle.addEventListener("pointercancel", finish);
+    handle.addEventListener("lostpointercapture", finish);
+    const windowTarget = typeof window !== "undefined"
+      && typeof window.addEventListener === "function"
+      && typeof window.removeEventListener === "function"
+      ? window
+      : null;
+    if (windowTarget) {
+      // Pointer capture is not guaranteed (notably through nested shadow roots).
+      // Window fallbacks keep resize functional and prevent refresh polling
+      // from remaining locked when capture is unavailable or lost.
+      windowTarget.addEventListener("pointermove", move);
+      windowTarget.addEventListener("pointerup", finish);
+      windowTarget.addEventListener("pointercancel", finish);
+    }
+    this._meshLayoutCleanup = () => {
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", finish);
+      handle.removeEventListener("pointercancel", finish);
+      handle.removeEventListener("lostpointercapture", finish);
+      if (windowTarget) {
+        windowTarget.removeEventListener("pointermove", move);
+        windowTarget.removeEventListener("pointerup", finish);
+        windowTarget.removeEventListener("pointercancel", finish);
+      }
+      if (typeof handle.releasePointerCapture === "function" && pointerId != null) {
+        try {
+          handle.releasePointerCapture(pointerId);
+        } catch (_ignored) {
+          // Capture may already have ended with pointerup/cancel.
+        }
+      }
+    };
+  }
+
+  _resizeMeshCardFromKeyboard(event, card, cardId) {
+    if (
+      !event
+      || !["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)
+      || !card
+      || typeof card.getBoundingClientRect !== "function"
+      || !this._isMeshCardId(cardId)
+    ) return;
+    const rect = card.getBoundingClientRect();
+    const step = event.shiftKey ? 100 : 32;
+    const widthDelta = event.key === "ArrowLeft" ? -step : event.key === "ArrowRight" ? step : 0;
+    const heightDelta = event.key === "ArrowUp" ? -step : event.key === "ArrowDown" ? step : 0;
+    if (typeof event.preventDefault === "function") event.preventDefault();
+    this._setMeshCardSize(
+      cardId,
+      Math.round(rect.width + widthDelta),
+      Math.round(rect.height + heightDelta),
+    );
+  }
+
+  _bindMeshCardLayout(scrollState = new Map()) {
+    this._applyMeshCardOrder();
+    if (typeof this.querySelector !== "function") return;
+    const container = this.querySelector("#meshnet-mesh-cards");
+    if (!container || typeof container.querySelectorAll !== "function") return;
+    const cards = [...container.querySelectorAll("[data-mesh-card]")];
+    cards.forEach((card) => {
+      const cardId = card.getAttribute("data-mesh-card");
+      if (!this._isMeshCardId(cardId)) return;
+      if (typeof card.insertAdjacentHTML === "function") {
+        card.insertAdjacentHTML("afterbegin", this._meshCardControls(cardId));
+      }
+      card.querySelectorAll(
+        "[data-mesh-drag-handle], [data-mesh-resize-handle], [data-mesh-card-move]",
+      ).forEach((control) => {
+        control.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
+      });
+      card.addEventListener("dragover", (event) => {
+        if (!this._meshLayoutInteraction || this._meshLayoutInteraction.kind !== "drag") return;
+        event.preventDefault();
+        const rect = card.getBoundingClientRect();
+        card.dataset.meshDropAfter = String(event.clientY >= rect.top + rect.height / 2);
+      });
+      card.addEventListener("drop", (event) => {
+        if (!this._meshLayoutInteraction || this._meshLayoutInteraction.kind !== "drag") return;
+        event.preventDefault();
+        const draggedId = this._meshLayoutInteraction.card_id;
+        const after = card.dataset.meshDropAfter === "true";
+        this._moveMeshCardTo(draggedId, cardId, after);
+        this._finishMeshLayoutInteraction();
+      });
+      const drag = card.querySelector("[data-mesh-drag-handle]");
+      if (drag) {
+        drag.addEventListener("dragstart", (event) => {
+          this._cancelMeshLayoutInteraction();
+          this._meshLayoutInteraction = { kind: "drag", card_id: cardId };
+          card.classList.add("mesh-card-dragging");
+          if (event.dataTransfer) {
+            event.dataTransfer.effectAllowed = "move";
+            event.dataTransfer.setData("text/plain", cardId);
+          }
+        });
+        drag.addEventListener("dragend", () => this._finishMeshLayoutInteraction());
+      }
+      card.querySelectorAll("[data-mesh-card-move]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const direction = button.getAttribute("data-mesh-card-move");
+          this._moveMeshCard(cardId, direction);
+          if (typeof button.focus === "function") button.focus();
+        });
+      });
+      const resize = card.querySelector("[data-mesh-resize-handle]");
+      if (resize) {
+        resize.addEventListener("pointerdown", (event) => {
+          this._startMeshCardResize(event, card, resize, cardId);
+        });
+        resize.addEventListener("keydown", (event) => {
+          this._resizeMeshCardFromKeyboard(event, card, cardId);
+        });
+      }
+    });
+    const reset = this.querySelector("#meshnet-layout-reset");
+    if (reset) {
+      reset.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
+      reset.addEventListener("click", () => this._resetMeshCardLayout());
+    }
+    this._restoreMeshCardScrollState(scrollState);
+  }
+
+  _openNeighborInfoForNode(nodeKey) {
+    const requested = String(nodeKey || "");
+    const snapshot = this._snapshot;
+    const nodes = snapshot && snapshot.nodes && typeof snapshot.nodes === "object"
+      ? Object.values(snapshot.nodes)
+      : [];
+    const candidates = this._remoteNodeCandidates(nodes);
+    const matches = candidates.filter((node) => node.node_key === requested);
+    if (matches.length !== 1) return false;
+    const gateways = snapshot && snapshot.gateways && typeof snapshot.gateways === "object"
+      ? Object.values(snapshot.gateways)
+      : [];
+    const compatibleGateways = this._remoteGatewayCandidates(gateways);
+    if (!compatibleGateways.length) return false;
+    const selectedGateway = compatibleGateways.some(
+      (gateway) => gateway.gateway_id === this._neighborInfoGatewayId,
+    ) ? this._neighborInfoGatewayId : compatibleGateways[0].gateway_id;
+    const nodeId = this._meshtasticNodeId(matches[0]);
+    const targetNode = `meshtastic:${nodeId}`;
+    if (requested !== targetNode || !this._isExactTracerouteTarget(targetNode)) return false;
+
+    this._neighborInfoGatewayId = selectedGateway;
+    this._resetNeighborInfoTarget(targetNode);
+    this._neighborInfoStatus = {
+      kind: "warn",
+      text: "NeighborInfo target selected. Load persisted status before RF controls are enabled.",
+    };
+    this._safeRender("render");
+    const reveal = () => {
+      const panel = this.querySelector("#meshnet-neighbor-info-panel");
+      if (panel && typeof panel.scrollIntoView === "function") {
+        panel.scrollIntoView({ block: "start" });
+      }
+      const statusLoad = this.querySelector("#meshnet-neighbor-info-status-load");
+      if (statusLoad && typeof statusLoad.focus === "function") statusLoad.focus();
+    };
+    if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+      window.requestAnimationFrame(reveal);
+    } else {
+      reveal();
+    }
+    return true;
+  }
+
   _bindNodeControls() {
     const sort = this.querySelector("#meshnet-node-sort");
     if (sort) {
@@ -5204,6 +5702,20 @@ class MeshNetPanel extends HTMLElement {
           this._safeRender("render");
           const message = this.querySelector("#meshnet-message");
           if (message) message.focus();
+        });
+      });
+    });
+    this.querySelectorAll("[data-neighbor-info-node]").forEach((button) => {
+      button.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
+      button.addEventListener("click", () => {
+        this._safeStep("node_neighbor_info_event", "binding", () => {
+          if (!this._openNeighborInfoForNode(button.getAttribute("data-neighbor-info-node"))) {
+            this._recordFailure(
+              "neighbor_info_shortcut_invalid",
+              "validation",
+              { name: "ValidationError", code: "target_unavailable" },
+            );
+          }
         });
       });
     });
@@ -5412,7 +5924,7 @@ class MeshNetPanel extends HTMLElement {
   }
 
   _recipientChoices(nodes) {
-    const choices = nodes
+    const choices = this._sortNodes(Array.isArray(nodes) ? nodes : [], "favorites_recent")
       .filter((node) => node && node.node_key != null && String(node.node_key))
       .map((node) => ({
         value: String(node.node_key),
@@ -5457,11 +5969,13 @@ class MeshNetPanel extends HTMLElement {
         choice.label = `${choice.label} · ${distinctNodeIds ? nodeIds[index] : choice.value}`;
       });
     });
+    choices.forEach((choice) => {
+      const favorite = choice.node && choice.node.favorite === true ? "★ " : "";
+      const lastSeen = this._humanLastSeen(choice.node && choice.node.last_heard);
+      choice.label = `${favorite}${choice.label} · ${lastSeen}`;
+    });
     return choices
-      .map(({ node: _node, ...choice }) => choice)
-      .sort((left, right) => Number(right.named) - Number(left.named)
-        || this._compareText(left.label, right.label)
-        || this._compareText(left.value, right.value));
+      .map(({ node: _node, ...choice }) => choice);
   }
 
   _recipientOptions(nodes) {
@@ -5558,7 +6072,7 @@ class MeshNetPanel extends HTMLElement {
       : "stopped";
     const provenanceAvailable = current !== "n/a" || cached !== "n/a";
     return `
-      <section class="panel">
+      <section class="panel" data-mesh-card="panel-diagnostics">
         <h2>Panel diagnostics</h2>
         <div class="row">
           <span>Snapshot</span>

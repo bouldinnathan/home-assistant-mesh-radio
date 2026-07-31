@@ -28,12 +28,24 @@ The panel shows:
 - A link to Home Assistant's native Map
 - RF heat based on RSSI or SNR
 
+On the main **Mesh** view, drag a side-card handle to reorder cards or use its
+accessible earlier/later buttons. Resize with the corner handle or its keyboard
+arrow controls. Card order and size live only in the current panel instance;
+MeshNet does not write them to browser storage, Home Assistant, or a radio.
+Press **Reset**, or detach/navigate away from the panel, to restore the default
+layout.
+
 For the simplest test, open the sidebar panel, leave **Delivery** on
 **Broadcast** and **Gateway** on **Automatic**, enter a short message, and press
 **Send**. For a direct message, choose **Delivery → Direct** and select a cached
 node, or press **Message** beside a node. The dropdown submits the node's
 canonical identifier, so you do not need to copy a node number or short name
 manually.
+
+Every node selector—including both message composers, remote administration,
+traceroute, and NeighborInfo—shows favorites first and then valid last-seen
+times from newest to oldest. A star and last-seen label make that ordering
+visible; missing or malformed timestamps follow valid ones.
 
 Meshtastic reactions are attached only when their `reply_id` matches the
 original message's exact on-air packet ID. Reactions whose original message is
@@ -109,6 +121,12 @@ target's Neighbor Info module to be enabled. Older firmware may reject it or
 time out. The response is a cached zero-hop report with at most ten neighbors,
 not a live scan; an empty valid response and a timeout are different outcomes.
 A timeout is treated as unknown and consumes both reservations.
+
+The **NeighborInfo** button beside **Message** in a node row is only a shortcut
+to the guarded controls. It selects the exact node and reveals the existing
+flow; it does not load status or transmit RF. Explicitly use **Load persisted
+status**, then **Request NeighborInfo**, review the warning, and **Confirm
+request** before one request can leave the radio.
 
 ## Remote Node Administration
 

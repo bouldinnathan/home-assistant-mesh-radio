@@ -1575,11 +1575,11 @@ def test_recipient_name_collisions_receive_exact_disambiguators() -> None:
   const byValue = Object.fromEntries(
     panel._recipientChoices(nodes).map((choice) => [choice.value, choice.label]),
   );
-  assert.equal(byValue["meshcore:contact-one"], "Shared Relay · SR · contact-one");
-  assert.equal(byValue["meshcore:contact-two"], "shared relay · sr · contact-two");
-  assert.equal(byValue["meshcore:unique"], "Unique Relay · UR");
-  assert.equal(byValue["meshcore:alias-one"], "Same Contact · meshcore:alias-one");
-  assert.equal(byValue["meshcore:alias-two"], "same contact · meshcore:alias-two");
+  assert.equal(byValue["meshcore:contact-one"], "Shared Relay · SR · contact-one · Last seen unknown");
+  assert.equal(byValue["meshcore:contact-two"], "shared relay · sr · contact-two · Last seen unknown");
+  assert.equal(byValue["meshcore:unique"], "Unique Relay · UR · Last seen unknown");
+  assert.equal(byValue["meshcore:alias-one"], "Same Contact · meshcore:alias-one · Last seen unknown");
+  assert.equal(byValue["meshcore:alias-two"], "same contact · meshcore:alias-two · Last seen unknown");
   const options = panel._recipientOptions(nodes);
   for (const node of nodes) {
     assert.match(options, new RegExp(`value="${node.node_key}"`));
@@ -1634,7 +1634,7 @@ def test_node_labels_show_long_and_short_names_without_raw_key_duplication() -> 
     "!12345678",
   );
   const options = panel._recipientOptions([named]);
-  assert.match(options, />Backyard Repeater · BY · !12345678<\/option>/);
+  assert.match(options, />Backyard Repeater · BY · !12345678 · Last seen unknown<\/option>/);
   assert.equal((options.match(/meshtastic:!12345678/g) || []).length, 1);
 """
     )

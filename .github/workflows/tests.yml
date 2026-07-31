@@ -79,6 +79,7 @@ jobs:
           tests/test_frontend_panel.py
           tests/test_gateway_settings.py
           tests/test_init.py
+          tests/test_mesh_workspace_frontend.py
           tests/test_meshcore_settings.py
           tests/test_meshtastic_settings.py
           tests/test_neighborinfo_projection.py

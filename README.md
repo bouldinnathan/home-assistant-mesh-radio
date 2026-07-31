@@ -1,6 +1,6 @@
 # MeshNet for Home Assistant
 
-MeshNet turns Home Assistant into one operating surface for Meshtastic and MeshCore radios. It creates gateway and node entities, records telemetry and messages, tracks valid GPS positions, exposes actions and events, and provides an admin-only mesh panel with app-like broadcast/channel/direct conversations, favorites-aware node sorting, native Map access, a moving distance-aware cached-evidence graph, validated live gateway settings, guarded Meshtastic remote administration, and manual cooldown-protected radio tools.
+MeshNet turns Home Assistant into one operating surface for Meshtastic and MeshCore radios. It creates gateway and node entities, records telemetry and messages, tracks valid GPS positions, exposes actions and events, and provides an admin-only mesh panel with app-like broadcast/channel/direct conversations, reorderable and resizable main-view cards, favorites-aware node sorting, native Map access, a moving distance-aware cached-evidence graph, validated live gateway settings, guarded Meshtastic remote administration, and manual cooldown-protected radio tools.
 
 > [!IMPORTANT]
 > The current package is an in-process Home Assistant custom integration. Use it
@@ -179,6 +179,16 @@ excluded destructive operations.
 > uninstalling it through HACS cannot restore an intentional hardware change.
 
 ### Advanced local mesh tools
+
+Version 0.9.0 makes each side card on the main **Mesh** view reorderable and
+resizable with drag handles plus accessible move and keyboard-resize controls.
+The layout exists only in the current panel instance: it is not written to
+browser storage, Home Assistant, or a radio, and **Reset** or detaching the
+panel restores the default. Every node selector displays favorites first, then
+valid last-seen timestamps from newest to oldest, with visible favorite and
+last-seen labels. The **NeighborInfo** button beside a node's **Message** button
+only selects and reveals the existing **Load status → Request → Confirm** flow;
+the shortcut sends no RF traffic by itself.
 
 Version 0.8.0 attaches reactions by exact Meshtastic packet ID, preserves the
 message reading position across refreshes, labels graph-edge distance in miles,

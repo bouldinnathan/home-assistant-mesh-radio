@@ -21,7 +21,8 @@ correlate, cancel, and verify every request without blocking Home Assistant.
 | Apply remote settings | Yes | Never | Meshtastic Bluetooth | Sanitized result only |
 | Run a traceroute | Yes | Never | Meshtastic Bluetooth | Cooldown and sanitized route |
 | Request NeighborInfo | Yes | Never | Meshtastic Bluetooth | Cooldowns and sanitized report |
-| Move, filter, or sort the graph | No | Browser animation only | Not applicable | Browser-tab layout only |
+| Reorder or resize main Mesh cards | No | Never | Not applicable | Current panel-instance memory only |
+| Move, filter, or sort the graph | No | Browser animation only | Not applicable | Current panel-instance memory only |
 
 The following rules are invariants, not UI suggestions:
 
@@ -44,6 +45,29 @@ The following rules are invariants, not UI suggestions:
 - SNR and RSSI are signal observations, not physical-distance estimates.
 - Encrypted traffic that the connected radio cannot legitimately decrypt is
   not inspected, guessed, retained, or exposed.
+
+## Main Mesh Workspace
+
+Each side card on the main **Mesh** view can be reordered with a drag handle or
+the accessible earlier/later buttons. A corner handle supports pointer resizing
+and keyboard arrow resizing. Order and size are bounded and remain only in the
+current panel instance; they are never written to browser storage, Home
+Assistant state or configuration, SQLite, or radio firmware. **Reset** and
+panel detachment both restore the default layout.
+
+Both direct-message recipient selectors and the remote-administration,
+traceroute, and NeighborInfo target selectors share one deterministic order:
+favorites first, then valid last-seen timestamps from newest to oldest, with
+stable name/identity tie-breakers. Favorite stars and last-seen labels are
+visible in each selector. Invalid, ambiguous, and duplicate identities are not
+offered as advanced radio-operation targets.
+
+The node-row **NeighborInfo** button performs no status request and transmits no
+RF packet. It revalidates and selects one exact cached Meshtastic identity,
+reveals the existing NeighborInfo card, and focuses **Load persisted status**.
+An administrator must still load status, press **Request NeighborInfo**, review
+the warning, and press **Confirm request**. The backend cooldown reservation
+and validation remain authoritative even if the browser is bypassed.
 
 ## Remote Administration and Keys
 
@@ -446,7 +470,8 @@ Advanced features keep MeshNet compartmentalized as a custom integration:
 - The browser cannot call provider objects directly.
 - Cooldowns and cached routes live in `meshnet.sqlite3` with the existing
   integration history; they do not alter Home Assistant core databases.
-- Browser drafts and force-layout coordinates are memory-only.
+- Browser drafts, card order and size, and force-layout coordinates are
+  current-panel-instance memory only.
 - Diagnostics remain cached and redacted and never run remote admin or
   traceroute.
 - Unloading cancels in-flight waiters and animation owners. Late callbacks are

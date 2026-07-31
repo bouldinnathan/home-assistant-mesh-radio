@@ -1,5 +1,22 @@
 # Upgrade Guide
 
+## From 0.8.0
+
+0.9.0 makes side cards on the main **Mesh** view reorderable and resizable with
+pointer controls plus accessible move buttons and keyboard resizing. Layout is
+held only by the current panel instance: it is never written to browser
+storage, Home Assistant, or a radio, and **Reset** or detaching the panel
+restores the default order and size.
+
+All five node selectors now place favorites first, then nodes with valid
+last-seen timestamps from newest to oldest, and display both favorite and
+last-seen labels. Invalid, ambiguous, and duplicate identities remain excluded
+from radio-operation target selectors. The node-row **NeighborInfo** shortcut
+only selects the exact target and reveals the existing **Load status → Request
+→ Confirm** controls; it does not send RF or bypass persisted cooldown checks.
+Restart Home Assistant and hard-refresh the browser so the versioned panel
+JavaScript is replaced. No database or config-entry migration is required.
+
 ## From 0.7.0
 
 0.8.0 attaches Meshtastic reactions to the exact referenced on-air packet,
