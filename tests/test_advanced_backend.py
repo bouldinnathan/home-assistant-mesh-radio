@@ -116,7 +116,7 @@ def _reservation_won(result: object) -> bool:
 def test_traceroute_cooldown_is_atomic_persisted_and_exact_at_boundary(
     tmp_path,
 ) -> None:
-    """One SQLite reservation owns airtime for 3,600 seconds across reopen."""
+    """One SQLite reservation owns airtime for 60 seconds across reopen."""
 
     async def run() -> None:
         path = tmp_path / "meshnet.sqlite3"
@@ -129,7 +129,7 @@ def test_traceroute_cooldown_is_atomic_persisted_and_exact_at_boundary(
                 store.async_reserve_traceroute(
                     "ble-gateway",
                     "meshtastic:!1234abcd",
-                    cooldown_seconds=3600,
+                    cooldown_seconds=60,
                     now=start,
                 )
                 for _ in range(12)
@@ -140,16 +140,16 @@ def test_traceroute_cooldown_is_atomic_persisted_and_exact_at_boundary(
             await store.async_reserve_traceroute(
                 "ble-gateway",
                 "meshtastic:!1234abcd",
-                cooldown_seconds=3600,
-                now=start + timedelta(seconds=3599, microseconds=999999),
+                cooldown_seconds=60,
+                now=start + timedelta(seconds=59, microseconds=999999),
             )
         )
         assert not _reservation_won(
             await store.async_reserve_traceroute(
                 "second-gateway",
                 "meshtastic:!99999999",
-                cooldown_seconds=3600,
-                now=start + timedelta(seconds=3599),
+                cooldown_seconds=60,
+                now=start + timedelta(seconds=59),
             )
         )
         await store.async_close()
@@ -164,24 +164,24 @@ def test_traceroute_cooldown_is_atomic_persisted_and_exact_at_boundary(
             await reopened.async_reserve_traceroute(
                 "ble-gateway",
                 "meshtastic:!1234abcd",
-                cooldown_seconds=3600,
-                now=start + timedelta(seconds=3599),
+                cooldown_seconds=60,
+                now=start + timedelta(seconds=59),
             )
         )
         assert _reservation_won(
             await reopened.async_reserve_traceroute(
                 "second-gateway",
                 "meshtastic:!99999999",
-                cooldown_seconds=3600,
-                now=start + timedelta(seconds=3600),
+                cooldown_seconds=60,
+                now=start + timedelta(seconds=60),
             )
         )
         assert not _reservation_won(
             await reopened.async_reserve_traceroute(
                 "ble-gateway",
                 "meshtastic:!1234abcd",
-                cooldown_seconds=3600,
-                now=start + timedelta(seconds=3600),
+                cooldown_seconds=60,
+                now=start + timedelta(seconds=60),
             )
         )
         await reopened.async_close()
@@ -206,7 +206,7 @@ def test_traceroute_status_is_integration_wide_and_result_is_allowlisted(
             now=start,
         )
         assert _reservation_won(first)
-        assert first["next_allowed_at"] == "2026-07-30T13:00:00+00:00"
+        assert first["next_allowed_at"] == "2026-07-30T12:01:00+00:00"
 
         await store.async_store_traceroute_result(
             "ble-gateway",
@@ -270,8 +270,8 @@ def test_traceroute_status_is_integration_wide_and_result_is_allowlisted(
             "gateway_id": "ble-gateway",
             "target_node": "meshtastic:!1234abcd",
             "reserved_at": "2026-07-30T12:00:00+00:00",
-            "next_allowed_at": "2026-07-30T13:00:00+00:00",
-            "remaining_seconds": 3599,
+            "next_allowed_at": "2026-07-30T12:01:00+00:00",
+            "remaining_seconds": 59,
             "result_updated_at": "2026-07-30T12:00:05+00:00",
             "result": {
                 "schema_version": 1,
@@ -291,12 +291,89 @@ def test_traceroute_status_is_integration_wide_and_result_is_allowlisted(
             "different-gateway",
             "meshtastic:!99999999",
             cooldown_seconds=1,
-            now=start + timedelta(seconds=3599),
+            now=start + timedelta(seconds=59),
         )
         assert not _reservation_won(blocked)
         assert blocked["gateway_id"] == "ble-gateway"
         assert blocked["target_node"] == "meshtastic:!1234abcd"
         await store.async_close()
+
+    asyncio.run(run())
+
+
+def test_neighbor_info_cooldowns_are_atomic_persisted_global_and_per_target(
+    tmp_path,
+) -> None:
+    """Neighbor requests have global and target 180s floors across reopen."""
+
+    async def run() -> None:
+        path = tmp_path / "meshnet.sqlite3"
+        start = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
+        store = MeshStore(path)
+        await store.async_open()
+
+        racers = await asyncio.gather(
+            *(
+                store.async_reserve_neighbor_info_request(
+                    "ble-gateway",
+                    "meshtastic:!11111111",
+                    global_cooldown_seconds=1,
+                    target_cooldown_seconds=1,
+                    now=start,
+                )
+                for _ in range(12)
+            )
+        )
+        assert sum(_reservation_won(result) for result in racers) == 1
+
+        global_block = await store.async_reserve_neighbor_info_request(
+            "second-gateway",
+            "meshtastic:!22222222",
+            now=start + timedelta(seconds=179, microseconds=999999),
+        )
+        assert not _reservation_won(global_block)
+        assert global_block["global_remaining_seconds"] == 1
+
+        target_block = await store.async_reserve_neighbor_info_request(
+            "second-gateway",
+            "meshtastic:!11111111",
+            now=start + timedelta(seconds=179, microseconds=999999),
+        )
+        assert not _reservation_won(target_block)
+        assert target_block["target_remaining_seconds"] == 1
+        await store.async_close()
+
+        reopened = MeshStore(path)
+        await reopened.async_open()
+        status = await reopened.async_get_neighbor_info_request_status(
+            "meshtastic:!11111111",
+            now=start + timedelta(seconds=179),
+        )
+        assert status["scope"] == "integration_and_target"
+        assert status["status"] == "cooldown"
+        assert status["global_remaining_seconds"] == 1
+        assert status["target_remaining_seconds"] == 1
+        assert status["next_allowed_at"] == "2026-07-30T12:03:00+00:00"
+
+        different_target = await reopened.async_reserve_neighbor_info_request(
+            "second-gateway",
+            "meshtastic:!22222222",
+            now=start + timedelta(seconds=180),
+        )
+        assert _reservation_won(different_target)
+        still_global = await reopened.async_reserve_neighbor_info_request(
+            "ble-gateway",
+            "meshtastic:!11111111",
+            now=start + timedelta(seconds=359, microseconds=999999),
+        )
+        assert not _reservation_won(still_global)
+        target_available = await reopened.async_reserve_neighbor_info_request(
+            "ble-gateway",
+            "meshtastic:!11111111",
+            now=start + timedelta(seconds=360),
+        )
+        assert _reservation_won(target_available)
+        await reopened.async_close()
 
     asyncio.run(run())
 
@@ -514,6 +591,190 @@ def test_manual_traceroute_timeout_consumes_reservation_and_is_never_retried(
         assert gateway.calls == ["!1234abcd"]
 
     asyncio.run(run())
+
+
+def _neighbor_info_coordinator(
+    coordinator_class,
+    *,
+    send_error: Exception | None = None,
+):
+    order: list[str] = []
+    node = NodeState(
+        node_key="meshtastic:!1234abcd",
+        protocol=PROTOCOL_MESHTASTIC,
+        node_id="!1234abcd",
+    )
+    config = GatewayConfig(
+        gateway_id="ble-gateway",
+        name="BLE gateway",
+        protocol=PROTOCOL_MESHTASTIC,
+        transport=TRANSPORT_BLUETOOTH,
+    )
+
+    class Store:
+        reservations = 0
+
+        async def async_reserve_neighbor_info_request(
+            self, gateway_id, target_node, **_kwargs
+        ):
+            assert (gateway_id, target_node) == (
+                "ble-gateway",
+                "meshtastic:!1234abcd",
+            )
+            self.reservations += 1
+            order.append("reserve")
+            return {"reserved": self.reservations == 1}
+
+        async def async_store_neighbor_info_result(self, *_args, **_kwargs):
+            order.append("store-result")
+
+        async def async_get_neighbor_info_request_status(self, target_node):
+            assert target_node == "meshtastic:!1234abcd"
+            return {"next_allowed_at": "2026-07-30T12:03:00+00:00"}
+
+    class Gateway:
+        def __init__(self) -> None:
+            self.config = config
+            self.status = GatewayStatus(
+                gateway_id=config.gateway_id,
+                name=config.name,
+                protocol=config.protocol,
+                transport=config.transport,
+                connected=True,
+            )
+            self.calls: list[str] = []
+            self.local_node_id = "!aaaaaaaa"
+
+        async def async_manual_neighbor_info(self, target_node: str):
+            self.calls.append(target_node)
+            order.append("send")
+            if send_error is not None:
+                raise send_error
+            return {
+                "correlation_id": "neighbor-correlation",
+                "source": target_node,
+                "destination": "!aaaaaaaa",
+                "channel": 0,
+                "node_broadcast_interval_secs": 3600,
+                "neighbors": [
+                    {"node_id": "!11111111", "snr": -2.25},
+                    {"node_id": "!22222222", "snr": 0},
+                ],
+            }
+
+    gateway = Gateway()
+    coordinator = object.__new__(coordinator_class)
+    coordinator._shutting_down = False
+    coordinator._reconnect_suspended = False
+    coordinator._radio_operations_accepting = True
+    coordinator._traceroute_tasks = set()
+    coordinator.snapshot = MeshSnapshot(nodes={node.node_key: node})
+    coordinator.gateways = {config.gateway_id: gateway}
+    coordinator.store = Store()
+    return coordinator, gateway, order
+
+
+def test_manual_neighbor_info_reserves_before_one_exact_unicast_and_stores_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit NeighborInfo request is reserved, correlated, and persisted."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+        coordinator, gateway, order = _neighbor_info_coordinator(coordinator_class)
+
+        result = await coordinator.async_manual_neighbor_info(
+            gateway_id="ble-gateway",
+            target_node="meshtastic:!1234abcd",
+        )
+
+        assert order == ["reserve", "send", "store-result"]
+        assert gateway.calls == ["!1234abcd"]
+        assert result["schema_version"] == 1
+        assert result["gateway_id"] == "ble-gateway"
+        assert result["source"] == "meshtastic:!1234abcd"
+        assert result["destination"] == "meshtastic:!aaaaaaaa"
+        assert result["neighbors"] == [
+            {"node_id": "meshtastic:!11111111", "snr": -2.25},
+            {"node_id": "meshtastic:!22222222", "snr": 0.0},
+        ]
+        assert result["next_allowed_at"] == "2026-07-30T12:03:00+00:00"
+
+    asyncio.run(run())
+
+
+def test_manual_neighbor_info_timeout_consumes_reservation_and_never_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unknown RF outcome consumes both floors and sends no retry."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+        error_type = coordinator_class.async_manual_traceroute.__globals__[
+            "HomeAssistantError"
+        ]
+        coordinator, gateway, order = _neighbor_info_coordinator(
+            coordinator_class,
+            send_error=TimeoutError("private endpoint timed out"),
+        )
+
+        with pytest.raises(error_type):
+            await coordinator.async_manual_neighbor_info(
+                gateway_id="ble-gateway",
+                target_node="meshtastic:!1234abcd",
+            )
+        with pytest.raises(error_type):
+            await coordinator.async_manual_neighbor_info(
+                gateway_id="ble-gateway",
+                target_node="meshtastic:!1234abcd",
+            )
+
+        assert order == ["reserve", "send", "reserve"]
+        assert gateway.calls == ["!1234abcd"]
+
+    asyncio.run(run())
+
+
+def test_neighbor_info_result_limits_are_rechecked_by_coordinator_and_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No provider can bypass the official ten-neighbor response maximum."""
+    coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+    provider_result = {
+        "correlation_id": "neighbor-correlation",
+        "source": "!1234abcd",
+        "destination": "!aaaaaaaa",
+        "channel": 0,
+        "node_broadcast_interval_secs": 3600,
+        "neighbors": [
+            {"node_id": f"!{index:08x}", "snr": 0}
+            for index in range(1, 12)
+        ],
+    }
+    with pytest.raises(
+        coordinator_class.async_manual_traceroute.__globals__["HomeAssistantError"]
+    ):
+        coordinator_class._validated_manual_neighbor_info_result(
+            provider_result,
+            gateway_id="ble-gateway",
+            target_node="meshtastic:!1234abcd",
+            provider_target="!1234abcd",
+            local_node_id="!aaaaaaaa",
+        )
+
+    safe = MeshStore._safe_neighbor_info_result(
+        {
+            "schema_version": 1,
+            "gateway_id": "ble-gateway",
+            "source": "meshtastic:!1234abcd",
+            "destination": "meshtastic:!aaaaaaaa",
+            "neighbors": [
+                {"node_id": f"meshtastic:!{index:08x}", "snr": 0}
+                for index in range(1, 12)
+            ],
+        }
+    )
+    assert "neighbors" not in safe
 
 
 def test_radio_quiesce_cancels_traceroute_and_fences_new_rf_work(

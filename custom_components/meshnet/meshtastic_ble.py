@@ -72,13 +72,13 @@ class MeshtasticBluetoothTransport:
         channel: str | None,
         priority: str,
         message_type: str,
-    ) -> None:
-        """Translate MeshNet's send contract into one Meshtastic text packet."""
+    ) -> int:
+        """Translate MeshNet's send contract and return the on-air packet ID."""
         del message_type
         channel_index = 0 if channel is None else coerce_int(channel)
         if channel_index is None or not 0 <= channel_index <= 7:
             raise ValueError("Meshtastic Bluetooth channel must be between 0 and 7")
-        await self._client.async_send_text(
+        return await self._client.async_send_text(
             message,
             destination_id=target_node,
             channel_index=channel_index,

@@ -46,6 +46,58 @@ def test_meshtastic_packet_normalization() -> None:
     assert node.power["battery_level"] == 91.0
 
 
+def test_meshtastic_reaction_targets_the_exact_replied_to_packet() -> None:
+    packet = meshtastic_packet_to_state_packet(
+        {
+            "id": 222,
+            "from": 1,
+            "to": 0xFFFFFFFF,
+            "decoded": {
+                "portnum": "TEXT_MESSAGE_APP",
+                "text": "👍",
+                "replyId": 111,
+                "emoji": 0x1F44D,
+            },
+        },
+        gateway_id="g1",
+    )
+
+    assert packet.reply_to_message_id == "meshtastic:111"
+    assert packet.reaction == "👍"
+
+
+@pytest.mark.parametrize(
+    ("reply_id", "emoji", "expected_reply"),
+    [
+        (0, 0x1F44D, None),
+        (True, 0x1F44D, None),
+        (1, True, "meshtastic:1"),
+        (1, 0xD800, "meshtastic:1"),
+        (1, 0x110000, "meshtastic:1"),
+        (1, 0x0007, "meshtastic:1"),
+    ],
+)
+def test_meshtastic_reaction_metadata_rejects_invalid_wire_values(
+    reply_id: object,
+    emoji: object,
+    expected_reply: str | None,
+) -> None:
+    packet = meshtastic_packet_to_state_packet(
+        {
+            "decoded": {
+                "portnum": "TEXT_MESSAGE_APP",
+                "text": "untrusted",
+                "replyId": reply_id,
+                "emoji": emoji,
+            }
+        },
+        gateway_id="g1",
+    )
+
+    assert packet.reply_to_message_id == expected_reply
+    assert packet.reaction is None
+
+
 @pytest.mark.parametrize(
     ("hop_fields", "expected"),
     [

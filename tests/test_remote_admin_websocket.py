@@ -14,6 +14,8 @@ pytest.importorskip("homeassistant")
 from homeassistant.exceptions import Unauthorized  # noqa: E402
 
 from custom_components.meshnet.websocket_api import (  # noqa: E402
+    websocket_neighbor_info,
+    websocket_neighbor_info_status,
     websocket_remote_settings_apply,
     websocket_remote_settings_get,
     websocket_remote_settings_preview,
@@ -208,6 +210,143 @@ def test_traceroute_status_rejects_extra_values_without_echoing_them() -> None:
             "MeshNet could not load the traceroute status",
         )
         assert sentinel not in json.dumps(connection.send_error.call_args_list, default=str)
+
+    asyncio.run(run())
+
+
+def test_neighbor_info_request_and_status_are_admin_only_exact_boundaries() -> None:
+    """The read path performs no RF and the write delegates one exact request."""
+
+    async def run() -> None:
+        target = "meshtastic:!1234abcd"
+        status = {
+            "schema_version": 1,
+            "scope": "integration_and_target",
+            "target_node": target,
+            "status": "cooldown",
+            "global_remaining_seconds": 12,
+            "target_remaining_seconds": 132,
+            "remaining_seconds": 132,
+        }
+        result = {
+            "schema_version": 1,
+            "gateway_id": "ble-gateway",
+            "source": target,
+            "neighbors": [],
+        }
+        store = SimpleNamespace(
+            async_get_neighbor_info_request_status=AsyncMock(
+                return_value=status
+            )
+        )
+        coordinator = SimpleNamespace(
+            store=store,
+            async_manual_neighbor_info=AsyncMock(return_value=result),
+        )
+        hass = _hass(coordinator)
+        denied = SimpleNamespace(
+            user=SimpleNamespace(is_admin=False),
+            send_message=MagicMock(),
+            send_error=MagicMock(),
+        )
+        status_message = {
+            "id": 20,
+            "type": "meshnet/neighbor_info/status",
+            "target_node": target,
+        }
+        request_message = {
+            "id": 21,
+            "type": "meshnet/neighbor_info",
+            "gateway_id": "ble-gateway",
+            "target_node": target,
+        }
+
+        with pytest.raises(Unauthorized):
+            websocket_neighbor_info_status(hass, denied, status_message)
+        with pytest.raises(Unauthorized):
+            websocket_neighbor_info(hass, denied, request_message)
+        store.async_get_neighbor_info_request_status.assert_not_awaited()
+        coordinator.async_manual_neighbor_info.assert_not_awaited()
+
+        connection = SimpleNamespace(
+            send_message=MagicMock(), send_error=MagicMock()
+        )
+        await websocket_neighbor_info_status.__wrapped__.__wrapped__(
+            hass, connection, status_message
+        )
+        store.async_get_neighbor_info_request_status.assert_awaited_once_with(
+            target
+        )
+        coordinator.async_manual_neighbor_info.assert_not_awaited()
+        assert connection.send_message.call_args.args[0]["result"] == status
+
+        connection.send_message.reset_mock()
+        await websocket_neighbor_info.__wrapped__.__wrapped__(
+            hass, connection, request_message
+        )
+        coordinator.async_manual_neighbor_info.assert_awaited_once_with(
+            gateway_id="ble-gateway", target_node=target
+        )
+        assert connection.send_message.call_args.args[0]["result"] == result
+
+    asyncio.run(run())
+
+
+def test_neighbor_info_failures_use_fixed_redacted_errors() -> None:
+    """Storage and provider details never cross either NeighborInfo endpoint."""
+
+    async def run() -> None:
+        sentinel = "private-key at /dev/serial/by-id/private-device"
+        target = "meshtastic:!1234abcd"
+        store = SimpleNamespace(
+            async_get_neighbor_info_request_status=AsyncMock(
+                side_effect=RuntimeError(sentinel)
+            )
+        )
+        coordinator = SimpleNamespace(
+            store=store,
+            async_manual_neighbor_info=AsyncMock(
+                side_effect=RuntimeError(sentinel)
+            ),
+        )
+        connection = SimpleNamespace(
+            send_message=MagicMock(), send_error=MagicMock()
+        )
+        hass = _hass(coordinator)
+
+        await websocket_neighbor_info_status.__wrapped__.__wrapped__(
+            hass,
+            connection,
+            {
+                "id": 22,
+                "type": "meshnet/neighbor_info/status",
+                "target_node": target,
+            },
+        )
+        await websocket_neighbor_info.__wrapped__.__wrapped__(
+            hass,
+            connection,
+            {
+                "id": 23,
+                "type": "meshnet/neighbor_info",
+                "gateway_id": "ble-gateway",
+                "target_node": target,
+            },
+        )
+
+        assert connection.send_error.call_args_list[0].args == (
+            22,
+            "neighbor_info_status_failed",
+            "MeshNet could not load the NeighborInfo request status",
+        )
+        assert connection.send_error.call_args_list[1].args == (
+            23,
+            "neighbor_info_failed",
+            "MeshNet could not complete the NeighborInfo request",
+        )
+        assert sentinel not in json.dumps(
+            connection.send_error.call_args_list, default=str
+        )
 
     asyncio.run(run())
 

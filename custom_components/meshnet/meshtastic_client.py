@@ -12,6 +12,7 @@ import logging
 import math
 import re
 import time
+import unicodedata
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
@@ -51,7 +52,7 @@ _LOGGER = logging.getLogger(__name__)
 
 _STOP_WAIT_TIMEOUT = 2.0
 _MAX_MESHTASTIC_TEXT_BYTES = 237
-_MAX_MESHTASTIC_NEIGHBORS = 64
+_MAX_MESHTASTIC_NEIGHBORS = 10
 _MAX_MESHTASTIC_SENSORS = 64
 _MESHTASTIC_SENSOR_KEYS = frozenset(
     {
@@ -139,6 +140,10 @@ _BLUETOOTH_FAILURE_DIAGNOSTIC_FIELDS = frozenset(
         "traceroute_response_count",
         "traceroute_timeout_count",
         "traceroute_waiter_count",
+        "neighbor_info_request_count",
+        "neighbor_info_response_count",
+        "neighbor_info_timeout_count",
+        "neighbor_info_waiter_count",
         "connection_generation",
         "settings_complete_sequence",
         "settings_complete_generation",
@@ -1098,6 +1103,7 @@ class MeshtasticClient(MeshGateway):
         message_id = hashlib.sha256(
             f"{self.config.gateway_id}:{target_node}:{channel}:{message}:{utcnow().timestamp()}".encode()
         ).hexdigest()[:16]
+        provider_packet: Any = None
         if self.config.transport == TRANSPORT_MQTT:
             await self._mqtt_publish_message(
                 target_node=target_node,
@@ -1111,7 +1117,7 @@ class MeshtasticClient(MeshGateway):
             transport = self._ble_transport
             if transport is None:
                 raise RuntimeError("Meshtastic Bluetooth is not connected")
-            await self._async_run_bluetooth_operation(
+            provider_packet = await self._async_run_bluetooth_operation(
                 transport.async_send_text(
                     target_node=target_node,
                     message=message,
@@ -1128,7 +1134,7 @@ class MeshtasticClient(MeshGateway):
             kwargs: dict[str, Any] = {}
             if channel is not None:
                 kwargs["channelIndex"] = coerce_int(channel) or 0
-            await self._async_run_native_executor(
+            provider_packet = await self._async_run_native_executor(
                 interface,
                 lambda: interface.sendText(
                     message,
@@ -1139,7 +1145,8 @@ class MeshtasticClient(MeshGateway):
             )
         self.status.packets_sent += 1
         await self._emit_status()
-        return message_id
+        provider_packet_id = _outbound_meshtastic_packet_id(provider_packet)
+        return str(provider_packet_id) if provider_packet_id is not None else message_id
 
     async def async_refresh(self) -> None:
         """Refresh node DB from the native interface."""
@@ -1240,6 +1247,21 @@ class MeshtasticClient(MeshGateway):
         if not callable(traceroute):
             raise RuntimeError("Manual traceroute is unavailable")
         return await self._async_run_bluetooth_operation(traceroute(target_node))
+
+    async def async_manual_neighbor_info(
+        self, target_node: str
+    ) -> dict[str, Any]:
+        """Delegate one explicit NeighborInfo request to the owned BLE client."""
+        if self.config.transport != TRANSPORT_BLUETOOTH:
+            raise RuntimeError(
+                "Manual NeighborInfo requires a Meshtastic Bluetooth gateway"
+            )
+        transport = self._ble_transport
+        client = getattr(transport, "_client", None)
+        request = getattr(client, "async_manual_neighbor_info", None)
+        if not callable(request):
+            raise RuntimeError("Manual NeighborInfo is unavailable")
+        return await self._async_run_bluetooth_operation(request(target_node))
 
     async def async_apply_remote_settings_plan(
         self,
@@ -1775,6 +1797,32 @@ def _meshtastic_via_mqtt(raw: dict[str, Any]) -> bool:
     return False
 
 
+def _outbound_meshtastic_packet_id(result: Any) -> int | None:
+    """Extract one validated on-air packet ID from a provider send result."""
+    value = result
+    if isinstance(result, dict):
+        value = _first_present_value(result, "id", "packet_id")
+    elif result is not None and not isinstance(result, (int, str, float, bool)):
+        value = getattr(result, "id", None)
+    packet_id = coerce_int(value)
+    return packet_id if packet_id is not None and 1 <= packet_id <= 0xFFFFFFFF else None
+
+
+def _meshtastic_message_relation(decoded: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Return a validated Meshtastic reply target and optional reaction."""
+    reply_id = coerce_int(_first_present_value(decoded, "replyId", "reply_id"))
+    if reply_id is None or not 1 <= reply_id <= 0xFFFFFFFF:
+        return None, None
+
+    reaction: str | None = None
+    emoji = coerce_int(decoded.get("emoji"))
+    if emoji is not None and 1 <= emoji <= 0x10FFFF and not 0xD800 <= emoji <= 0xDFFF:
+        candidate = chr(emoji)
+        if not unicodedata.category(candidate).startswith("C"):
+            reaction = candidate
+    return f"meshtastic:{reply_id}", reaction
+
+
 def _meshtastic_float(value: Any) -> float | None:
     """Return a finite non-boolean float from provider position data."""
     if isinstance(value, bool):
@@ -1832,8 +1880,9 @@ def _meshtastic_neighbor_routing(
     reporter_id: str,
     observed_at: datetime | None,
     via_mqtt: bool,
+    provenance: Any = None,
 ) -> dict[str, Any]:
-    """Project one exact, bounded passive NeighborInfo observation."""
+    """Project one exact, bounded NeighborInfo observation with provenance."""
     if not isinstance(neighbor_info, dict):
         return {}
     claimed_values = [
@@ -1865,6 +1914,11 @@ def _meshtastic_neighbor_routing(
         "neighbors": neighbors,
         "neighbor_count": len(neighbors),
         "neighbors_via_mqtt": via_mqtt,
+        "neighbors_provenance": (
+            "manual_request"
+            if provenance == "manual_request" and not via_mqtt
+            else "passive"
+        ),
     }
     if (observed_at_text := timestamp_to_json(observed_at)) is not None:
         routing["neighbors_updated_at"] = observed_at_text
@@ -1892,6 +1946,7 @@ def meshtastic_packet_to_state_packet(
     )
     if isinstance(payload, bytes):
         payload = payload.hex()
+    reply_to_message_id, reaction = _meshtastic_message_relation(decoded)
     packet_time = parse_timestamp(raw.get("rxTime") or raw.get("timestamp") or raw.get("time")) or utcnow()
     channel_value = raw.get("channel")
     if channel_value is None:
@@ -1915,6 +1970,8 @@ def meshtastic_packet_to_state_packet(
         snr=coerce_float(_first_present_value(raw, "rxSnr", "snr")),
         hops=_meshtastic_packet_hops(raw),
         hop_limit=_first_nonnegative_int(raw, "hopLimit", "hop_limit"),
+        reply_to_message_id=reply_to_message_id,
+        reaction=reaction,
         timestamp=packet_time,
         raw=packet_raw,
     )
@@ -2010,6 +2067,10 @@ def meshtastic_node_to_state(
             reporter_id=canonical_node_id,
             observed_at=neighbor_observed_at,
             via_mqtt=via_mqtt,
+            provenance=(
+                raw.get("neighborInfoProvenance")
+                or raw.get("neighbor_info_provenance")
+            ),
         ),
         sensors=sensors,
         raw=raw,
@@ -2108,6 +2169,10 @@ def meshtastic_packet_to_node(packet: MeshPacket) -> NodeState | None:
             reporter_id=routing_id,
             observed_at=packet.timestamp,
             via_mqtt=via_mqtt,
+            provenance=(
+                decoded.get("neighborInfoProvenance")
+                or decoded.get("neighbor_info_provenance")
+            ),
         ),
         sensors=sensors,
         raw=raw,

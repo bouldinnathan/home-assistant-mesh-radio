@@ -28,6 +28,171 @@ def test_remote_admin_and_traceroute_are_visible_explicit_controls_only() -> Non
     assert "sessionStorage" not in source
 
 
+def test_neighbor_info_is_explicit_experimental_and_status_gated() -> None:
+    source = PANEL.read_text(encoding="utf-8")
+    assert 'type: "meshnet/neighbor_info/status"' in source
+    assert 'type: "meshnet/neighbor_info"' in source
+    assert "Experimental / newer firmware only" in source
+    assert "official android" in source.casefold()
+    assert "_maybeLoadNeighborInfo" not in source
+
+
+def test_neighbor_info_loads_target_status_then_requires_two_clicks_for_one_rf_request() -> None:
+    _run_panel_script(
+        r"""
+  panel._safeRender = () => true;
+  const requests = [];
+  panel._hass = {
+    async callWS(payload) {
+      requests.push(structuredClone(payload));
+      if (payload.type === "meshnet/neighbor_info/status") {
+        return {
+          schema_version: 1,
+          scope: "integration_and_target",
+          target_node: "meshtastic:!1234abcd",
+          status: "available",
+          global_remaining_seconds: 0,
+          target_remaining_seconds: 0,
+          remaining_seconds: 0,
+        };
+      }
+      if (payload.type === "meshnet/neighbor_info") {
+        return {
+          schema_version: 1,
+          gateway_id: "ble-gateway",
+          source: "meshtastic:!1234abcd",
+          destination: "meshtastic:!01020304",
+          channel: 0,
+          node_broadcast_interval_secs: 3600,
+          neighbors: [
+            { node_id: "meshtastic:!11121314", snr: -2.25 },
+            { node_id: "meshtastic:!21222324", snr: 4.5 },
+          ],
+          completed_at: "2026-07-31T12:00:05+00:00",
+          next_allowed_at: "2026-07-31T12:03:05+00:00",
+        };
+      }
+      throw new Error("unexpected request");
+    },
+  };
+
+  assert.equal(panel._neighborInfoStatusReady, false);
+  await panel._requestNeighborInfo("ble-gateway", "meshtastic:!1234abcd");
+  assert.equal(requests.length, 0, "RF stays locked until persisted status is read");
+
+  await panel._loadNeighborInfoStatus("meshtastic:!1234abcd");
+  assert.deepEqual(requests, [{
+    type: "meshnet/neighbor_info/status",
+    target_node: "meshtastic:!1234abcd",
+  }]);
+  assert.equal(panel._neighborInfoStatusReady, true);
+  assert.equal(panel._neighborInfoStatusTarget, "meshtastic:!1234abcd");
+
+  await panel._requestNeighborInfo("ble-gateway", "meshtastic:!1234abcd");
+  assert.equal(requests.length, 1, "first click only creates the RF confirmation");
+  assert.deepEqual(panel._neighborInfoConfirmation, {
+    gateway_id: "ble-gateway",
+    target_node: "meshtastic:!1234abcd",
+  });
+  await panel._requestNeighborInfo("ble-gateway", "meshtastic:!1234abcd");
+  assert.deepEqual(requests[1], {
+    type: "meshnet/neighbor_info",
+    gateway_id: "ble-gateway",
+    target_node: "meshtastic:!1234abcd",
+  });
+  assert.equal(panel._neighborInfoResult.neighbors.length, 2);
+  assert.equal(panel._neighborInfoResult.neighbors[0].snr, -2.25);
+  assert.equal(panel._neighborInfoStatusData.global_remaining_seconds, 180);
+  assert.equal(panel._neighborInfoStatusData.target_remaining_seconds, 180);
+  assert.equal(panel._neighborInfoCooldownActive(), true);
+
+  const html = panel._neighborInfoResultPanel(panel._neighborInfoResult);
+  assert.match(html, /!11121314/);
+  assert.match(html, /-2\.25 dB/);
+  assert.match(html, /3600 seconds/);
+"""
+    )
+
+
+def test_neighbor_info_validation_is_bounded_and_failures_never_claim_zero_neighbors() -> None:
+    _run_panel_script(
+        r"""
+  const base = {
+    schema_version: 1,
+    gateway_id: "ble-gateway",
+    source: "meshtastic:!1234abcd",
+    destination: "meshtastic:!01020304",
+    channel: 0,
+    node_broadcast_interval_secs: 3600,
+    neighbors: [],
+    completed_at: "2026-07-31T12:00:05+00:00",
+    next_allowed_at: "2026-07-31T12:03:05+00:00",
+  };
+  assert.equal(
+    panel._sanitizeNeighborInfoResult(base, "ble-gateway", "meshtastic:!1234abcd").neighbors.length,
+    0,
+  );
+  assert.throws(() => panel._sanitizeNeighborInfoResult({
+    ...base,
+    neighbors: Array.from({ length: 11 }, (_item, index) => ({
+      node_id: `meshtastic:!${(index + 1).toString(16).padStart(8, "0")}`,
+      snr: 1,
+    })),
+  }, "ble-gateway", "meshtastic:!1234abcd"));
+  assert.throws(() => panel._sanitizeNeighborInfoResult({
+    ...base,
+    neighbors: [{ node_id: "meshtastic:!11121314", snr: Number.NaN }],
+  }, "ble-gateway", "meshtastic:!1234abcd"));
+
+  const persisted = panel._sanitizeNeighborInfoStatus({
+    schema_version: 1,
+    scope: "integration_and_target",
+    target_node: "meshtastic:!1234abcd",
+    status: "cooldown",
+    global_remaining_seconds: 180,
+    target_remaining_seconds: 60,
+    remaining_seconds: 180,
+    next_allowed_at: "2026-07-31T12:03:05+00:00",
+    gateway_id: "newer-global-reservation-gateway",
+    reserved_at: "2026-07-31T12:00:05+00:00",
+    result_updated_at: "2026-07-31T11:59:05+00:00",
+    result: {
+      ...base,
+      gateway_id: "persisted-result-gateway",
+      next_allowed_at: undefined,
+    },
+  }, "meshtastic:!1234abcd");
+  assert.equal(persisted.gateway_id, "newer-global-reservation-gateway");
+  assert.equal(persisted.result.gateway_id, "persisted-result-gateway");
+  assert.equal(persisted.result.next_allowed_at, "2026-07-31T12:03:05+00:00");
+
+  const sentinel = "provider detail node !deadbeef key=secret";
+  const error = new Error(sentinel);
+  error.code = "neighbor_info_failed";
+  panel._safeRender = () => true;
+  panel._neighborInfoStatusReady = true;
+  panel._neighborInfoStatusTarget = "meshtastic:!1234abcd";
+  panel._neighborInfoStatusData = {
+    status: "available",
+    global_remaining_seconds: 0,
+    target_remaining_seconds: 0,
+    remaining_seconds: 0,
+    loaded_at_ms: Date.now(),
+  };
+  panel._neighborInfoConfirmation = {
+    gateway_id: "ble-gateway",
+    target_node: "meshtastic:!1234abcd",
+  };
+  panel._hass = { async callWS() { throw error; } };
+  await panel._requestNeighborInfo("ble-gateway", "meshtastic:!1234abcd");
+  assert.equal(panel._neighborInfoResult, null);
+  assert.equal(panel._neighborInfoStatus.text.includes(sentinel), false);
+  assert.doesNotMatch(panel._neighborInfoStatus.text, /zero|0 neighbors/i);
+  assert.match(panel._neighborInfoStatus.text, /may have been sent|do not retry/i);
+"""
+    )
+
+
 def test_remote_admin_requires_load_preview_and_confirmation_before_one_apply() -> None:
     _run_panel_script(
         r"""

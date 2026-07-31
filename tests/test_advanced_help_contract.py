@@ -36,7 +36,7 @@ def test_advanced_guide_fixes_key_and_traceroute_safety_boundaries() -> None:
     assert "every SecurityConfig write" in guide
     assert "raw AdminMessage passthrough" in guide
     assert "reserved in SQLite before the radio write" in guide
-    assert "one manual traceroute across the entire MeshNet integration every 3,600 seconds" in guide
+    assert "one manual traceroute across the entire MeshNet integration every 60 seconds" in guide
     assert "There is no traceroute Home Assistant service" in guide
     assert "There is no broadcast, batch, scheduled, automatic, or retry mode" in guide
 

@@ -46,6 +46,7 @@ from .const import (
     EVENT_MESSAGE_SENT,
     EVENT_MESSAGE_STATUS,
     EVENT_PACKET,
+    MANUAL_TRACEROUTE_COOLDOWN_SECONDS,
     MAX_PANEL_NODES,
     MESSAGE_TYPE_BROADCAST,
     MESSAGE_TYPE_DIRECT,
@@ -127,6 +128,9 @@ _PUBLIC_MESSAGE_ERROR_CODES = frozenset(
         "send_failed",
     }
 )
+_MESHTASTIC_MESSAGE_REFERENCE_RE = re.compile(
+    r"^meshtastic:([1-9][0-9]{0,9})$"
+)
 _PRIVATE_MESHTASTIC_PORTS = frozenset(
     {
         "ADMIN_APP",
@@ -136,7 +140,6 @@ _PRIVATE_MESHTASTIC_PORTS = frozenset(
         "SESSION",
     }
 )
-_TRACEROUTE_COOLDOWN_SECONDS = 3600
 _GATEWAY_ISSUE_CATEGORIES = (
     "gateway_start",
     "send_failed",
@@ -359,6 +362,8 @@ def _safe_error_type(error: BaseException) -> str:
 def message_api_dict(message: MessageRecord) -> dict[str, Any]:
     """Serialize a message without exposing retained provider metadata."""
     data = message.as_dict()
+    data.pop("reply_to_message_id", None)
+    data.pop("reaction", None)
     raw: dict[str, str] = {}
     status = message.raw.get("status")
     if isinstance(status, str) and status in _PUBLIC_MESSAGE_STATUSES:
@@ -378,7 +383,60 @@ def message_api_dict(message: MessageRecord) -> dict[str, Any]:
     )
     data["delivery"] = delivery
     data["peer_node_key"] = peer_node_key
+    reply_to_message_id = _validated_message_reference(
+        message.reply_to_message_id
+    )
+    reaction = _validated_message_reaction(message.reaction)
+    if reply_to_message_id is not None:
+        data["reply_to_message_id"] = reply_to_message_id
+        if reaction is not None:
+            data["reaction"] = reaction
+    mesh_packet_id = _provider_mesh_packet_id(message)
+    if mesh_packet_id is not None:
+        data["mesh_packet_id"] = mesh_packet_id
     return data
+
+
+def _validated_message_reference(value: Any) -> str | None:
+    """Return one exact stored Meshtastic on-air message reference."""
+    if not isinstance(value, str):
+        return None
+    match = _MESHTASTIC_MESSAGE_REFERENCE_RE.fullmatch(value)
+    if match is None:
+        return None
+    packet_id = int(match.group(1))
+    return value if packet_id <= 0xFFFFFFFF else None
+
+
+def _validated_message_reaction(value: Any) -> str | None:
+    """Return one printable Unicode scalar used as a Meshtastic reaction."""
+    if not isinstance(value, str) or len(value) != 1:
+        return None
+    if unicodedata.category(value).startswith("C"):
+        return None
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    return value if 1 <= len(encoded) <= 4 else None
+
+
+def _provider_mesh_packet_id(message: MessageRecord) -> str | None:
+    """Project a sent Meshtastic packet ID without exposing provider metadata."""
+    if _known_protocol(message.protocol) != PROTOCOL_MESHTASTIC:
+        return None
+    value = message.raw.get("provider_id")
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        packet_id = value
+    elif isinstance(value, str) and re.fullmatch(r"[1-9][0-9]{0,9}", value):
+        packet_id = int(value)
+    else:
+        return None
+    if not 1 <= packet_id <= 0xFFFFFFFF:
+        return None
+    return f"meshtastic:{packet_id}"
 
 
 def _message_channel_index(value: Any) -> int | None:
@@ -511,7 +569,7 @@ def _packet_event_dict(packet: MeshPacket) -> dict[str, Any]:
 def _message_received_event(record: MessageRecord) -> dict[str, Any]:
     """Project one decoded text message for privacy-safe automations."""
     delivery, _peer_node_key = _message_delivery(record)
-    return {
+    event = {
         "schema_version": 1,
         "message_id": str(record.message_id)[:128],
         "protocol": _known_protocol(record.protocol) or "unknown",
@@ -525,6 +583,15 @@ def _message_received_event(record: MessageRecord) -> dict[str, Any]:
         "hops": record.hops,
         "timestamp": timestamp_to_json(record.timestamp),
     }
+    reply_to_message_id = _validated_message_reference(
+        record.reply_to_message_id
+    )
+    reaction = _validated_message_reaction(record.reaction)
+    if reply_to_message_id is not None:
+        event["reply_to_message_id"] = reply_to_message_id
+        if reaction is not None:
+            event["reaction"] = reaction
+    return event
 
 
 def _safe_inbound_text(value: Any) -> str | None:
@@ -1647,7 +1714,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         reservation = await self.store.async_reserve_traceroute(
             gateway_id,
             target_node,
-            cooldown_seconds=_TRACEROUTE_COOLDOWN_SECONDS,
+            cooldown_seconds=MANUAL_TRACEROUTE_COOLDOWN_SECONDS,
         )
         reserved = (
             reservation
@@ -1657,7 +1724,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         )
         if not reserved:
             raise HomeAssistantError(
-                "MeshNet permits at most one manual traceroute each hour"
+                "MeshNet permits at most one manual traceroute every 60 seconds"
             )
 
         try:
@@ -1767,6 +1834,218 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                 snr_values.append(float(item))
             output[provider_key] = snr_values
         return output
+
+    async def async_manual_neighbor_info(
+        self,
+        *,
+        gateway_id: str,
+        target_node: str,
+    ) -> dict[str, Any]:
+        """Own one explicit NeighborInfo request for lifecycle cancellation."""
+        if (
+            not getattr(self, "_radio_operations_accepting", True)
+            or getattr(self, "_shutting_down", False)
+            or getattr(self, "_reconnect_suspended", False)
+        ):
+            raise HomeAssistantError(
+                "Manual radio operations are temporarily unavailable"
+            )
+        task = asyncio.current_task()
+        tasks = getattr(self, "_traceroute_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._traceroute_tasks = tasks
+        if task is not None:
+            tasks.add(task)
+        try:
+            if (
+                not getattr(self, "_radio_operations_accepting", True)
+                or getattr(self, "_shutting_down", False)
+                or getattr(self, "_reconnect_suspended", False)
+            ):
+                raise HomeAssistantError(
+                    "Manual radio operations are temporarily unavailable"
+                )
+            return await self._async_manual_neighbor_info(
+                gateway_id=gateway_id,
+                target_node=target_node,
+            )
+        finally:
+            if task is not None:
+                tasks.discard(task)
+
+    async def _async_manual_neighbor_info(
+        self,
+        *,
+        gateway_id: str,
+        target_node: str,
+    ) -> dict[str, Any]:
+        """Send one cooldown-protected BLE NeighborInfo request."""
+        if (
+            not isinstance(gateway_id, str)
+            or not gateway_id
+            or len(gateway_id) > 128
+        ):
+            raise HomeAssistantError("Invalid MeshNet gateway ID")
+        gateway = self.gateways.get(gateway_id)
+        if gateway is None:
+            raise HomeAssistantError("Unknown MeshNet gateway")
+        if (
+            _known_protocol(gateway.config.protocol) != PROTOCOL_MESHTASTIC
+            or gateway.config.transport != TRANSPORT_BLUETOOTH
+        ):
+            raise HomeAssistantError(
+                "Manual NeighborInfo requires a Meshtastic Bluetooth gateway"
+            )
+        if not gateway.status.connected:
+            raise HomeAssistantError("The selected gateway is not connected")
+        if (
+            not isinstance(target_node, str)
+            or target_node != target_node.strip()
+            or len(target_node) > 128
+        ):
+            raise HomeAssistantError("Select one exact known node")
+        node = self.snapshot.nodes.get(target_node)
+        if node is None or node.node_key != target_node:
+            raise HomeAssistantError("Select one exact known node")
+        if _known_protocol(node.protocol) != PROTOCOL_MESHTASTIC:
+            raise HomeAssistantError("Select one Meshtastic node")
+        provider_target = canonical_meshtastic_node_id(node.node_id)
+        if provider_target is None or target_node != f"meshtastic:{provider_target}":
+            raise HomeAssistantError("The selected node identity is invalid")
+        local_node_id = canonical_meshtastic_node_id(
+            getattr(gateway, "local_node_id", None)
+        )
+        if local_node_id is not None and provider_target == local_node_id:
+            raise HomeAssistantError("A gateway cannot request itself")
+
+        reservation = await self.store.async_reserve_neighbor_info_request(
+            gateway_id, target_node
+        )
+        reserved = (
+            reservation
+            if isinstance(reservation, bool)
+            else isinstance(reservation, Mapping)
+            and (
+                reservation.get("reserved") is True
+                or reservation.get("status") == "reserved"
+            )
+        )
+        if not reserved:
+            raise HomeAssistantError(
+                "The NeighborInfo request cooldown is active"
+            )
+        try:
+            provider_result = await gateway.async_manual_neighbor_info(
+                provider_target
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            category = _diagnostic_error_category(str(err))
+            raise HomeAssistantError(
+                f"Manual NeighborInfo failed ({category})"
+            ) from None
+        if (
+            not getattr(self, "_radio_operations_accepting", True)
+            or getattr(self, "_shutting_down", False)
+            or getattr(self, "_reconnect_suspended", False)
+        ):
+            raise HomeAssistantError(
+                "Manual NeighborInfo result was discarded because the "
+                "integration lifecycle changed"
+            )
+        result = self._validated_manual_neighbor_info_result(
+            provider_result,
+            gateway_id=gateway_id,
+            target_node=target_node,
+            provider_target=provider_target,
+            local_node_id=local_node_id,
+        )
+        await self.store.async_store_neighbor_info_result(
+            gateway_id, target_node, result
+        )
+        status = await self.store.async_get_neighbor_info_request_status(
+            target_node
+        )
+        if isinstance(status, Mapping):
+            next_allowed_at = status.get("next_allowed_at")
+            if isinstance(next_allowed_at, str):
+                result["next_allowed_at"] = next_allowed_at
+        return result
+
+    @staticmethod
+    def _validated_manual_neighbor_info_result(
+        provider_result: Any,
+        *,
+        gateway_id: str,
+        target_node: str,
+        provider_target: str,
+        local_node_id: str | None,
+    ) -> dict[str, Any]:
+        """Validate and bound one correlated NeighborInfo response."""
+        if not isinstance(provider_result, Mapping):
+            raise HomeAssistantError("The NeighborInfo response was invalid")
+        correlation_id = provider_result.get("correlation_id")
+        source = canonical_meshtastic_node_id(provider_result.get("source"))
+        destination = canonical_meshtastic_node_id(
+            provider_result.get("destination")
+        )
+        channel = provider_result.get("channel")
+        interval = provider_result.get("node_broadcast_interval_secs")
+        if (
+            not isinstance(correlation_id, str)
+            or not 1 <= len(correlation_id) <= 128
+            or source != provider_target
+            or destination is None
+            or (local_node_id is not None and destination != local_node_id)
+            or isinstance(channel, bool)
+            or not isinstance(channel, int)
+            or not 0 <= channel <= 7
+            or isinstance(interval, bool)
+            or not isinstance(interval, int)
+            or not 0 <= interval <= 31_536_000
+        ):
+            raise HomeAssistantError("The NeighborInfo response was invalid")
+        raw_neighbors = provider_result.get("neighbors")
+        if not isinstance(raw_neighbors, (list, tuple)) or len(raw_neighbors) > 10:
+            raise HomeAssistantError("The NeighborInfo response was invalid")
+        neighbors: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in raw_neighbors:
+            if not isinstance(item, Mapping) or set(item) - {"node_id", "snr"}:
+                raise HomeAssistantError("The NeighborInfo response was invalid")
+            neighbor_id = canonical_meshtastic_node_id(item.get("node_id"))
+            snr = item.get("snr")
+            if (
+                neighbor_id is None
+                or neighbor_id in {provider_target, local_node_id}
+                or neighbor_id in seen
+                or isinstance(snr, bool)
+                or not isinstance(snr, (int, float))
+                or not math.isfinite(float(snr))
+                or not -128 <= float(snr) <= 128
+            ):
+                raise HomeAssistantError("The NeighborInfo response was invalid")
+            seen.add(neighbor_id)
+            neighbors.append(
+                {
+                    "node_id": f"meshtastic:{neighbor_id}",
+                    "snr": float(snr),
+                }
+            )
+        return {
+            "schema_version": 1,
+            "gateway_id": gateway_id,
+            "correlation_id": correlation_id,
+            "source": target_node,
+            "destination": f"meshtastic:{destination}",
+            "channel": channel,
+            "node_broadcast_interval_secs": interval,
+            "neighbors": neighbors,
+            "status": "complete",
+            "completed_at": timestamp_to_json(utcnow()),
+        }
 
     async def async_gateway_settings_get(self, gateway_id: str | None = None) -> dict[str, Any]:
         """Read one local gateway's bounded, privacy-safe settings schema."""
@@ -2243,6 +2522,8 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                     == "contact_message"
                     else MESSAGE_TYPE_BROADCAST
                 ),
+                reply_to_message_id=packet.reply_to_message_id,
+                reaction=packet.reaction,
                 raw={},
             )
             await self.store.async_add_message(record)

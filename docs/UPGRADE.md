@@ -1,5 +1,28 @@
 # Upgrade Guide
 
+## From 0.7.0
+
+0.8.0 attaches Meshtastic reactions to the exact referenced on-air packet,
+preserves the Messages timeline position during refresh, displays located graph
+edge distances in miles, changes the persisted integration-wide manual
+traceroute cooldown to 60 seconds, and adds an experimental manual NeighborInfo
+request. Restart Home Assistant and hard-refresh the browser so the versioned
+panel JavaScript is replaced.
+
+NeighborInfo requests are administrator-only, Meshtastic-Bluetooth-only,
+unicast, and never automatic or retried by MeshNet. Global and same-target
+180-second reservations are persisted before submission. The feature is
+verified with firmware 2.7.26 and requires the target's Neighbor Info module;
+older firmware may reject or time out. A response is a cached zero-hop report
+of at most ten nodes, not a live scan, and a timeout does not mean zero
+neighbors.
+
+The existing SQLite file is extended in place with isolated NeighborInfo
+reservation/result state. No Home Assistant core configuration or radio
+setting is changed by this migration. The graph can use Home Assistant's Home
+location as a browser-only fallback for a gateway without cached GPS; MeshNet
+does not write a fixed position to the radio.
+
 ## From 0.6.2
 
 0.7.0 adds an app-like **Messages** view, 20/50/100-node moving passive graph,
@@ -9,8 +32,8 @@ node editor. Restart Home Assistant and hard-refresh the browser so the new
 panel JavaScript replaces its cached 0.6.x copy.
 
 Traceroute is manual and administrator-only. The backend reserves a SQLite
-cooldown before the single RF request and permits at most one manual traceroute
-across the entire MeshNet integration every 3,600 seconds. Failure and timeout
+cooldown before the single application request and permits at most one manual traceroute
+across the entire MeshNet integration every 60 seconds. Failure and timeout
 consume it, and there is no service, polling, startup, graph-fill, scheduled,
 broadcast, or retry path.
 

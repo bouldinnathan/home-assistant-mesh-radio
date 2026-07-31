@@ -11,7 +11,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .const import STORAGE_SCHEMA_VERSION
+from .const import (
+    MANUAL_NEIGHBOR_INFO_GLOBAL_COOLDOWN_SECONDS,
+    MANUAL_NEIGHBOR_INFO_TARGET_COOLDOWN_SECONDS,
+    MANUAL_TRACEROUTE_COOLDOWN_SECONDS,
+    STORAGE_SCHEMA_VERSION,
+)
 from .models import (
     MeshPacket,
     MeshSnapshot,
@@ -132,6 +137,19 @@ class MeshStore:
                 result_updated_at TEXT,
                 result_data TEXT,
                 PRIMARY KEY(gateway_id, target_node)
+            )
+            """
+        )
+        await self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS neighbor_info_requests (
+                target_node TEXT PRIMARY KEY,
+                gateway_id TEXT NOT NULL,
+                reserved_at TEXT NOT NULL,
+                global_next_allowed_at TEXT NOT NULL,
+                target_next_allowed_at TEXT NOT NULL,
+                result_updated_at TEXT,
+                result_data TEXT
             )
             """
         )
@@ -593,7 +611,7 @@ class MeshStore:
         gateway_id: str,
         target_node: str,
         *,
-        cooldown_seconds: int = 3600,
+        cooldown_seconds: int = MANUAL_TRACEROUTE_COOLDOWN_SECONDS,
         now: datetime | None = None,
     ) -> dict[str, Any]:
         """Atomically reserve the integration-wide traceroute airtime slot."""
@@ -605,7 +623,9 @@ class MeshStore:
         ):
             raise ValueError("traceroute cooldown must be an integer")
         # This is a safety floor, not a caller-selected rate limit.
-        cooldown_seconds = max(3600, cooldown_seconds)
+        cooldown_seconds = max(
+            MANUAL_TRACEROUTE_COOLDOWN_SECONDS, cooldown_seconds
+        )
         reserved_at = self._traceroute_now(now)
         next_allowed = reserved_at + timedelta(seconds=cooldown_seconds)
         reserved_at_text = timestamp_to_json(reserved_at)
@@ -766,6 +786,236 @@ class MeshStore:
             "result": result,
         }
 
+    async def async_reserve_neighbor_info_request(
+        self,
+        gateway_id: str,
+        target_node: str,
+        *,
+        global_cooldown_seconds: int = (
+            MANUAL_NEIGHBOR_INFO_GLOBAL_COOLDOWN_SECONDS
+        ),
+        target_cooldown_seconds: int = (
+            MANUAL_NEIGHBOR_INFO_TARGET_COOLDOWN_SECONDS
+        ),
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Atomically reserve the global and per-target NeighborInfo floors."""
+        gateway_id, target_node = self._validated_traceroute_key(
+            gateway_id, target_node
+        )
+        for value in (global_cooldown_seconds, target_cooldown_seconds):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError("NeighborInfo cooldown must be an integer")
+        global_cooldown_seconds = max(
+            MANUAL_NEIGHBOR_INFO_GLOBAL_COOLDOWN_SECONDS,
+            global_cooldown_seconds,
+        )
+        target_cooldown_seconds = max(
+            MANUAL_NEIGHBOR_INFO_TARGET_COOLDOWN_SECONDS,
+            target_cooldown_seconds,
+        )
+        reserved_at = self._traceroute_now(now)
+        reserved_at_text = timestamp_to_json(reserved_at)
+        global_next_text = timestamp_to_json(
+            reserved_at + timedelta(seconds=global_cooldown_seconds)
+        )
+        target_next_text = timestamp_to_json(
+            reserved_at + timedelta(seconds=target_cooldown_seconds)
+        )
+
+        def reserve(conn: sqlite3.Connection) -> bool:
+            global_active = conn.execute(
+                """
+                SELECT 1
+                FROM neighbor_info_requests
+                WHERE global_next_allowed_at > ?
+                LIMIT 1
+                """,
+                (reserved_at_text,),
+            ).fetchone()
+            target_active = conn.execute(
+                """
+                SELECT 1
+                FROM neighbor_info_requests
+                WHERE target_node = ? AND target_next_allowed_at > ?
+                LIMIT 1
+                """,
+                (target_node, reserved_at_text),
+            ).fetchone()
+            if global_active is not None or target_active is not None:
+                return False
+            cursor = conn.execute(
+                """
+                INSERT INTO neighbor_info_requests(
+                    target_node,
+                    gateway_id,
+                    reserved_at,
+                    global_next_allowed_at,
+                    target_next_allowed_at
+                )
+                VALUES(?, ?, ?, ?, ?)
+                ON CONFLICT(target_node) DO UPDATE SET
+                    gateway_id=excluded.gateway_id,
+                    reserved_at=excluded.reserved_at,
+                    global_next_allowed_at=excluded.global_next_allowed_at,
+                    target_next_allowed_at=excluded.target_next_allowed_at,
+                    result_updated_at=NULL,
+                    result_data=NULL
+                """,
+                (
+                    target_node,
+                    gateway_id,
+                    reserved_at_text,
+                    global_next_text,
+                    target_next_text,
+                ),
+            )
+            return cursor.rowcount == 1
+
+        reserved = bool(await self._run_serialized(reserve))
+        status = await self.async_get_neighbor_info_request_status(
+            target_node, now=reserved_at
+        )
+        return {
+            **status,
+            "reserved": reserved,
+            "status": "reserved" if reserved else "cooldown",
+        }
+
+    async def async_store_neighbor_info_result(
+        self,
+        gateway_id: str,
+        target_node: str,
+        result: dict[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        """Attach one sanitized NeighborInfo response to its reservation."""
+        gateway_id, target_node = self._validated_traceroute_key(
+            gateway_id, target_node
+        )
+        safe_result = self._safe_neighbor_info_result(result)
+        await self._execute(
+            """
+            UPDATE neighbor_info_requests
+            SET result_updated_at = ?, result_data = ?
+            WHERE gateway_id = ? AND target_node = ?
+            """,
+            (
+                timestamp_to_json(self._traceroute_now(now)),
+                stable_json(safe_result),
+                gateway_id,
+                target_node,
+            ),
+        )
+
+    async def async_get_neighbor_info_request_status(
+        self,
+        target_node: str,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Return persisted global and selected-target NeighborInfo status."""
+        self._validated_traceroute_key("status", target_node)
+        current = self._traceroute_now(now)
+        global_row = await self._fetchone(
+            """
+            SELECT gateway_id, target_node, reserved_at, global_next_allowed_at
+            FROM neighbor_info_requests
+            ORDER BY reserved_at DESC, gateway_id ASC, target_node ASC
+            LIMIT 1
+            """
+        )
+        target_row = await self._fetchone(
+            """
+            SELECT
+                gateway_id,
+                reserved_at,
+                target_next_allowed_at,
+                result_updated_at,
+                result_data
+            FROM neighbor_info_requests
+            WHERE target_node = ?
+            LIMIT 1
+            """,
+            (target_node,),
+        )
+        global_next = (
+            parse_timestamp(global_row["global_next_allowed_at"])
+            if global_row is not None
+            else None
+        )
+        target_next = (
+            parse_timestamp(target_row["target_next_allowed_at"])
+            if target_row is not None
+            else None
+        )
+        global_remaining = (
+            max(0, math.ceil((global_next - current).total_seconds()))
+            if global_next is not None
+            else 0
+        )
+        target_remaining = (
+            max(0, math.ceil((target_next - current).total_seconds()))
+            if target_next is not None
+            else 0
+        )
+        active_next = [
+            value
+            for value in (global_next, target_next)
+            if value is not None and value > current
+        ]
+        next_allowed = max(active_next) if active_next else None
+        result: dict[str, Any] | None = None
+        if target_row is not None and isinstance(target_row["result_data"], str):
+            try:
+                decoded = json.loads(target_row["result_data"])
+            except (json.JSONDecodeError, RecursionError, TypeError, ValueError):
+                decoded = None
+            if isinstance(decoded, dict):
+                result = self._safe_neighbor_info_result(decoded)
+        remaining = max(global_remaining, target_remaining)
+        return {
+            "schema_version": 1,
+            "scope": "integration_and_target",
+            "reserved": remaining > 0,
+            "status": "cooldown" if remaining > 0 else "available",
+            "target_node": target_node,
+            "gateway_id": (
+                global_row["gateway_id"] if global_row is not None else None
+            ),
+            "last_target_node": (
+                global_row["target_node"] if global_row is not None else None
+            ),
+            "reserved_at": (
+                global_row["reserved_at"] if global_row is not None else None
+            ),
+            "global_next_allowed_at": (
+                global_row["global_next_allowed_at"]
+                if global_row is not None
+                else None
+            ),
+            "target_next_allowed_at": (
+                target_row["target_next_allowed_at"]
+                if target_row is not None
+                else None
+            ),
+            "next_allowed_at": (
+                timestamp_to_json(next_allowed)
+                if next_allowed is not None
+                else None
+            ),
+            "global_remaining_seconds": global_remaining,
+            "target_remaining_seconds": target_remaining,
+            "remaining_seconds": remaining,
+            "result_updated_at": (
+                target_row["result_updated_at"]
+                if target_row is not None
+                else None
+            ),
+            "result": result,
+        }
+
     @staticmethod
     def _validated_traceroute_key(
         gateway_id: Any, target_node: Any
@@ -858,6 +1108,78 @@ class MeshStore:
                 safe[key] = snr_values
         return safe
 
+    @staticmethod
+    def _safe_neighbor_info_result(result: Any) -> dict[str, Any]:
+        """Project a NeighborInfo response onto one bounded durable allowlist."""
+        if not isinstance(result, dict):
+            raise ValueError("invalid NeighborInfo result")
+        safe: dict[str, Any] = {}
+        schema_version = result.get("schema_version")
+        if (
+            isinstance(schema_version, int)
+            and not isinstance(schema_version, bool)
+            and schema_version == 1
+        ):
+            safe["schema_version"] = schema_version
+        for key, maximum_bytes in (
+            ("gateway_id", 128),
+            ("source", 256),
+            ("destination", 256),
+        ):
+            value = result.get(key)
+            if (
+                isinstance(value, str)
+                and value == value.strip()
+                and 1 <= len(value.encode("utf-8")) <= maximum_bytes
+            ):
+                safe[key] = value
+        completed_at = result.get("completed_at")
+        if (
+            isinstance(completed_at, str)
+            and len(completed_at.encode("utf-8")) <= 64
+        ):
+            parsed = parse_timestamp(completed_at)
+            if parsed is not None:
+                safe["completed_at"] = timestamp_to_json(parsed)
+        channel = result.get("channel")
+        if (
+            isinstance(channel, int)
+            and not isinstance(channel, bool)
+            and 0 <= channel <= 7
+        ):
+            safe["channel"] = channel
+        interval = result.get("node_broadcast_interval_secs")
+        if (
+            isinstance(interval, int)
+            and not isinstance(interval, bool)
+            and 0 <= interval <= 31_536_000
+        ):
+            safe["node_broadcast_interval_secs"] = interval
+        neighbors = result.get("neighbors")
+        if isinstance(neighbors, list) and len(neighbors) <= 10:
+            safe_neighbors: list[dict[str, Any]] = []
+            for item in neighbors:
+                if not isinstance(item, dict) or set(item) - {"node_id", "snr"}:
+                    break
+                node_id = item.get("node_id")
+                snr = item.get("snr")
+                if (
+                    not isinstance(node_id, str)
+                    or node_id != node_id.strip()
+                    or not 1 <= len(node_id.encode("utf-8")) <= 256
+                    or isinstance(snr, bool)
+                    or not isinstance(snr, (int, float))
+                    or not math.isfinite(float(snr))
+                    or not -128 <= float(snr) <= 128
+                ):
+                    break
+                safe_neighbors.append(
+                    {"node_id": node_id, "snr": float(snr)}
+                )
+            else:
+                safe["neighbors"] = safe_neighbors
+        return safe
+
     async def async_prune(self, history_days: int) -> None:
         """Prune old history without deleting an active RF cooldown."""
         current = utcnow()
@@ -872,6 +1194,15 @@ class MeshStore:
             WHERE reserved_at < ? AND next_allowed_at <= ?
             """,
             (cutoff_text, current_text),
+        )
+        await self._execute(
+            """
+            DELETE FROM neighbor_info_requests
+            WHERE reserved_at < ?
+              AND global_next_allowed_at <= ?
+              AND target_next_allowed_at <= ?
+            """,
+            (cutoff_text, current_text, current_text),
         )
 
     async def async_diagnostics(self) -> dict[str, Any]:
@@ -897,6 +1228,9 @@ class MeshStore:
             SELECT 'routes', COUNT(*) FROM routes
             UNION ALL
             SELECT 'traceroutes', COUNT(*) FROM traceroutes
+            UNION ALL
+            SELECT 'neighbor_info_requests', COUNT(*)
+            FROM neighbor_info_requests
             """
         )
         table_counts = {
@@ -965,6 +1299,9 @@ class MeshStore:
                 "packet_count": table_counts.get("packets", 0),
                 "route_count": table_counts.get("routes", 0),
                 "traceroute_count": table_counts.get("traceroutes", 0),
+                "neighbor_info_request_count": table_counts.get(
+                    "neighbor_info_requests", 0
+                ),
                 "table_counts": table_counts,
                 "message_direction_counts": {
                     "received": int(message_summary["received_count"] or 0)

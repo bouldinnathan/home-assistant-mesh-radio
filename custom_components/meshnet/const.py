@@ -6,7 +6,7 @@ from typing import Final
 
 DOMAIN: Final = "meshnet"
 NAME: Final = "MeshNet"
-VERSION: Final = "0.7.0"
+VERSION: Final = "0.8.0"
 DATA_BLUETOOTH_PAIRING: Final = f"{DOMAIN}_bluetooth_pairing"
 
 PLATFORMS: Final = ["sensor", "binary_sensor", "device_tracker"]
@@ -41,6 +41,13 @@ DEFAULT_DATABASE_NAME: Final = "meshnet.sqlite3"
 # Bound work performed by the recurring admin sidebar projection.
 MAX_PANEL_NODES: Final = 1000
 MAX_PANEL_GATEWAYS: Final = 64
+
+# Manual RF requests are always explicit and reserved durably before transmit.
+# Traceroute has one integration-wide floor. NeighborInfo additionally honors
+# the firmware's three-minute per-target reply suppression across all gateways.
+MANUAL_TRACEROUTE_COOLDOWN_SECONDS: Final = 60
+MANUAL_NEIGHBOR_INFO_GLOBAL_COOLDOWN_SECONDS: Final = 180
+MANUAL_NEIGHBOR_INFO_TARGET_COOLDOWN_SECONDS: Final = 180
 
 PROTOCOL_MESHTASTIC: Final = "meshtastic"
 PROTOCOL_MESHCORE: Final = "meshcore"

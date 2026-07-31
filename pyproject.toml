@@ -1,6 +1,6 @@
 [project]
 name = "homeassistant-meshnet"
-version = "0.7.0"
+version = "0.8.0"
 description = "Home Assistant custom integration for Meshtastic and MeshCore mesh networks"
 license = { file = "LICENSE" }
 requires-python = ">=3.12,<3.15"

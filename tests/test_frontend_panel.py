@@ -2058,7 +2058,7 @@ def test_passive_topology_uses_only_direct_hops_and_exact_meshcore_routes() -> N
       ["node:meshcore:a", "node:meshcore:b", "route"],
     ].sort(),
   );
-  assert.match(panel._graph(topology), /Cached passive topology — no traceroutes sent/);
+  assert.match(panel._graph(topology), /Cached evidence topology — no traceroutes sent automatically/);
   assert.match(panel._graph(topology), /last received evidence, not a live route/);
 
   const empty = panel._passiveTopology(
@@ -2071,7 +2071,7 @@ def test_passive_topology_uses_only_direct_hops_and_exact_meshcore_routes() -> N
     gateways,
   );
   assert.equal(empty.edges.length, 0);
-  assert.match(panel._graph(empty), /No passive connection evidence yet/);
+  assert.match(panel._graph(empty), /No cached connection evidence yet/);
 
   const many = Array.from({ length: 60 }, (_value, index) => ({
     node_key: `meshcore:${index}`,

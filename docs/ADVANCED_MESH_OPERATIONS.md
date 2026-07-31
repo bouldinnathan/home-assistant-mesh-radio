@@ -20,6 +20,7 @@ correlate, cancel, and verify every request without blocking Home Assistant.
 | Load remote settings | Yes | Never | Meshtastic Bluetooth | No settings or session keys |
 | Apply remote settings | Yes | Never | Meshtastic Bluetooth | Sanitized result only |
 | Run a traceroute | Yes | Never | Meshtastic Bluetooth | Cooldown and sanitized route |
+| Request NeighborInfo | Yes | Never | Meshtastic Bluetooth | Cooldowns and sanitized report |
 | Move, filter, or sort the graph | No | Browser animation only | Not applicable | Browser-tab layout only |
 
 The following rules are invariants, not UI suggestions:
@@ -30,15 +31,16 @@ The following rules are invariants, not UI suggestions:
   self, ambiguous, malformed, and unknown targets are rejected.
 - A traceroute cooldown is reserved in SQLite before the radio write. A
   failure, timeout, restart, second browser, or simultaneous request cannot
-  bypass the one-hour limit.
+  bypass the one-minute limit.
 - An RF timeout has an unknown outcome. MeshNet never automatically retries a
-  traceroute or remote setting write after a timeout.
+  traceroute, NeighborInfo request, or remote setting write after a timeout.
 - All advanced commands require a Home Assistant administrator.
 - Node numbers and cryptographic identity are routing facts. Names are display
   labels and are never used to merge or silently retarget nodes.
 - Graph distance never creates an edge. An edge exists only when MeshNet has
-  received passive route or neighbor evidence. Manual traceroute results stay
-  in the separate result view and never mutate the passive graph.
+  received route or NeighborInfo evidence. Solicited NeighborInfo is marked
+  `manual_request`; unsolicited and legacy evidence is marked `passive`.
+  Manual traceroute results stay separate and never mutate the graph.
 - SNR and RSSI are signal observations, not physical-distance estimates.
 - Encrypted traffic that the connected radio cannot legitimately decrypt is
   not inspected, guessed, retained, or exposed.
@@ -178,9 +180,19 @@ Message history is loaded from the bounded `meshnet/messages` WebSocket API,
 not the abbreviated panel snapshot. Malformed records are skipped. Text is
 HTML-escaped, UTF-8 validated, and bounded to the radio payload limit.
 
+Meshtastic reactions carry the original packet's numeric `reply_id`. MeshNet
+projects that as `meshtastic:<uint32>` and joins it only to a record with that
+exact on-air ID. Multiple matching reactions are grouped by Unicode scalar and
+sender; an unresolved reaction remains visible as an orphan. BLE and native
+serial/TCP sends retain the radio-returned packet ID. MQTT submission does not
+return an on-air ID, so MeshNet does not guess a match for that local outbound
+record.
+
 The conversation selector and message draft survive the five-second cached
 snapshot refresh while the panel remains open. They are not written to browser
-storage. Navigating away discards unsent text.
+storage. The message timeline also preserves its exact scroll position during
+refresh unless it was already near the bottom, in which case it follows the
+newest message. Navigating away discards unsent text.
 
 ### Delivery wording
 
@@ -208,23 +220,45 @@ Traceroute is intentionally separate from graph refresh.
 2. Select an active Meshtastic Bluetooth gateway.
 3. Press **Traceroute**, review the RF-traffic notice, and confirm.
 4. MeshNet reserves the integration-wide cooldown in SQLite.
-5. Exactly one RouteDiscovery packet is submitted to that destination.
+5. One RouteDiscovery application packet is submitted to that destination;
+   MeshNet performs no application retry. Firmware may still relay or
+   retransmit reliable traffic.
 6. A correlated response, routing rejection, or timeout completes the action.
 
 The button displays the next permitted time. The backend permits at most one
-manual traceroute across the entire MeshNet integration every 3,600 seconds,
+manual traceroute across the entire MeshNet integration every 60 seconds,
 regardless of gateway or destination. The reservation is shared by every
 browser session and survives Home Assistant restarts. The panel reloads the
 persisted cooldown and last privacy-bounded result, including completion time
 and available per-hop SNR, instead of treating a browser reload as a fresh
 airtime budget. A rejected local validation does not reserve airtime; once the
-backend reaches the reservation step, all outcomes consume the hour because RF
+backend reaches the reservation step, all outcomes consume the minute because RF
 transmission may have occurred.
 
 There is no traceroute Home Assistant service and no automation action in the
 initial implementation. It cannot be invoked by snapshot polling, coordinator
 refresh, reconnection, diagnostics, graph animation, map opening, or startup.
 There is no broadcast, batch, scheduled, automatic, or retry mode.
+
+### Manual NeighborInfo request
+
+An administrator may request one exact known Meshtastic node's cached
+NeighborInfo report through a connected Bluetooth gateway. MeshNet atomically
+reserves 180-second integration-wide and same-target cooldowns in SQLite
+before submitting one unicast application packet without an application-level
+retry. Those floors
+are shared by every gateway and browser and survive Home Assistant restarts.
+
+The request is never sent by graph rendering, refresh, startup, reconnection,
+diagnostics, services, automations, or polling. It has no broadcast, batch,
+schedule, or retry form. MeshNet accepts only a non-MQTT response whose request
+ID, source, destination, and channel match the submitted packet, caps the
+report at ten neighbors, and stores only the sanitized result. This experimental
+request is verified against firmware 2.7.26 and requires Neighbor Info to be
+enabled on the target. Older firmware may reject it or time out. The successful
+result is cached zero-hop evidence, not a live scan; an empty successful report
+means no cached neighbors, while a timeout is unknown. Every post-reservation
+outcome consumes both cooldowns.
 
 ### Route interpretation
 
@@ -257,8 +291,9 @@ and generates no radio traffic.
 
 Edges are visually distinguished:
 
-- **Passive direct/neighbor evidence** came from packets the gateway already
-  received.
+- **Cached direct/neighbor evidence** came from packets the gateway already
+  received. NeighborInfo is labeled `Passive` or `Requested NeighborInfo`
+  according to its validated provenance.
 - A Meshtastic NeighborInfo edge requires an exact, unambiguous reporter and
   endpoint, a direct non-MQTT observation no more than one hour old, and a
   bounded timestamp. Five minutes of future clock skew is tolerated; older,
@@ -277,7 +312,9 @@ distance with the Haversine formula and maps it monotonically to a bounded
 spring length. The displayed line can therefore settle shorter for nearby
 nodes and longer for distant nodes. The mapping is deliberately compressed;
 pixels are not meters and a graph must remain readable across neighborhood and
-regional meshes.
+regional meshes. Each located edge displays its great-circle distance in miles
+at the moving line midpoint; that label is not an estimate of RF range or route
+length.
 
 Fallback order for a gateway endpoint is:
 
@@ -446,6 +483,9 @@ The implementation is complete only when automated tests prove all of these:
 - Exact identity is retained; duplicate names never merge conversations.
 - Draft, focus, and selected conversation survive snapshot refresh; navigation
   clears the draft.
+- Timeline refresh preserves reading position or follows the bottom, and a
+  reaction joins only through an exact validated on-air packet ID; unresolved
+  reactions stay visible.
 - Malformed/oversized text and records are rejected and every rendered value is
   escaped.
 - Immediate send, offline queue, provider failure, replay, and permanent block
@@ -458,7 +498,7 @@ The implementation is complete only when automated tests prove all of these:
   destinations fail before reservation or transmission.
 - Reservation is atomic, stored before send, survives database reopen, and
   permits one manual traceroute across the entire MeshNet integration every
-  3,600 seconds.
+  60 seconds.
 - Simultaneous callers cannot both transmit. Timeout/failure consumes the
   reservation and is never retried.
 - Only the admin WebSocket/manual panel path reaches the provider; polling,

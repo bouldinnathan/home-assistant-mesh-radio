@@ -66,6 +66,18 @@ class MeshNetPanel extends HTMLElement {
     this._tracerouteStatusLoading = false;
     this._tracerouteStatusAttempted = false;
     this._tracerouteStatusRequestGeneration = 0;
+    this._neighborInfoGatewayId = "";
+    this._neighborInfoTargetNode = "";
+    this._neighborInfoConfirmation = null;
+    this._neighborInfoResult = null;
+    this._neighborInfoStatus = null;
+    this._neighborInfoBusy = false;
+    this._neighborInfoRequestGeneration = 0;
+    this._neighborInfoStatusData = null;
+    this._neighborInfoStatusReady = false;
+    this._neighborInfoStatusLoading = false;
+    this._neighborInfoStatusTarget = "";
+    this._neighborInfoStatusRequestGeneration = 0;
     this._settingsGateways = [];
     this._settingsSnapshot = null;
     this._settingsGatewayId = "";
@@ -106,6 +118,8 @@ class MeshNetPanel extends HTMLElement {
     this._remoteRequestGeneration += 1;
     this._tracerouteRequestGeneration += 1;
     this._tracerouteStatusRequestGeneration += 1;
+    this._neighborInfoRequestGeneration += 1;
+    this._neighborInfoStatusRequestGeneration += 1;
     this._settingsRequestGeneration += 1;
     this._stopGraphAnimation();
     this._graphPositions.clear();
@@ -135,6 +149,16 @@ class MeshNetPanel extends HTMLElement {
     this._tracerouteStatusReady = false;
     this._tracerouteStatusLoading = false;
     this._tracerouteStatusAttempted = false;
+    this._neighborInfoGatewayId = "";
+    this._neighborInfoTargetNode = "";
+    this._neighborInfoConfirmation = null;
+    this._neighborInfoResult = null;
+    this._neighborInfoStatus = null;
+    this._neighborInfoBusy = false;
+    this._neighborInfoStatusData = null;
+    this._neighborInfoStatusReady = false;
+    this._neighborInfoStatusLoading = false;
+    this._neighborInfoStatusTarget = "";
     this._settingsBusy = null;
     // Treat navigation away from the panel as abandoning the draft. Secret
     // replacements must not linger on a detached custom-element instance.
@@ -373,6 +397,9 @@ class MeshNetPanel extends HTMLElement {
       "traceroute_event",
       "traceroute_request",
       "traceroute_status",
+      "neighbor_info_event",
+      "neighbor_info_request",
+      "neighbor_info_status",
       "reporting",
     ], "poll_unexpected");
     const safeCategory = this._safeOperation(category, [
@@ -490,6 +517,9 @@ class MeshNetPanel extends HTMLElement {
       traceroute_event: "event_handler",
       traceroute_request: "traceroute",
       traceroute_status: "traceroute",
+      neighbor_info_event: "event_handler",
+      neighbor_info_request: "event_handler",
+      neighbor_info_status: "event_handler",
       reporting: "reporting",
     };
     let operation = operationMap[event.operation] || "reporting";
@@ -712,7 +742,8 @@ class MeshNetPanel extends HTMLElement {
       return;
     }
     if (this._activeView === "messages") {
-      this._renderMessages(composerFocus);
+      const messageScroll = this._captureMessageScrollState();
+      this._renderMessages(composerFocus, messageScroll);
       return;
     }
     const snapshot = this._snapshot || { nodes: {}, gateways: {}, recent_messages: [] };
@@ -1115,6 +1146,15 @@ class MeshNetPanel extends HTMLElement {
         line.link { stroke: var(--divider-color); stroke-width: 1.4; }
         line.direct-link { stroke: var(--success-color, #168047); stroke-width: 2; }
         line.route-link { stroke: var(--primary-color); stroke-dasharray: 6 4; }
+        text.edge-distance {
+          fill: var(--primary-text-color);
+          stroke: var(--card-background-color);
+          stroke-width: 4px;
+          paint-order: stroke;
+          text-anchor: middle;
+          pointer-events: none;
+          font-size: 11px;
+        }
         .topology-empty {
           fill: var(--secondary-text-color);
           font-size: 16px;
@@ -1210,6 +1250,7 @@ class MeshNetPanel extends HTMLElement {
           </section>
           ${this._remoteAdminPanel(nodes, gateways)}
           ${this._traceroutePanel(nodes, gateways)}
+          ${this._neighborInfoPanel(nodes, gateways)}
           ${this._panelDiagnostics(snapshot.panel_metadata, nodes)}
           <section class="panel">
             <div class="panel-heading">
@@ -1502,7 +1543,7 @@ class MeshNetPanel extends HTMLElement {
     return `
       <section class="panel" id="meshnet-traceroute-panel">
         <h2>Manual traceroute</h2>
-        <div class="field-help">This sends RF traffic. It is never run by polling, graph animation, startup, or automation. One attempt starts an integration-wide one-hour cooldown.</div>
+        <div class="field-help">This sends RF traffic. It is never run by polling, graph animation, startup, or automation. One attempt starts an integration-wide one-minute cooldown.</div>
         <div class="operator-controls">
           <label>Gateway
             <select id="meshnet-traceroute-gateway"${compatibleGateways.length ? "" : " disabled"}>
@@ -1584,6 +1625,104 @@ class MeshNetPanel extends HTMLElement {
     return ["good", "warn", "bad"].includes(kind) ? kind : "";
   }
 
+  _neighborInfoPanel(nodes, gateways) {
+    const compatibleGateways = this._remoteGatewayCandidates(gateways);
+    const compatibleNodes = this._remoteNodeCandidates(nodes);
+    const selectedGateway = compatibleGateways.some(
+      (gateway) => gateway.gateway_id === this._neighborInfoGatewayId,
+    ) ? this._neighborInfoGatewayId : compatibleGateways[0] && compatibleGateways[0].gateway_id || "";
+    const selectedTarget = compatibleNodes.some(
+      (node) => `meshtastic:${this._meshtasticNodeId(node)}` === this._neighborInfoTargetNode,
+    ) ? this._neighborInfoTargetNode : compatibleNodes[0]
+      ? `meshtastic:${this._meshtasticNodeId(compatibleNodes[0])}`
+      : "";
+    const statusReady = this._neighborInfoStatusReady
+      && this._neighborInfoStatusTarget === selectedTarget;
+    const pending = this._neighborInfoConfirmation
+      && this._neighborInfoConfirmation.gateway_id === selectedGateway
+      && this._neighborInfoConfirmation.target_node === selectedTarget;
+    const cooldown = statusReady && this._neighborInfoCooldownActive();
+    const result = this._neighborInfoResult
+      && this._neighborInfoResult.gateway_id === selectedGateway
+      && this._neighborInfoResult.source === selectedTarget
+      ? this._neighborInfoResult
+      : null;
+    return `
+      <section class="panel" id="meshnet-neighbor-info-panel">
+        <h2>NeighborInfo request</h2>
+        <div class="field-help warn"><strong>Experimental / newer firmware only.</strong> Verified on firmware 2.7.26 when Neighbor Info is enabled. Older firmware may reject or time out; the official Android app temporarily disabled this control because it was not working as expected.</div>
+        <div class="field-help">This submits one application request with no MeshNet retry. Firmware may relay or retransmit reliable traffic. MeshNet never runs it during polling, startup, or graph animation. The server enforces 180-second global and same-target cooldowns.</div>
+        <div class="operator-controls">
+          <label>Bluetooth gateway
+            <select id="meshnet-neighbor-info-gateway"${compatibleGateways.length && !this._neighborInfoBusy && !this._neighborInfoStatusLoading ? "" : " disabled"}>
+              ${this._operatorGatewayOptions(compatibleGateways, selectedGateway)}
+            </select>
+          </label>
+          <label>Exact Meshtastic node
+            <select id="meshnet-neighbor-info-target"${compatibleNodes.length && !this._neighborInfoBusy && !this._neighborInfoStatusLoading ? "" : " disabled"}>
+              ${this._operatorTargetOptions(compatibleNodes, selectedTarget, { traceroute: true })}
+            </select>
+          </label>
+          <div class="operator-actions">
+            <button class="operator-button" id="meshnet-neighbor-info-status-load" type="button"${this._neighborInfoBusy || this._neighborInfoStatusLoading || !selectedTarget ? " disabled" : ""}>${this._neighborInfoStatusLoading ? "Checking…" : "Load persisted status"}</button>
+            <button class="operator-button" id="meshnet-neighbor-info-start" type="button"${this._neighborInfoBusy || this._neighborInfoStatusLoading || !statusReady || cooldown || !selectedGateway || !selectedTarget ? " disabled" : ""}>${this._neighborInfoBusy ? "Waiting for response…" : "Request NeighborInfo"}</button>
+          </div>
+          ${this._neighborInfoStatusPanel(statusReady)}
+          ${pending ? `
+            <div class="confirmation-box">
+              <span aria-hidden="true">⚠</span>
+              <span>Confirm one experimental NeighborInfo application request to <strong>${this._escape(selectedTarget)}</strong>. A timeout can have an unknown outcome and must not be retried blindly.</span>
+            </div>
+            <div class="operator-actions">
+              <button class="operator-button primary" id="meshnet-neighbor-info-confirm" type="button"${this._neighborInfoBusy ? " disabled" : ""}>Confirm request</button>
+              <button class="operator-button" id="meshnet-neighbor-info-cancel" type="button"${this._neighborInfoBusy ? " disabled" : ""}>Cancel</button>
+            </div>
+          ` : ""}
+          ${result ? this._neighborInfoResultPanel(result) : ""}
+          <div class="operator-status ${this._neighborInfoStatusClass()}" id="meshnet-neighbor-info-status" role="status" aria-live="polite">${this._escape(this._neighborInfoStatus ? this._neighborInfoStatus.text : "")}</div>
+        </div>
+      </section>
+    `;
+  }
+
+  _neighborInfoStatusPanel(statusReady) {
+    const status = this._neighborInfoStatusData;
+    if (!statusReady || !status) {
+      return this._neighborInfoStatusLoading
+        ? '<div class="field-help">Checking persisted NeighborInfo cooldowns…</div>'
+        : '<div class="field-help warn">Load persisted status for this exact target before RF control is enabled.</div>';
+    }
+    if (!this._neighborInfoCooldownActive()) {
+      return '<div class="field-help good">No persisted NeighborInfo cooldown is active for this request.</div>';
+    }
+    return `
+      <div class="operator-card">
+        <strong>NeighborInfo cooldown active</strong>
+        <div class="field-help">Global: ${this._escape(status.global_remaining_seconds)}s · same target: ${this._escape(status.target_remaining_seconds)}s</div>
+        ${status.next_allowed_at ? `<div class="field-help">Next permitted request: ${this._escape(this._timestampDisplay(status.next_allowed_at))}</div>` : ""}
+      </div>
+    `;
+  }
+
+  _neighborInfoResultPanel(result) {
+    return `
+      <section class="operator-card">
+        <h3>Completed NeighborInfo response</h3>
+        <div class="field-help">Gateway: ${this._escape(result.gateway_id)} · source: ${this._escape(result.source)}</div>
+        <div class="field-help">Completed: ${this._escape(this._timestampDisplay(result.completed_at))}</div>
+        <div class="field-help">Node broadcast interval: ${this._escape(result.node_broadcast_interval_secs)} seconds</div>
+        ${result.neighbors.length
+          ? `<ol class="route-list">${result.neighbors.map((neighbor) => `<li>${this._escape(neighbor.node_id)} · ${this._escape(neighbor.snr)} dB SNR</li>`).join("")}</ol>`
+          : '<div class="field-help">The completed response reported no neighbors.</div>'}
+      </section>
+    `;
+  }
+
+  _neighborInfoStatusClass() {
+    const kind = this._neighborInfoStatus && this._neighborInfoStatus.kind;
+    return ["good", "warn", "bad"].includes(kind) ? kind : "";
+  }
+
   _composerFocusState() {
     const active = this._activePanelElement();
     const fieldIds = [
@@ -1609,6 +1748,12 @@ class MeshNetPanel extends HTMLElement {
       "meshnet-traceroute-status-reload",
       "meshnet-traceroute-confirm",
       "meshnet-traceroute-cancel",
+      "meshnet-neighbor-info-gateway",
+      "meshnet-neighbor-info-target",
+      "meshnet-neighbor-info-status-load",
+      "meshnet-neighbor-info-start",
+      "meshnet-neighbor-info-confirm",
+      "meshnet-neighbor-info-cancel",
     ];
     if (!active || !this.contains(active) || !fieldIds.includes(active.id)) return null;
     return {
@@ -2884,9 +3029,34 @@ class MeshNetPanel extends HTMLElement {
     }
   }
 
+  _messageReactionIsValid(value) {
+    if (typeof value !== "string" || Array.from(value).length !== 1) return false;
+    try {
+      const bytes = new TextEncoder().encode(value);
+      return bytes.length >= 1
+        && bytes.length <= 4
+        && new TextDecoder("utf-8", { fatal: true }).decode(bytes) === value;
+    } catch (_ignored) {
+      return false;
+    }
+  }
+
+  _messageMeshPacketId(value) {
+    if (value == null) return null;
+    if (typeof value !== "string" || !/^meshtastic:[0-9]{1,10}$/.test(value)) return null;
+    const packetId = Number.parseInt(value.slice("meshtastic:".length), 10);
+    return Number.isSafeInteger(packetId)
+      && packetId > 0
+      && packetId <= 0xffffffff
+      && value === `meshtastic:${packetId}`
+      ? value
+      : null;
+  }
+
   _sanitizeMessageRecord(record) {
     if (!record || typeof record !== "object" || Array.isArray(record)) return null;
     const messageId = this._messageString(record.message_id, 256, { required: true });
+    const meshPacketId = this._messageMeshPacketId(record.mesh_packet_id);
     const protocol = this._messageString(record.protocol, 32, { required: true });
     const gatewayId = this._messageString(record.gateway_id, 128, { required: true });
     const sender = this._messageString(record.sender, 128);
@@ -2897,6 +3067,7 @@ class MeshNetPanel extends HTMLElement {
     const raw = record.raw == null ? {} : record.raw;
     if (
       !messageId
+      || (record.mesh_packet_id != null && meshPacketId == null)
       || !protocol
       || !gatewayId
       || (record.sender != null && sender == null)
@@ -2951,6 +3122,19 @@ class MeshNetPanel extends HTMLElement {
     if (delivery === "broadcast" && channel !== "0") return null;
     if (delivery === "channel" && (channel == null || channel === "0")) return null;
 
+    const reactionPresent = Object.prototype.hasOwnProperty.call(record, "reaction")
+      && record.reaction != null;
+    const replyPresent = Object.prototype.hasOwnProperty.call(record, "reply_to_message_id")
+      && record.reply_to_message_id != null;
+    if (reactionPresent && !replyPresent) return null;
+    const reaction = reactionPresent ? record.reaction : null;
+    const replyToMessageId = replyPresent
+      ? this._messageString(record.reply_to_message_id, 256, { required: true })
+      : null;
+    if (reactionPresent && (!this._messageReactionIsValid(reaction) || !replyToMessageId)) {
+      return null;
+    }
+
     const safeRaw = {};
     if (["blocked", "queued", "sent", "failed"].includes(raw.status)) {
       safeRaw.status = raw.status;
@@ -2960,6 +3144,7 @@ class MeshNetPanel extends HTMLElement {
     }
     return {
       message_id: messageId,
+      mesh_packet_id: meshPacketId,
       protocol,
       gateway_id: gatewayId,
       sender,
@@ -2974,6 +3159,8 @@ class MeshNetPanel extends HTMLElement {
       direction,
       delivery,
       peer_node_key: delivery === "direct" ? peerNodeKey : null,
+      reaction,
+      reply_to_message_id: replyToMessageId,
       raw: safeRaw,
     };
   }
@@ -3135,7 +3322,136 @@ class MeshNetPanel extends HTMLElement {
     return Number.isFinite(timestamp) ? new Date(timestamp).toLocaleString() : "Unknown time";
   }
 
-  _renderMessages(focusState = null) {
+  _messageTimelineEntries(messages) {
+    const safeMessages = (Array.isArray(messages) ? messages : [])
+      .map((message) => this._sanitizeMessageRecord(message))
+      .filter((message) => message != null);
+    const targets = new Map();
+    const registerTarget = (identifier, message) => {
+      if (!identifier) return;
+      if (targets.has(identifier) && targets.get(identifier) !== message) {
+        targets.set(identifier, null);
+      } else if (!targets.has(identifier)) {
+        targets.set(identifier, message);
+      }
+    };
+    safeMessages.forEach((message) => {
+      if (message.reaction != null) return;
+      registerTarget(message.message_id, message);
+      registerTarget(message.mesh_packet_id, message);
+    });
+    const attached = new Set();
+    const reactionsByTarget = new Map();
+    safeMessages.forEach((message) => {
+      if (message.reaction == null) return;
+      const target = targets.get(message.reply_to_message_id);
+      if (!target) return;
+      attached.add(message);
+      if (!reactionsByTarget.has(target)) reactionsByTarget.set(target, new Map());
+      const groups = reactionsByTarget.get(target);
+      if (!groups.has(message.reaction)) {
+        groups.set(message.reaction, {
+          reaction: message.reaction,
+          count: 0,
+          senders: new Set(),
+        });
+      }
+      const group = groups.get(message.reaction);
+      group.count += 1;
+      group.senders.add(message.sender || "unknown");
+    });
+    return safeMessages
+      .filter((message) => !attached.has(message))
+      .map((message) => ({
+        message,
+        orphan_reaction: message.reaction != null,
+        reactions: [...(reactionsByTarget.get(message) || new Map()).values()].map(
+          (group) => ({
+            reaction: group.reaction,
+            count: group.count,
+            senders: [...group.senders].sort((left, right) => this._compareText(left, right)),
+          }),
+        ),
+      }));
+  }
+
+  _messageReactionBadges(reactions) {
+    if (!Array.isArray(reactions) || !reactions.length) return "";
+    return `<div class="message-reactions" aria-label="Reactions">${reactions.map((group) => {
+      const senders = group.senders.join(", ");
+      const description = `${group.reaction} from ${senders}`;
+      return `<span class="message-reaction" title="${this._escape(description)}" aria-label="${this._escape(description)}"><span aria-hidden="true">${this._escape(group.reaction)}</span>${group.count > 1 ? ` <span aria-hidden="true">${group.count}</span>` : ""}</span>`;
+    }).join("")}</div>`;
+  }
+
+  _messageTimelineRow(entry) {
+    const message = entry.message;
+    const receiver = message.receiver
+      || (message.channel == null ? "unknown" : `Channel ${message.channel}`);
+    const status = message.raw.status ? ` · ${this._escape(message.raw.status)}` : "";
+    const meta = `${this._escape(message.sender || "unknown")} → ${this._escape(receiver)} · ${this._escape(this._messageTimestampLabel(message.timestamp))}${status}`;
+    const body = entry.orphan_reaction
+      ? `<div class="orphan-reaction"><span class="message-reaction" aria-hidden="true">${this._escape(message.reaction)}</span><span>Reaction to a message that is not available in this conversation or loaded history: <code>${this._escape(message.reply_to_message_id)}</code></span></div>`
+      : `<div>${this._escape(message.text)}</div>${this._messageReactionBadges(entry.reactions)}`;
+    return `
+      <article class="message-row ${message.direction === "tx" ? "tx" : "rx"}${entry.orphan_reaction ? " reaction-orphan" : ""}" data-message-id="${this._escape(message.message_id)}">
+        ${body}
+        <div class="message-meta">${meta}</div>
+      </article>
+    `;
+  }
+
+  _captureMessageScrollState() {
+    if (typeof this.querySelector !== "function") return null;
+    const timeline = this.querySelector("#meshnet-message-timeline");
+    if (!timeline || typeof timeline.getAttribute !== "function") return null;
+    const conversationKey = timeline.getAttribute("data-conversation-key");
+    const scrollTop = timeline.scrollTop;
+    const scrollHeight = timeline.scrollHeight;
+    const clientHeight = timeline.clientHeight;
+    if (
+      typeof conversationKey !== "string"
+      || !conversationKey
+      || ![scrollTop, scrollHeight, clientHeight].every(
+        (value) => typeof value === "number" && Number.isFinite(value) && value >= 0,
+      )
+    ) return null;
+    const maximumScroll = Math.max(0, scrollHeight - clientHeight);
+    return {
+      conversation_key: conversationKey,
+      scroll_top: Math.min(maximumScroll, scrollTop),
+      near_bottom: maximumScroll - scrollTop <= 64,
+    };
+  }
+
+  _restoreMessageScrollState(state, conversationKey) {
+    if (typeof this.querySelector !== "function") return;
+    const timeline = this.querySelector("#meshnet-message-timeline");
+    if (!timeline) return;
+    const scrollHeight = timeline.scrollHeight;
+    const clientHeight = timeline.clientHeight;
+    if (
+      typeof scrollHeight !== "number"
+      || !Number.isFinite(scrollHeight)
+      || typeof clientHeight !== "number"
+      || !Number.isFinite(clientHeight)
+    ) return;
+    const maximumScroll = Math.max(0, scrollHeight - clientHeight);
+    if (
+      !state
+      || state.conversation_key !== conversationKey
+      || state.near_bottom === true
+    ) {
+      timeline.scrollTop = maximumScroll;
+      return;
+    }
+    const previous = typeof state.scroll_top === "number" && Number.isFinite(state.scroll_top)
+      ? state.scroll_top
+      : 0;
+    timeline.scrollTop = Math.min(maximumScroll, Math.max(0, previous));
+  }
+
+  _renderMessages(focusState = null, scrollState = null) {
     const snapshot = this._snapshot || { nodes: {}, gateways: {}, recent_messages: [] };
     const nodes = this._nodesWithExactMeshtasticNameHints(
       Object.values(snapshot.nodes || {}).filter(
@@ -3147,6 +3463,7 @@ class MeshNetPanel extends HTMLElement {
     );
     const conversations = this._messageConversations(this._messages, nodes);
     const selected = this._selectMessageConversation(this._messageConversation, conversations);
+    const timelineEntries = this._messageTimelineEntries(selected.messages).slice(-200);
     const directDelivery = this._draft.delivery === "direct";
     const recipientCount = this._recipientChoices(nodes)
       .filter((choice) => !choice.ambiguous && !choice.invalidIdentity).length;
@@ -3166,6 +3483,10 @@ class MeshNetPanel extends HTMLElement {
         .timeline { min-height: 260px; max-height: 52vh; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
         .message-row { max-width: min(82%, 720px); border-radius: 9px; padding: 9px 11px; background: var(--secondary-background-color); overflow-wrap: anywhere; }
         .message-row.tx { align-self: end; background: color-mix(in srgb, var(--primary-color) 18%, var(--card-background-color)); }
+        .message-reactions { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+        .message-reaction { display: inline-flex; align-items: center; gap: 3px; border: 1px solid var(--divider-color); border-radius: 999px; padding: 2px 7px; background: var(--card-background-color); font-size: 13px; }
+        .orphan-reaction { display: flex; align-items: center; gap: 7px; color: var(--secondary-text-color); font-size: 12px; }
+        .orphan-reaction code { overflow-wrap: anywhere; }
         .message-meta, .label, .field-help { color: var(--secondary-text-color); font-size: 11px; }
         .composer { display: grid; gap: 9px; border-top: 1px solid var(--divider-color); padding-top: 12px; }
         .composer label { display: grid; gap: 4px; color: var(--secondary-text-color); font-size: 12px; }
@@ -3192,13 +3513,8 @@ class MeshNetPanel extends HTMLElement {
             ${this._messageError ? `<p class="bad">${this._escape(this._messageError)}</p>` : ""}
           </aside>
           <main class="card">
-            <div class="timeline" id="meshnet-message-timeline" aria-live="polite">
-              ${selected.messages.slice(-200).map((message) => `
-                <article class="message-row ${message.direction === "tx" ? "tx" : "rx"}">
-                  <div>${this._escape(message.text)}</div>
-                  <div class="message-meta">${this._escape(message.sender || "unknown")} → ${this._escape(message.receiver || (message.channel == null ? "unknown" : `Channel ${message.channel}`))} · ${this._escape(this._messageTimestampLabel(message.timestamp))}${message.raw.status ? ` · ${this._escape(message.raw.status)}` : ""}</div>
-                </article>
-              `).join("") || '<div class="label">No messages in this conversation.</div>'}
+            <div class="timeline" id="meshnet-message-timeline" data-conversation-key="${this._escape(selected.key)}" aria-live="polite">
+              ${timelineEntries.map((entry) => this._messageTimelineRow(entry)).join("") || '<div class="label">No messages in this conversation.</div>'}
             </div>
             <form class="composer" id="meshnet-send-form">
               <div class="composer-controls">
@@ -3241,6 +3557,10 @@ class MeshNetPanel extends HTMLElement {
     this._safeStep("bind_messages", "binding", () => this._bindMessageControls(conversations));
     this._safeStep("bind_composer", "binding", () => this._bindComposer());
     this._safeStep("restore_focus", "focus", () => this._restoreComposerFocus(focusState));
+    this._safeStep("restore_focus", "focus", () => this._restoreMessageScrollState(
+      scrollState,
+      selected.key,
+    ));
   }
 
   _bindMessageControls(conversations) {
@@ -3309,6 +3629,12 @@ class MeshNetPanel extends HTMLElement {
     const traceStatusReload = this.querySelector("#meshnet-traceroute-status-reload");
     const traceConfirm = this.querySelector("#meshnet-traceroute-confirm");
     const traceCancel = this.querySelector("#meshnet-traceroute-cancel");
+    const neighborGateway = this.querySelector("#meshnet-neighbor-info-gateway");
+    const neighborTarget = this.querySelector("#meshnet-neighbor-info-target");
+    const neighborStatusLoad = this.querySelector("#meshnet-neighbor-info-status-load");
+    const neighborStart = this.querySelector("#meshnet-neighbor-info-start");
+    const neighborConfirm = this.querySelector("#meshnet-neighbor-info-confirm");
+    const neighborCancel = this.querySelector("#meshnet-neighbor-info-cancel");
     [
       remoteGateway,
       remoteTarget,
@@ -3322,6 +3648,12 @@ class MeshNetPanel extends HTMLElement {
       traceStatusReload,
       traceConfirm,
       traceCancel,
+      neighborGateway,
+      neighborTarget,
+      neighborStatusLoad,
+      neighborStart,
+      neighborConfirm,
+      neighborCancel,
     ].filter(Boolean).forEach((control) => {
       control.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
     });
@@ -3436,7 +3768,63 @@ class MeshNetPanel extends HTMLElement {
         this._safeRender("render");
       });
     }
+    if (neighborGateway) {
+      neighborGateway.addEventListener("change", () => {
+        this._neighborInfoGatewayId = neighborGateway.value;
+        this._neighborInfoConfirmation = null;
+        this._neighborInfoStatus = null;
+        this._safeRender("render");
+      });
+    }
+    if (neighborTarget) {
+      neighborTarget.addEventListener("change", () => {
+        this._resetNeighborInfoTarget(neighborTarget.value);
+        this._safeRender("render");
+      });
+    }
+    if (neighborStatusLoad) {
+      neighborStatusLoad.addEventListener("click", () => {
+        this._safeStep("neighbor_info_event", "binding", () => {
+          void this._loadNeighborInfoStatus(
+            neighborTarget && neighborTarget.value || this._neighborInfoTargetNode,
+          );
+        });
+      });
+    }
+    const requestNeighborInfo = () => this._requestNeighborInfo(
+      neighborGateway && neighborGateway.value || this._neighborInfoGatewayId,
+      neighborTarget && neighborTarget.value || this._neighborInfoTargetNode,
+    );
+    if (neighborStart) {
+      neighborStart.addEventListener("click", () => {
+        this._safeStep("neighbor_info_event", "binding", () => requestNeighborInfo());
+      });
+    }
+    if (neighborConfirm) {
+      neighborConfirm.addEventListener("click", () => {
+        this._safeStep("neighbor_info_event", "binding", () => requestNeighborInfo());
+      });
+    }
+    if (neighborCancel) {
+      neighborCancel.addEventListener("click", () => {
+        this._neighborInfoConfirmation = null;
+        this._neighborInfoStatus = { kind: "warn", text: "NeighborInfo request cancelled before transmission." };
+        this._safeRender("render");
+      });
+    }
     this._maybeLoadTracerouteStatus();
+  }
+
+  _resetNeighborInfoTarget(targetNode) {
+    this._neighborInfoStatusRequestGeneration += 1;
+    this._neighborInfoTargetNode = targetNode;
+    this._neighborInfoConfirmation = null;
+    this._neighborInfoResult = null;
+    this._neighborInfoStatus = null;
+    this._neighborInfoStatusData = null;
+    this._neighborInfoStatusReady = false;
+    this._neighborInfoStatusLoading = false;
+    this._neighborInfoStatusTarget = "";
   }
 
   _resetRemoteSelection(gatewayId, targetNode) {
@@ -4318,7 +4706,7 @@ class MeshNetPanel extends HTMLElement {
       const result = this._sanitizeTracerouteResult(response, gatewayId, targetNode);
       this._tracerouteResults[targetNode] = result;
       const nextAllowedAt = result.next_allowed_at
-        || new Date(Date.now() + 3600 * 1000).toISOString();
+        || new Date(Date.now() + 60 * 1000).toISOString();
       this._tracerouteGlobalStatus = {
         schema_version: 1,
         status: "cooldown",
@@ -4327,7 +4715,7 @@ class MeshNetPanel extends HTMLElement {
         target_node: targetNode,
         reserved_at: result.completed_at || new Date(Date.now()).toISOString(),
         next_allowed_at: nextAllowedAt,
-        remaining_seconds: 3600,
+        remaining_seconds: 60,
         result_updated_at: result.completed_at,
         result,
         loaded_at_ms: Date.now(),
@@ -4335,7 +4723,7 @@ class MeshNetPanel extends HTMLElement {
       this._tracerouteStatusReady = true;
       this._tracerouteStatus = result.next_allowed_at
         ? { kind: "good", text: `Traceroute complete. Next permitted attempt: ${this._timestampDisplay(result.next_allowed_at)}.` }
-        : { kind: "good", text: "Traceroute complete. The server still enforces the one-hour cooldown." };
+        : { kind: "good", text: "Traceroute complete. The server still enforces the one-minute cooldown." };
       this._markOperationSuccess("traceroute_request");
     } catch (error) {
       if (generation !== this._tracerouteRequestGeneration) return;
@@ -4352,8 +4740,8 @@ class MeshNetPanel extends HTMLElement {
         gateway_id: gatewayId,
         target_node: targetNode,
         reserved_at: new Date(failedAt).toISOString(),
-        next_allowed_at: new Date(failedAt + 3600 * 1000).toISOString(),
-        remaining_seconds: 3600,
+        next_allowed_at: new Date(failedAt + 60 * 1000).toISOString(),
+        remaining_seconds: 60,
         result_updated_at: null,
         result: null,
         loaded_at_ms: failedAt,
@@ -4443,6 +4831,305 @@ class MeshNetPanel extends HTMLElement {
       snr_back: snr(response.snr_back),
       next_allowed_at: nextAllowedAt,
     };
+  }
+
+  async _loadNeighborInfoStatus(targetNode) {
+    if (
+      this._neighborInfoStatusLoading
+      || this._neighborInfoBusy
+      || !this._isExactTracerouteTarget(targetNode)
+      || !this._hass
+      || typeof this._hass.callWS !== "function"
+    ) return;
+    const generation = ++this._neighborInfoStatusRequestGeneration;
+    this._neighborInfoTargetNode = targetNode;
+    this._neighborInfoStatusTarget = targetNode;
+    this._neighborInfoStatusLoading = true;
+    this._neighborInfoStatusReady = false;
+    this._neighborInfoStatusData = null;
+    this._neighborInfoConfirmation = null;
+    this._neighborInfoStatus = { kind: "warn", text: "Checking persisted NeighborInfo cooldowns…" };
+    this._safeRender("render");
+    try {
+      const response = await this._withTimeout(this._hass.callWS({
+        type: "meshnet/neighbor_info/status",
+        target_node: targetNode,
+      }), 15000);
+      if (generation !== this._neighborInfoStatusRequestGeneration) return;
+      const status = this._sanitizeNeighborInfoStatus(response, targetNode);
+      this._neighborInfoStatusData = status;
+      this._neighborInfoStatusReady = true;
+      this._neighborInfoStatusTarget = targetNode;
+      this._neighborInfoResult = status.result;
+      this._neighborInfoStatus = this._neighborInfoCooldownActive()
+        ? { kind: "warn", text: `NeighborInfo cooldown active for ${status.remaining_seconds} more seconds.` }
+        : { kind: "good", text: "Persisted NeighborInfo status loaded. One explicit request may be prepared." };
+      this._markOperationSuccess("neighbor_info_status");
+    } catch (error) {
+      if (generation !== this._neighborInfoStatusRequestGeneration) return;
+      this._neighborInfoStatusData = null;
+      this._neighborInfoStatusReady = false;
+      this._neighborInfoResult = null;
+      this._recordFailure(
+        "neighbor_info_status",
+        this._safeErrorCode(error) === "timeout" ? "timeout" : this._safeErrorType(error) === "PanelSchemaError" ? "schema" : "websocket",
+        error,
+      );
+      this._neighborInfoStatus = {
+        kind: "bad",
+        text: this._neighborInfoErrorText(error, "status"),
+      };
+    } finally {
+      if (generation === this._neighborInfoStatusRequestGeneration) {
+        this._neighborInfoStatusLoading = false;
+        this._safeRender("render");
+      }
+    }
+  }
+
+  _sanitizeNeighborInfoStatus(response, targetNode) {
+    if (
+      !response
+      || typeof response !== "object"
+      || Array.isArray(response)
+      || response.schema_version !== 1
+      || response.scope !== "integration_and_target"
+      || response.target_node !== targetNode
+      || !this._isExactTracerouteTarget(response.target_node)
+      || !["available", "cooldown"].includes(response.status)
+    ) throw { name: "PanelSchemaError", code: "invalid_format" };
+    const seconds = (value) => {
+      if (!Number.isSafeInteger(value) || value < 0 || value > 86400) {
+        throw { name: "PanelSchemaError", code: "invalid_format" };
+      }
+      return value;
+    };
+    const globalRemaining = seconds(response.global_remaining_seconds);
+    const targetRemaining = seconds(response.target_remaining_seconds);
+    const remaining = seconds(response.remaining_seconds);
+    if (
+      remaining !== Math.max(globalRemaining, targetRemaining)
+      || (response.status === "available" && remaining !== 0)
+      || (response.status === "cooldown" && remaining < 1)
+    ) throw { name: "PanelSchemaError", code: "invalid_format" };
+    const timestamp = (value, required = false) => {
+      if (value == null && !required) return null;
+      return this._validatedTimestamp(value);
+    };
+    const gatewayId = response.gateway_id == null ? null : response.gateway_id;
+    if (gatewayId != null && !this._validOperatorGatewayId(gatewayId)) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    const nextAllowedAt = timestamp(response.next_allowed_at, remaining > 0);
+    const reservedAt = timestamp(response.reserved_at);
+    const resultUpdatedAt = timestamp(response.result_updated_at);
+    let result = null;
+    if (response.result != null) {
+      const resultGateway = response.result && response.result.gateway_id;
+      if (!this._validOperatorGatewayId(resultGateway) || !resultUpdatedAt) {
+        throw { name: "PanelSchemaError", code: "invalid_format" };
+      }
+      result = this._sanitizeNeighborInfoResult(response.result, resultGateway, targetNode, {
+        persisted: true,
+        nextAllowedAt,
+      });
+    }
+    return {
+      schema_version: 1,
+      scope: "integration_and_target",
+      target_node: targetNode,
+      status: response.status,
+      global_remaining_seconds: globalRemaining,
+      target_remaining_seconds: targetRemaining,
+      remaining_seconds: remaining,
+      next_allowed_at: nextAllowedAt,
+      gateway_id: gatewayId,
+      reserved_at: reservedAt,
+      result_updated_at: resultUpdatedAt,
+      result,
+      loaded_at_ms: Date.now(),
+    };
+  }
+
+  _sanitizeNeighborInfoResult(
+    response,
+    gatewayId,
+    targetNode,
+    { persisted = false, nextAllowedAt = null } = {},
+  ) {
+    if (
+      !response
+      || typeof response !== "object"
+      || Array.isArray(response)
+      || response.schema_version !== 1
+      || response.gateway_id !== gatewayId
+      || response.source !== targetNode
+      || !this._isExactTracerouteTarget(response.destination)
+      || response.channel !== 0
+      || !Number.isSafeInteger(response.node_broadcast_interval_secs)
+      || response.node_broadcast_interval_secs < 0
+      || response.node_broadcast_interval_secs > 31536000
+      || !Array.isArray(response.neighbors)
+      || response.neighbors.length > 10
+    ) throw { name: "PanelSchemaError", code: "invalid_format" };
+    const seen = new Set();
+    const neighbors = response.neighbors.map((neighbor) => {
+      if (
+        !neighbor
+        || typeof neighbor !== "object"
+        || Array.isArray(neighbor)
+        || !this._isExactTracerouteTarget(neighbor.node_id)
+        || seen.has(neighbor.node_id)
+        || typeof neighbor.snr !== "number"
+        || !Number.isFinite(neighbor.snr)
+        || neighbor.snr < -128
+        || neighbor.snr > 128
+      ) throw { name: "PanelSchemaError", code: "invalid_format" };
+      seen.add(neighbor.node_id);
+      return { node_id: neighbor.node_id, snr: neighbor.snr };
+    });
+    const completedAt = this._validatedTimestamp(response.completed_at);
+    const allowedAt = persisted
+      ? nextAllowedAt
+      : this._validatedTimestamp(response.next_allowed_at);
+    return {
+      schema_version: 1,
+      gateway_id: gatewayId,
+      source: targetNode,
+      destination: response.destination,
+      channel: 0,
+      node_broadcast_interval_secs: response.node_broadcast_interval_secs,
+      neighbors,
+      completed_at: completedAt,
+      next_allowed_at: allowedAt,
+    };
+  }
+
+  _neighborInfoCooldownActive() {
+    const status = this._neighborInfoStatusData;
+    if (!this._neighborInfoStatusReady || !status || status.status !== "cooldown") return false;
+    const absolute = Date.parse(status.next_allowed_at);
+    const relative = Number.isFinite(status.loaded_at_ms)
+      ? status.loaded_at_ms + status.remaining_seconds * 1000
+      : Number.NaN;
+    return (Number.isFinite(absolute) && absolute > Date.now())
+      || (Number.isFinite(relative) && relative > Date.now());
+  }
+
+  async _requestNeighborInfo(gatewayId, targetNode) {
+    if (this._neighborInfoBusy) return;
+    if (!this._validOperatorGatewayId(gatewayId) || !this._isExactTracerouteTarget(targetNode)) {
+      this._neighborInfoConfirmation = null;
+      this._neighborInfoStatus = { kind: "bad", text: "Choose one exact Bluetooth gateway and Meshtastic node." };
+      this._safeRender("render");
+      return;
+    }
+    this._neighborInfoGatewayId = gatewayId;
+    this._neighborInfoTargetNode = targetNode;
+    if (!this._neighborInfoStatusReady || this._neighborInfoStatusTarget !== targetNode) {
+      this._neighborInfoConfirmation = null;
+      this._neighborInfoStatus = { kind: "bad", text: "Load persisted NeighborInfo status for this exact target before enabling RF control." };
+      this._safeRender("render");
+      return;
+    }
+    if (this._neighborInfoCooldownActive()) {
+      this._neighborInfoConfirmation = null;
+      this._neighborInfoStatus = { kind: "warn", text: "A global or same-target NeighborInfo cooldown is active. Wait and reload persisted status." };
+      this._safeRender("render");
+      return;
+    }
+    if (
+      !this._neighborInfoConfirmation
+      || this._neighborInfoConfirmation.gateway_id !== gatewayId
+      || this._neighborInfoConfirmation.target_node !== targetNode
+    ) {
+      this._neighborInfoConfirmation = { gateway_id: gatewayId, target_node: targetNode };
+      this._neighborInfoStatus = { kind: "warn", text: "Review the experimental RF notice, then confirm this one NeighborInfo request." };
+      this._safeRender("render");
+      return;
+    }
+    if (!this._hass || typeof this._hass.callWS !== "function") return;
+    const generation = ++this._neighborInfoRequestGeneration;
+    this._neighborInfoConfirmation = null;
+    this._neighborInfoBusy = true;
+    this._neighborInfoResult = null;
+    this._neighborInfoStatus = { kind: "warn", text: "One NeighborInfo request submitted; waiting for a validated response…" };
+    this._safeRender("render");
+    try {
+      const response = await this._withTimeout(this._hass.callWS({
+        type: "meshnet/neighbor_info",
+        gateway_id: gatewayId,
+        target_node: targetNode,
+      }), 130000);
+      if (generation !== this._neighborInfoRequestGeneration) return;
+      const result = this._sanitizeNeighborInfoResult(response, gatewayId, targetNode);
+      const now = Date.now();
+      this._neighborInfoResult = result;
+      this._neighborInfoStatusData = {
+        schema_version: 1,
+        scope: "integration_and_target",
+        target_node: targetNode,
+        status: "cooldown",
+        global_remaining_seconds: 180,
+        target_remaining_seconds: 180,
+        remaining_seconds: 180,
+        next_allowed_at: result.next_allowed_at,
+        gateway_id: gatewayId,
+        reserved_at: result.completed_at,
+        result_updated_at: result.completed_at,
+        result,
+        loaded_at_ms: now,
+      };
+      this._neighborInfoStatusReady = true;
+      this._neighborInfoStatusTarget = targetNode;
+      this._neighborInfoStatus = { kind: "good", text: "NeighborInfo response validated. Cooldowns are active; do not request again yet." };
+      this._markOperationSuccess("neighbor_info_request");
+    } catch (error) {
+      if (generation !== this._neighborInfoRequestGeneration) return;
+      this._recordFailure(
+        "neighbor_info_request",
+        this._safeErrorCode(error) === "timeout" ? "timeout" : this._safeErrorType(error) === "PanelSchemaError" ? "schema" : "websocket",
+        error,
+      );
+      const now = Date.now();
+      this._neighborInfoResult = null;
+      this._neighborInfoStatusData = {
+        schema_version: 1,
+        scope: "integration_and_target",
+        target_node: targetNode,
+        status: "cooldown",
+        global_remaining_seconds: 180,
+        target_remaining_seconds: 180,
+        remaining_seconds: 180,
+        next_allowed_at: new Date(now + 180000).toISOString(),
+        gateway_id: gatewayId,
+        reserved_at: new Date(now).toISOString(),
+        result_updated_at: null,
+        result: null,
+        loaded_at_ms: now,
+      };
+      this._neighborInfoStatusReady = true;
+      this._neighborInfoStatusTarget = targetNode;
+      this._neighborInfoStatus = { kind: "warn", text: this._neighborInfoErrorText(error, "request") };
+    } finally {
+      if (generation === this._neighborInfoRequestGeneration) {
+        this._neighborInfoBusy = false;
+        this._safeRender("render");
+      }
+    }
+  }
+
+  _neighborInfoErrorText(error, phase = "request") {
+    const fixed = {
+      neighbor_info_status_failed: "Persisted NeighborInfo cooldowns could not be verified. RF control remains locked.",
+      neighbor_info_failed: "NeighborInfo did not return a validated response. RF may have been sent; do not retry until persisted status is reloaded after the cooldown.",
+      unauthorized: "Administrator access is required for NeighborInfo controls.",
+    };
+    const mapped = fixed[this._operatorErrorCode(error)];
+    if (mapped) return mapped;
+    return phase === "status"
+      ? "Persisted NeighborInfo cooldowns could not be verified. RF control remains locked."
+      : "NeighborInfo failed or timed out. RF may have been sent; do not retry blindly.";
   }
 
   _validatedTimestamp(value) {
@@ -5327,10 +6014,16 @@ class MeshNetPanel extends HTMLElement {
       ? node.routing
       : null;
     if (!routing || routing.neighbors_via_mqtt !== false) return null;
-    if (!Array.isArray(routing.neighbors) || routing.neighbors.length > 64) return null;
+    const provenance = routing.neighbors_provenance == null
+      ? "passive"
+      : ["passive", "manual_request"].includes(routing.neighbors_provenance)
+        ? routing.neighbors_provenance
+        : null;
+    if (!provenance) return null;
+    if (!Array.isArray(routing.neighbors) || routing.neighbors.length > 10) return null;
     if (!Number.isSafeInteger(routing.neighbor_count)
       || routing.neighbor_count < 0
-      || routing.neighbor_count > 64
+      || routing.neighbor_count > 10
       || routing.neighbor_count !== routing.neighbors.length) {
       return null;
     }
@@ -5355,7 +6048,7 @@ class MeshNetPanel extends HTMLElement {
       const canonical = this._parseMeshtasticNodeId(value);
       return Boolean(canonical && value === canonical);
     }))];
-    return { source, neighbors };
+    return { source, neighbors, provenance };
   }
 
   _hopsGatewayId(node) {
@@ -5486,6 +6179,16 @@ class MeshNetPanel extends HTMLElement {
     return Math.min(320, Math.max(70, compressed));
   }
 
+  _formatEdgeDistanceMiles(distanceMeters) {
+    if (
+      typeof distanceMeters !== "number"
+      || !Number.isFinite(distanceMeters)
+      || distanceMeters < 0
+    ) return null;
+    const miles = distanceMeters / 1609.344;
+    return `${miles < 10 ? miles.toFixed(1) : Math.round(miles)} mi`;
+  }
+
   _passiveTopology(nodes, gateways, limit) {
     const allNodes = nodes.filter(
       (node) => node && node.node_key != null && String(node.node_key),
@@ -5563,23 +6266,33 @@ class MeshNetPanel extends HTMLElement {
     });
     const edges = [];
     const edgeKeys = new Set();
-    const addEdge = (from, to, type) => {
+    const edgeByKey = new Map();
+    const addEdge = (from, to, type, { provenance = null } = {}) => {
       if (!from || !to || from === to) return;
       const endpoints = [from, to].sort();
       const key = `${type}:${endpoints[0]}:${endpoints[1]}`;
-      if (edgeKeys.has(key)) return;
+      if (edgeKeys.has(key)) {
+        const existing = edgeByKey.get(key);
+        if (existing && provenance === "manual_request") {
+          existing.provenance = "manual_request";
+        }
+        return;
+      }
       edgeKeys.add(key);
       const distance = this._haversineMeters(
         endpointLocations.get(from),
         endpointLocations.get(to),
       );
-      edges.push({
+      const edge = {
         from,
         to,
         type,
+        provenance,
         distance_meters: distance,
         target_length: this._edgeTargetLength(distance),
-      });
+      };
+      edges.push(edge);
+      edgeByKey.set(key, edge);
     };
 
     visibleNodes.forEach((node) => {
@@ -5594,9 +6307,11 @@ class MeshNetPanel extends HTMLElement {
         neighborEvidence.neighbors.forEach((neighbor) => {
           const target = this._resolveRouteIdentifier(visibleAliases, neighbor);
           if (source && target) {
-            // NeighborInfo establishes the passive edge. Only independently
+            // NeighborInfo establishes a cached evidence edge. Only independently
             // validated node coordinates may size its physical-distance spring.
-            addEdge(`node:${source}`, `node:${target}`, "neighbor");
+            addEdge(`node:${source}`, `node:${target}`, "neighbor", {
+              provenance: neighborEvidence.provenance,
+            });
           }
         });
       }
@@ -5633,8 +6348,8 @@ class MeshNetPanel extends HTMLElement {
       <section class="topology">
         <div class="topology-heading">
           <strong class="topology-copy">
-            <span>Cached passive topology — no traceroutes sent</span>
-            <span class="topology-note">Edges are last received evidence, not a live route. Fresh locally received NeighborInfo expires after one hour. Distance changes spring length only.</span>
+            <span>Cached evidence topology — no traceroutes sent automatically</span>
+            <span class="topology-note">Edges are last received evidence, not a live route. NeighborInfo evidence expires after one hour; explicitly requested evidence is labeled. Distance changes spring length only.</span>
             ${fallbackCount ? `<span class="topology-note">${fallbackCount} gateway${fallbackCount === 1 ? " uses" : "s use"} Home Assistant location fallback.</span>` : ""}
           </strong>
           <label class="sort-control">Most recent
@@ -5644,18 +6359,23 @@ class MeshNetPanel extends HTMLElement {
           </label>
           <span class="label">${shown} · ${topology.gateways.length} gateways</span>
         </div>
-        <svg id="meshnet-topology-graph" viewBox="0 0 ${width} ${height}" role="img" aria-label="Cached passive mesh topology; no traceroutes sent">
+        <svg id="meshnet-topology-graph" viewBox="0 0 ${width} ${height}" role="img" aria-label="Cached mesh evidence topology; no traceroutes sent automatically">
         ${topology.edges.map((edge) => {
           const a = points.get(edge.from);
           const b = points.get(edge.to);
           if (!a || !b) return "";
-          const distance = edge.distance_meters == null
+          const miles = this._formatEdgeDistanceMiles(edge.distance_meters);
+          const distance = miles == null
             ? "Physical distance unavailable"
-            : `${Math.round(edge.distance_meters)} m great-circle distance`;
+            : `${miles} (${Math.round(edge.distance_meters)} m) great-circle distance`;
           const evidence = edge.type === "neighbor"
-            ? "Fresh local-RF NeighborInfo"
+            ? edge.provenance === "manual_request"
+              ? "Requested NeighborInfo"
+              : "Fresh local-RF NeighborInfo"
             : edge.type === "direct" ? "Direct local-RF observation" : "Cached route evidence";
-          return `<line class="link ${edge.type === "direct" ? "direct-link" : "route-link"}" data-graph-from="${this._escape(edge.from)}" data-graph-to="${this._escape(edge.to)}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"><title>${this._escape(`${evidence}; ${distance}`)}</title></line>`;
+          const line = `<line class="link ${edge.type === "direct" ? "direct-link" : "route-link"}" data-graph-from="${this._escape(edge.from)}" data-graph-to="${this._escape(edge.to)}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"><title>${this._escape(`${evidence}; ${distance}`)}</title></line>`;
+          const label = miles == null ? "" : `<text class="edge-distance" aria-hidden="true" data-graph-distance-from="${this._escape(edge.from)}" data-graph-distance-to="${this._escape(edge.to)}" x="${(a.x + b.x) / 2}" y="${(a.y + b.y) / 2 - 4}">${this._escape(miles)}</text>`;
+          return `${line}${label}`;
         }).join("")}
         ${topology.gateways.map((gateway) => {
           const point = points.get(`gateway:${gateway.gateway_id}`);
@@ -5675,7 +6395,7 @@ class MeshNetPanel extends HTMLElement {
             <text x="${point.x + 19}" y="${point.y + 4}">${this._escape(this._nodeCompactName(node).slice(0, 18))}</text>
           </g>`;
         }).join("")}
-        ${topology.edges.length ? "" : '<text class="topology-empty" x="500" y="610">No passive connection evidence yet</text>'}
+        ${topology.edges.length ? "" : '<text class="topology-empty" x="500" y="610">No cached connection evidence yet</text>'}
         </svg>
       </section>
     `;
@@ -5799,6 +6519,13 @@ class MeshNetPanel extends HTMLElement {
       line.setAttribute("y1", String(left.y));
       line.setAttribute("x2", String(right.x));
       line.setAttribute("y2", String(right.y));
+    });
+    svg.querySelectorAll("[data-graph-distance-from][data-graph-distance-to]").forEach((label) => {
+      const left = this._graphPositions.get(label.getAttribute("data-graph-distance-from"));
+      const right = this._graphPositions.get(label.getAttribute("data-graph-distance-to"));
+      if (!left || !right) return;
+      label.setAttribute("x", String((left.x + right.x) / 2));
+      label.setAttribute("y", String((left.y + right.y) / 2 - 4));
     });
     svg.querySelectorAll("[data-graph-key]").forEach((group) => {
       const point = this._graphPositions.get(group.getAttribute("data-graph-key"));

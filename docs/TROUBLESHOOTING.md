@@ -619,7 +619,7 @@ The MeshNet sidebar panel is admin-only by design. Use an admin Home Assistant a
 MeshNet 0.5.10 version-stamps the sidebar JavaScript URL. Restart Home Assistant
 after updating, then hard-refresh the browser once. The current panel has a
 separate **Delivery** selector, node sort selector, **Message** buttons, a Map
-link, and the heading **Cached passive topology — no traceroutes sent**.
+link, and the heading **Cached evidence topology — no traceroutes sent automatically**.
 
 ### Sidebar Control Loses Focus During Refresh
 

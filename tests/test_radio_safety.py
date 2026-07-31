@@ -69,13 +69,71 @@ def test_manual_traceroute_is_admin_websocket_only_with_no_background_callsite()
 
 
 def test_future_manual_traceroute_cooldown_is_documented() -> None:
-    """Keep the one-hour backend cooldown invariant visible to maintainers."""
+    """Keep the one-minute backend cooldown invariant visible to maintainers."""
     architecture = Path("docs/ARCHITECTURE.md").read_text(encoding="utf-8")
     usage = Path("docs/USAGE.md").read_text(encoding="utf-8")
 
-    assert "one manual traceroute across the integration every 3,600 seconds" in " ".join(
+    assert "one manual traceroute across the integration every 60 seconds" in " ".join(
         architecture.split()
     )
-    assert "one manual traceroute across the entire MeshNet integration per hour" in " ".join(
+    assert "one manual traceroute across the entire MeshNet integration per minute" in " ".join(
         usage.split()
     )
+
+
+def test_manual_neighbor_info_is_admin_websocket_only_without_polling() -> None:
+    """NeighborInfo RF requests exist only on the explicit bounded admin path."""
+    websocket_path = Path("custom_components/meshnet/websocket_api.py")
+    tree = ast.parse(websocket_path.read_text(encoding="utf-8"))
+    handlers = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and any(
+            isinstance(value, ast.Constant)
+            and value.value == "meshnet/neighbor_info"
+            for value in ast.walk(node)
+        )
+    ]
+    assert len(handlers) == 1
+    decorator_names = {
+        ast.unparse(decorator) for decorator in handlers[0].decorator_list
+    }
+    assert any(name.endswith("require_admin") for name in decorator_names)
+
+    services = Path("custom_components/meshnet/services.yaml").read_text(
+        encoding="utf-8"
+    )
+    integration = Path("custom_components/meshnet/__init__.py").read_text(
+        encoding="utf-8"
+    )
+    assert "neighbor_info:" not in services
+    assert "SERVICE_NEIGHBOR_INFO" not in integration
+
+    allowed_call_owners = {
+        handlers[0].name,
+        "async_manual_neighbor_info",
+        "_async_manual_neighbor_info",
+    }
+    for path in RUNTIME_PATHS:
+        if path.suffix != ".py":
+            continue
+        module = ast.parse(path.read_text(encoding="utf-8"))
+        for owner in (
+            node
+            for node in ast.walk(module)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ):
+            for call in (
+                node for node in ast.walk(owner) if isinstance(node, ast.Call)
+            ):
+                target = call.func
+                called_name = (
+                    target.attr
+                    if isinstance(target, ast.Attribute)
+                    else target.id
+                    if isinstance(target, ast.Name)
+                    else ""
+                )
+                if called_name == "async_manual_neighbor_info":
+                    assert owner.name in allowed_call_owners, (path, owner.name)

@@ -311,6 +311,10 @@ class MeshtasticBluetoothClient:
         self._settings = MeshtasticSettingsState()
         self._pending_admin_responses: dict[int, _PendingAdminResponse] = {}
         self._pending_traceroute_responses: dict[int, _PendingTracerouteResponse] = {}
+        self._pending_neighbor_info_responses: dict[
+            int, _PendingTracerouteResponse
+        ] = {}
+        self._manual_neighbor_info_response_packets: set[tuple[int, int]] = set()
         self._internal_admin_request_ids: deque[int] = deque(maxlen=128)
         self._remote_admin_sessions: dict[int, _RemoteAdminSession] = {}
         self._remote_settings: dict[int, MeshtasticSettingsState] = {}
@@ -350,6 +354,9 @@ class MeshtasticBluetoothClient:
         self._traceroute_request_count = 0
         self._traceroute_response_count = 0
         self._traceroute_timeout_count = 0
+        self._neighbor_info_request_count = 0
+        self._neighbor_info_response_count = 0
+        self._neighbor_info_timeout_count = 0
         self._last_connected_monotonic: float | None = None
 
     @property
@@ -679,6 +686,126 @@ class MeshtasticBluetoothClient:
             "reverse_route": [canonical, *reverse_nodes, local_id],
             "snr_towards": [float(value) / 4.0 for value in list(route.snr_towards)[:64]],
             "snr_back": [float(value) / 4.0 for value in list(route.snr_back)[:64]],
+        }
+
+    async def async_manual_neighbor_info(self, target_node: str) -> dict[str, Any]:
+        """Request one exact node's NeighborInfo once, without retrying."""
+        if not isinstance(target_node, str):
+            raise MeshtasticConfigurationError(
+                "NeighborInfo requires one exact Meshtastic node ID"
+            )
+        canonical = canonical_meshtastic_node_id(target_node)
+        if (
+            canonical is None
+            or target_node != canonical
+            or canonical in {"!00000000", "!ffffffff"}
+        ):
+            raise MeshtasticConfigurationError(
+                "NeighborInfo requires one exact Meshtastic node ID"
+            )
+        destination = int(canonical[1:], 16)
+        if destination == self._my_node_num or destination not in self._nodes:
+            raise MeshtasticConfigurationError(
+                "NeighborInfo requires one known remote Meshtastic node"
+            )
+        target = self._nodes[destination]
+        user = target.get("user") if isinstance(target, Mapping) else None
+        claimed_id = user.get("id") if isinstance(user, Mapping) else None
+        if (
+            not isinstance(claimed_id, str)
+            or claimed_id != canonical
+            or canonical_meshtastic_node_id(claimed_id) != canonical
+        ):
+            raise MeshtasticConfigurationError(
+                "NeighborInfo target identity is inconsistent"
+            )
+        if self._my_node_num is None:
+            raise MeshtasticNotConnectedError(
+                "Meshtastic Bluetooth local node identity is unavailable"
+            )
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[Any] = loop.create_future()
+        request_id: int | None = None
+        pending: _PendingTracerouteResponse | None = None
+        async with self._send_lock:
+            connection = self._connection
+            if not self.connected or connection is None:
+                raise MeshtasticNotConnectedError(
+                    "Meshtastic Bluetooth is not active"
+                )
+            request = mesh_pb2.NeighborInfo()
+            # Current firmware recognizes this exact dummy as a request and
+            # deliberately avoids ingesting it into the neighbor database.
+            request.neighbors.add(node_id=0, snr=0.0)
+            packet = mesh_pb2.MeshPacket()
+            packet.to = destination
+            setattr(packet, "from", self._my_node_num)
+            packet.channel = 0
+            packet.id = self._next_packet_id()
+            packet.want_ack = True
+            packet.priority = mesh_pb2.MeshPacket.Priority.RELIABLE
+            packet.decoded.portnum = portnums_pb2.NEIGHBORINFO_APP
+            packet.decoded.want_response = True
+            packet.decoded.payload = request.SerializeToString()
+            request_id = int(packet.id)
+            pending = _PendingTracerouteResponse(
+                future=future,
+                source=destination,
+                channel=0,
+            )
+            self._pending_neighbor_info_responses[request_id] = pending
+            to_radio = mesh_pb2.ToRadio()
+            to_radio.packet.CopyFrom(packet)
+            try:
+                await connection.async_send(to_radio.SerializeToString())
+            except BaseException:
+                if self._pending_neighbor_info_responses.get(request_id) is pending:
+                    self._pending_neighbor_info_responses.pop(request_id, None)
+                raise
+            self._neighbor_info_request_count += 1
+
+        try:
+            async with asyncio.timeout(self._admin_response_timeout):
+                report = await future
+        except TimeoutError as err:
+            self._neighbor_info_timeout_count += 1
+            raise MeshtasticConfigurationError(
+                "Meshtastic NeighborInfo response timed out; the request was not retried"
+            ) from err
+        finally:
+            if (
+                request_id is not None
+                and pending is not None
+                and self._pending_neighbor_info_responses.get(request_id) is pending
+            ):
+                self._pending_neighbor_info_responses.pop(request_id, None)
+
+        self._neighbor_info_response_count += 1
+        neighbors: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        for neighbor in list(report.neighbors)[:10]:
+            node_id = int(neighbor.node_id)
+            snr = float(neighbor.snr)
+            if (
+                node_id in {0, _BROADCAST_NUM, destination, self._my_node_num}
+                or node_id in seen
+                or not math.isfinite(snr)
+                or not -128 <= snr <= 128
+            ):
+                continue
+            seen.add(node_id)
+            neighbors.append({"node_id": f"!{node_id:08x}", "snr": snr})
+        interval = int(report.node_broadcast_interval_secs)
+        if not 0 <= interval <= 31_536_000:
+            interval = 0
+        return {
+            "correlation_id": str(request_id),
+            "source": canonical,
+            "destination": f"!{self._my_node_num:08x}",
+            "channel": 0,
+            "node_broadcast_interval_secs": interval,
+            "neighbors": neighbors,
         }
 
     def node_snapshot(self) -> dict[int, dict[str, Any]]:
@@ -1295,6 +1422,12 @@ class MeshtasticBluetoothClient:
             "traceroute_response_count": self._traceroute_response_count,
             "traceroute_timeout_count": self._traceroute_timeout_count,
             "traceroute_waiter_count": len(self._pending_traceroute_responses),
+            "neighbor_info_request_count": self._neighbor_info_request_count,
+            "neighbor_info_response_count": self._neighbor_info_response_count,
+            "neighbor_info_timeout_count": self._neighbor_info_timeout_count,
+            "neighbor_info_waiter_count": len(
+                self._pending_neighbor_info_responses
+            ),
             "connection_generation": self._connection_generation,
             "settings_complete_sequence": self._settings_complete_sequence,
             "settings_complete_generation": self._settings_complete_generation,
@@ -1555,6 +1688,35 @@ class MeshtasticBluetoothClient:
         decoded = packet.decoded
         portnum = int(decoded.portnum)
         request_id = int(decoded.request_id)
+        if portnum == int(portnums_pb2.NEIGHBORINFO_APP):
+            pending_neighbor = self._pending_neighbor_info_responses.get(
+                request_id
+            )
+            if pending_neighbor is None:
+                return False
+            if (
+                pending_neighbor.future.done()
+                or int(getattr(packet, "from")) != pending_neighbor.source
+                or self._my_node_num is None
+                or int(packet.to) != self._my_node_num
+                or int(packet.channel) != pending_neighbor.channel
+                or bool(packet.via_mqtt)
+            ):
+                return True
+            try:
+                neighbor_info = mesh_pb2.NeighborInfo()
+                neighbor_info.ParseFromString(bytes(decoded.payload))
+            except DecodeError:
+                return True
+            if int(neighbor_info.node_id) != pending_neighbor.source:
+                return True
+            self._manual_neighbor_info_response_packets.add(
+                (int(getattr(packet, "from")), int(packet.id))
+            )
+            pending_neighbor.future.set_result(neighbor_info)
+            # NeighborInfo contains no credentials. Continue through the normal
+            # decoder while retaining explicit manual-request provenance.
+            return False
         if portnum == int(portnums_pb2.TRACEROUTE_APP):
             pending_trace = self._pending_traceroute_responses.get(request_id)
             if pending_trace is None:
@@ -1610,7 +1772,10 @@ class MeshtasticBluetoothClient:
             if (
                 pending_trace.future.done()
                 or int(getattr(packet, "from")) != pending_trace.source
+                or self._my_node_num is None
+                or int(packet.to) != self._my_node_num
                 or int(packet.channel) != pending_trace.channel
+                or bool(packet.via_mqtt)
             ):
                 return True
             try:
@@ -1624,6 +1789,31 @@ class MeshtasticBluetoothClient:
                     MeshtasticConfigurationError("Meshtastic traceroute was rejected by the mesh")
                 )
             # A successful routing ACK is not the RouteDiscovery response.
+            return True
+        pending_neighbor = self._pending_neighbor_info_responses.get(request_id)
+        if pending_neighbor is not None:
+            if (
+                pending_neighbor.future.done()
+                or int(getattr(packet, "from")) != pending_neighbor.source
+                or self._my_node_num is None
+                or int(packet.to) != self._my_node_num
+                or int(packet.channel) != pending_neighbor.channel
+                or bool(packet.via_mqtt)
+            ):
+                return True
+            try:
+                routing = mesh_pb2.Routing()
+                routing.ParseFromString(bytes(decoded.payload))
+            except DecodeError:
+                return True
+            selected = _selected_admin_field(routing)
+            if selected == "error_reason" and int(routing.error_reason):
+                pending_neighbor.future.set_exception(
+                    MeshtasticConfigurationError(
+                        "Meshtastic NeighborInfo request was rejected by the mesh"
+                    )
+                )
+            # A successful routing ACK is not the NeighborInfo response.
             return True
         if request_id not in self._internal_admin_request_ids:
             return False
@@ -1699,6 +1889,13 @@ class MeshtasticBluetoothClient:
                 # yet known to the installed Python package.
                 decoded["portnum"] = f"UNKNOWN_APP_{int(packet.decoded.portnum)}"
             self._decode_application_payload(packet.decoded, decoded)
+            packet_key = (source, int(packet.id))
+            if (
+                packet.decoded.portnum == portnums_pb2.NEIGHBORINFO_APP
+                and packet_key in self._manual_neighbor_info_response_packets
+            ):
+                self._manual_neighbor_info_response_packets.discard(packet_key)
+                decoded["neighborInfoProvenance"] = "manual_request"
             result["decoded"] = decoded
         self._packet_count += 1
         return result
@@ -1760,6 +1957,12 @@ class MeshtasticBluetoothClient:
             if isinstance(neighbor_info, Mapping):
                 update["neighborInfo"] = copy.deepcopy(dict(neighbor_info))
                 update["neighborInfoUpdatedAt"] = int(packet.rx_time)
+                provenance = decoded.get("neighborInfoProvenance")
+                update["neighborInfoProvenance"] = (
+                    "manual_request"
+                    if provenance == "manual_request"
+                    else "passive"
+                )
         self._merge_node(source, update)
 
     def _merge_node(self, node_num: int, update: Mapping[str, Any]) -> None:
@@ -1934,6 +2137,15 @@ class MeshtasticBluetoothClient:
                     MeshtasticConnectionError("Meshtastic Bluetooth disconnected during traceroute")
                 )
         self._pending_traceroute_responses.clear()
+        for pending in tuple(self._pending_neighbor_info_responses.values()):
+            if not pending.future.done():
+                pending.future.set_exception(
+                    MeshtasticConnectionError(
+                        "Meshtastic Bluetooth disconnected during NeighborInfo request"
+                    )
+                )
+        self._pending_neighbor_info_responses.clear()
+        self._manual_neighbor_info_response_packets.clear()
         self._internal_admin_request_ids.clear()
         self._remote_admin_sessions.clear()
         self._remote_settings.clear()

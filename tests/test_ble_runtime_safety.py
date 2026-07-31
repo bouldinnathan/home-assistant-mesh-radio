@@ -14,6 +14,7 @@ from custom_components.meshnet.const import (
     CONF_BLUETOOTH_ADAPTER_ADDRESS,
     PROTOCOL_MESHTASTIC,
     TRANSPORT_BLUETOOTH,
+    TRANSPORT_TCP,
 )
 from custom_components.meshnet.meshtastic_ble import MeshtasticBluetoothTransport
 from custom_components.meshnet.meshtastic_client import MeshtasticClient
@@ -184,7 +185,7 @@ class _FakeBluetoothTransport:
         channel: str | None,
         priority: str,
         message_type: str,
-    ) -> None:
+    ) -> int:
         self.send_calls.append(
             {
                 "target_node": target_node,
@@ -205,6 +206,7 @@ class _FakeBluetoothTransport:
             await self.send_gate.wait()
         finally:
             self.send_active = False
+        return 0x12345678
 
     async def async_node_snapshot(self) -> dict[Any, dict[str, Any]]:
         self.refresh_calls += 1
@@ -1092,7 +1094,7 @@ def test_ble_send_uses_async_transport_without_executor() -> None:
             message_type="direct",
         )
 
-        assert len(message_id) == 16
+        assert message_id == "305419896"
         assert transport.send_calls == [
             {
                 "target_node": "!12345678",
@@ -1115,6 +1117,52 @@ def test_ble_send_uses_async_transport_without_executor() -> None:
             )
         assert len(transport.send_calls) == 1
         await client.async_stop()
+
+    asyncio.run(run())
+
+
+def test_native_send_returns_provider_on_air_packet_id() -> None:
+    """Serial/TCP sends retain the packet ID needed for exact reactions."""
+
+    async def run() -> None:
+        hass = _FakeHass()
+
+        async def noop(_value) -> None:
+            return None
+
+        class SentPacket:
+            id = 0x23456789
+
+        class Interface:
+            def sendText(self, *_args, **_kwargs):
+                return SentPacket()
+
+        client = MeshtasticClient(
+            hass,
+            GatewayConfig(
+                gateway_id="tcp-gateway",
+                name="TCP Gateway",
+                protocol=PROTOCOL_MESHTASTIC,
+                transport=TRANSPORT_TCP,
+                host="192.0.2.1",
+            ),
+            noop,
+            noop,
+            noop,
+            logging.getLogger(__name__),
+        )
+        client._interface = Interface()
+
+        message_id = await client.async_send_message(
+            target_node="!12345678",
+            message="react to this",
+            channel="0",
+            priority="normal",
+            message_type="direct",
+        )
+
+        assert message_id == str(0x23456789)
+        assert hass.executor_calls == 1
 
     asyncio.run(run())
 

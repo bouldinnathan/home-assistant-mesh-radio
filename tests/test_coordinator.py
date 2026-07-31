@@ -774,10 +774,28 @@ def test_message_api_projection_ignores_unhashable_provider_metadata(
         receiver=None,
         channel=None,
         text="safe content",
+        reply_to_message_id=["meshtastic:1"],  # type: ignore[arg-type]
+        reaction="<script>",
         raw={"status": [], "last_error_code": {}},
     )
 
-    assert project(message)["raw"] == {}
+    projected = project(message)
+    assert projected["raw"] == {}
+    assert "reply_to_message_id" not in projected
+    assert "reaction" not in projected
+
+    outbound = MessageRecord(
+        message_id="home-assistant-submission",
+        protocol=PROTOCOL_MESHTASTIC,
+        gateway_id="gateway-1",
+        sender="homeassistant",
+        receiver="!ffffffff",
+        channel="0",
+        text="react to this",
+        direction="tx",
+        raw={"status": "sent", "provider_id": "123456789"},
+    )
+    assert project(outbound)["mesh_packet_id"] == "meshtastic:123456789"
 
 
 def test_unknown_gateway_is_rejected_before_message_persistence(monkeypatch) -> None:
@@ -2947,6 +2965,60 @@ def test_late_provider_callbacks_are_ignored_during_shutdown(monkeypatch) -> Non
         coordinator._flush_outbox.assert_not_awaited()
         coordinator._schedule_reconnect.assert_not_awaited()
         assert coordinator.snapshot == MeshSnapshot()
+
+    asyncio.run(run())
+
+
+def test_inbound_meshtastic_reaction_persists_exact_message_relationship(
+    monkeypatch,
+) -> None:
+    """A reaction remains a record but points to its exact on-air message ID."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+        coordinator = object.__new__(coordinator_class)
+        coordinator._shutting_down = False
+        coordinator._reconnect_suspended = False
+        coordinator._gateway_generation = 1
+        coordinator.snapshot = MeshSnapshot()
+        coordinator.gateways = {}
+        coordinator.deduplicator = SimpleNamespace(is_duplicate=lambda _packet: False)
+        stored: list[MessageRecord] = []
+
+        class Store:
+            async def async_add_packet(self, _packet) -> bool:
+                return True
+
+            async def async_add_message(self, message: MessageRecord) -> None:
+                stored.append(message)
+
+            async def async_recent_messages(self, _limit: int) -> list[MessageRecord]:
+                return list(stored)
+
+        coordinator.store = Store()
+        coordinator.async_set_updated_data = Mock()
+
+        await coordinator._handle_packet(
+            MeshPacket(
+                protocol=PROTOCOL_MESHTASTIC,
+                gateway_id="gateway-1",
+                packet_id="222",
+                sender="!12345678",
+                receiver="!ffffffff",
+                channel="0",
+                portnum="TEXT_MESSAGE_APP",
+                text="👍",
+                reply_to_message_id="meshtastic:111",
+                reaction="👍",
+            ),
+            gateway_generation=1,
+        )
+
+        assert len(stored) == 1
+        assert stored[0].message_id == "meshtastic:222"
+        assert stored[0].reply_to_message_id == "meshtastic:111"
+        assert stored[0].reaction == "👍"
+        assert coordinator.snapshot.recent_messages == stored
 
     asyncio.run(run())
 

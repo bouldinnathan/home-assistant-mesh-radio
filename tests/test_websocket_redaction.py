@@ -142,6 +142,17 @@ def test_filter_redacts_remote_admin_and_traceroute_identifiers_and_drafts() -> 
             "gateway_id": "private-gateway",
             "target_node": "!12345678",
         },
+        {
+            "id": 24,
+            "type": "meshnet/neighbor_info",
+            "gateway_id": "private-gateway",
+            "target_node": "meshtastic:!12345678",
+        },
+        {
+            "id": 25,
+            "type": "meshnet/neighbor_info/status",
+            "target_node": "meshtastic:!12345678",
+        },
     )
     original = json.loads(json.dumps(commands))
     record = logging.LogRecord(

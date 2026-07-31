@@ -359,6 +359,8 @@ Websocket commands:
 - `meshnet/messages`
 - `meshnet/send_message`
 - `meshnet/traceroute` (admin-only, explicit Meshtastic Bluetooth unicast)
+- `meshnet/neighbor_info` (admin-only, explicit Meshtastic Bluetooth unicast)
+- `meshnet/neighbor_info/status` (admin-only, persisted read with no RF)
 - `meshnet/settings/get`
 - `meshnet/settings/preview`
 - `meshnet/settings/apply`
@@ -375,11 +377,22 @@ fields, and fenced from SecurityConfig, keys, PSKs, destructive commands, and
 Home Assistant services.
 
 The traceroute command reserves a SQLite cooldown before any provider call. It
-permits one manual traceroute across the integration every 3,600 seconds;
+permits one manual traceroute across the integration every 60 seconds;
 changing the gateway or destination cannot bypass that global floor, and a
 timeout consumes the reservation. Its admin-only status command reads the
 persisted cooldown and bounded last result without sending RF. No service,
 poller, reconnect task, or automatic graph path can invoke traceroute.
+
+The NeighborInfo command is similarly manual and administrator-only. Its
+SQLite reservation combines 180-second integration-wide and same-target floors
+shared across gateways. The BLE client sends one exact unicast request marker,
+accepts only a local non-MQTT source/to/channel/request-ID correlated response,
+caps it at ten neighbors, and never retries. Its status endpoint reads the
+persisted cooldown and sanitized result without reaching a radio. Firmware
+2.7.26 is the verified request implementation and the target module must be
+enabled; older firmware may reject or time out. A response is cached zero-hop
+evidence rather than a live scan, and a timeout is never projected as zero
+neighbors. Every post-reservation outcome consumes both reservations.
 
 ## Setup Tools
 
@@ -417,10 +430,11 @@ Purpose:
   preview/confirmation/readback boundary.
 - Treat a settings-write timeout as an unknown outcome and never retry it
   automatically.
-- Treat topology as cached passive evidence: never infer node-to-node links
-  from a shared gateway observation.
+- Treat topology as cached evidence with explicit `passive` or
+  `manual_request` provenance: never infer node-to-node links from a shared
+  gateway observation.
 - Do not expose automatic traceroute. The admin-only manual WebSocket command
-  uses a backend-persisted integration-wide floor of 3,600 seconds, with no
+  uses a backend-persisted integration-wide floor of 60 seconds, with no
   startup, polling, refresh, graph-fill, service, or retry trigger.
 
 ## Isolation Boundary

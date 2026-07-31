@@ -264,6 +264,8 @@ class MessageRecord:
     hops: int | None = None
     timestamp: datetime = field(default_factory=utcnow)
     direction: str = "rx"
+    reply_to_message_id: str | None = None
+    reaction: str | None = None
     raw: JsonDict = field(default_factory=dict)
 
     def as_dict(self) -> JsonDict:
@@ -282,6 +284,8 @@ class MessageRecord:
             "hops": self.hops,
             "timestamp": timestamp_to_json(self.timestamp),
             "direction": self.direction,
+            "reply_to_message_id": self.reply_to_message_id,
+            "reaction": self.reaction,
             "raw": self.raw,
         }
 
@@ -302,6 +306,8 @@ class MessageRecord:
             hops=coerce_int(data.get("hops")),
             timestamp=parse_timestamp(data.get("timestamp")) or utcnow(),
             direction=str(data.get("direction") or "rx"),
+            reply_to_message_id=data.get("reply_to_message_id"),
+            reaction=data.get("reaction"),
             raw=dict(data.get("raw") or {}),
         )
 
@@ -324,6 +330,8 @@ class MeshPacket:
     snr: float | None = None
     hops: int | None = None
     hop_limit: int | None = None
+    reply_to_message_id: str | None = None
+    reaction: str | None = None
     timestamp: datetime = field(default_factory=utcnow)
     raw: JsonDict = field(default_factory=dict)
 
@@ -361,6 +369,8 @@ class MeshPacket:
             "snr": self.snr,
             "hops": self.hops,
             "hop_limit": self.hop_limit,
+            "reply_to_message_id": self.reply_to_message_id,
+            "reaction": self.reaction,
             "timestamp": timestamp_to_json(self.timestamp),
             "raw": self.raw,
         }

@@ -102,6 +102,7 @@ def test_panel_node_projects_only_bounded_passive_neighbor_evidence() -> None:
             "neighbor_count": 999,
             "neighbors_updated_at": "2026-07-30T12:00:00+00:00",
             "neighbors_via_mqtt": False,
+            "neighbors_provenance": "manual_request",
             "private_route_data": "secret",
         },
     )
@@ -118,6 +119,7 @@ def test_panel_node_projects_only_bounded_passive_neighbor_evidence() -> None:
         "neighbor_count": 2,
         "neighbors_updated_at": "2026-07-30T12:00:00+00:00",
         "neighbors_via_mqtt": False,
+        "neighbors_provenance": "manual_request",
     }
     assert "secret" not in json.dumps(projected)
 
@@ -125,13 +127,15 @@ def test_panel_node_projects_only_bounded_passive_neighbor_evidence() -> None:
 def test_messages_websocket_redacts_legacy_raw_provider_metadata() -> None:
     async def run() -> None:
         message = MessageRecord(
-            message_id="visible-message",
+            message_id="meshtastic:222",
             protocol="meshtastic",
             gateway_id="visible-gateway",
             sender="visible-sender",
             receiver=None,
             channel="0",
-            text="visible text",
+            text="👍",
+            reply_to_message_id="meshtastic:111",
+            reaction="👍",
             raw={
                 "status": "queued",
                 "last_error": "token=private at /dev/private",
@@ -162,6 +166,8 @@ def test_messages_websocket_redacts_legacy_raw_provider_metadata() -> None:
             "status": "queued",
             "last_error_code": "send_failed",
         }
+        assert payload[0]["reply_to_message_id"] == "meshtastic:111"
+        assert payload[0]["reaction"] == "👍"
         serialized = json.dumps(payload)
         assert "token=private" not in serialized
         assert "/dev/private" not in serialized

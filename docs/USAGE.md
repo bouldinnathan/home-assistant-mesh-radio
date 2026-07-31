@@ -22,8 +22,9 @@ The panel shows:
 - Gateway online state
 - Node online/last-seen state with favorites-aware sorting
 - Recent messages
-- A draggable, moving 20/50/100-node passive graph whose spring lengths use
-  valid GPS distance only after an edge has independent route evidence
+- A draggable, moving 20/50/100-node cached-evidence graph whose spring
+  lengths use valid GPS distance only after an edge has independent route
+  evidence, with the great-circle distance labeled in miles
 - A link to Home Assistant's native Map
 - RF heat based on RSSI or SNR
 
@@ -33,6 +34,13 @@ For the simplest test, open the sidebar panel, leave **Delivery** on
 node, or press **Message** beside a node. The dropdown submits the node's
 canonical identifier, so you do not need to copy a node number or short name
 manually.
+
+Meshtastic reactions are attached only when their `reply_id` matches the
+original message's exact on-air packet ID. Reactions whose original message is
+outside the loaded history remain visible as unresolved instead of being
+guessed onto a nearby message. A five-second panel refresh preserves the
+current scroll position; when you are already near the bottom it follows the
+newest messages.
 
 ## Nodes, Favorites, Map, And Topology
 
@@ -57,12 +65,12 @@ list but do not get a location tracker. For Meshtastic, the protocol's unset
 `(0, 0)` position is treated as missing. Precision bits remain separate from an
 explicit meter accuracy and are never presented to Home Assistant as meters.
 
-The topology deliberately uses passive evidence only. A solid gateway edge
+The topology deliberately requires cached evidence. A solid gateway edge
 means locally received, non-MQTT packet/node data explicitly reported zero hops
 and retained the gateway that observed it. A received, explicit MeshCore
 route/path may be shown only when every endpoint resolves to an exact cached
 identifier. Nodes sharing a gateway are not assumed to be connected. When no
-defensible evidence exists the panel displays **No passive connection evidence
+defensible evidence exists the panel displays **No cached connection evidence
 yet**. Edges are explicitly labeled as last received, cached evidence rather
 than a live route; MeshNet does not currently expire a received MeshCore
 route/path on a guessed schedule.
@@ -70,16 +78,37 @@ route/path on a guessed schedule.
 Locally received Meshtastic NeighborInfo may add a node-to-node edge when both
 identities resolve exactly and the report is no more than one hour old. MQTT,
 ambiguous, malformed, stale, and implausibly future-dated neighbor reports do
-not create graph edges. This processing is passive and sends no traceroute.
+not create graph edges. Unsolicited and legacy reports are marked `passive`.
+Reports returned by the explicit request below are marked `manual_request`, so
+the graph never describes solicited evidence as passive.
+
+An edge label is the Haversine distance in miles, not an RF range estimate.
+For a gateway endpoint MeshNet uses the exact controller radio's cached GPS
+first, then Home Assistant's configured Home location in the browser, then a
+neutral graph length. MeshNet does not write a fixed radio position. If the
+controller should advertise a fixed GPS position, configure it deliberately
+with an official Meshtastic client; otherwise keep Home Assistant's Home
+location accurate for the clearly labeled fallback.
 
 MeshNet does not run traceroute automatically, on refresh, on startup, or to
 fill the graph. Administrators may explicitly request one unicast traceroute
 from the MeshNet panel when using a connected Meshtastic Bluetooth gateway.
 The backend permits at most one manual traceroute across the entire MeshNet
-integration per hour, reserves that global cooldown before transmitting, never
+integration per minute, reserves that global cooldown before transmitting, never
 retries, and exposes no traceroute service or automation action. The panel
 reloads the persisted cooldown and last bounded result after Home Assistant or
 the browser restarts.
+
+Administrators may explicitly request NeighborInfo from one exact known node
+through a connected Meshtastic Bluetooth gateway. MeshNet submits one unicast
+application packet, with no MeshNet retry, only after atomically reserving persisted 180-second integration-wide
+and same-target floors shared by every gateway. It never
+polls, batches, broadcasts, schedules, or retries this operation. This
+experimental path is verified on Meshtastic firmware 2.7.26 and requires the
+target's Neighbor Info module to be enabled. Older firmware may reject it or
+time out. The response is a cached zero-hop report with at most ten neighbors,
+not a live scan; an empty valid response and a timeout are different outcomes.
+A timeout is treated as unknown and consumes both reservations.
 
 ## Remote Node Administration
 

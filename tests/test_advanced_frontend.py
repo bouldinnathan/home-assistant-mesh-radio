@@ -359,6 +359,166 @@ def test_messages_render_escapes_text_names_and_metadata() -> None:
     )
 
 
+def test_reactions_attach_to_the_referenced_message_and_orphans_remain_visible() -> None:
+    """Reaction packets become badges only when their target is in this thread."""
+    _run_panel_script(
+        r"""
+  assert.equal(typeof panel._messageTimelineEntries, "function");
+  const message = (message_id, text, extras = {}) => ({
+    message_id,
+    protocol: "meshtastic",
+    gateway_id: "gateway-one",
+    sender: extras.sender || "!00000001",
+    receiver: "!ffffffff",
+    channel: "0",
+    text,
+    message_type: "broadcast",
+    priority: "normal",
+    encrypted: false,
+    hops: 0,
+    timestamp: extras.timestamp || "2026-07-30T12:00:00+00:00",
+    direction: "rx",
+    delivery: "broadcast",
+    peer_node_key: null,
+    raw: {},
+    ...(extras.mesh_packet_id ? { mesh_packet_id: extras.mesh_packet_id } : {}),
+    ...(extras.reaction ? {
+      reaction: extras.reaction,
+      reply_to_message_id: extras.reply_to_message_id,
+    } : {}),
+  });
+  const records = [
+    message("outbound-local-uuid", "Original message", {
+      mesh_packet_id: "meshtastic:42",
+    }),
+    message("meshtastic:43", "👍", {
+      reaction: "👍",
+      reply_to_message_id: "meshtastic:42",
+      sender: "!00000002",
+    }),
+    message("meshtastic:44", "👍", {
+      reaction: "👍",
+      reply_to_message_id: "meshtastic:42",
+      sender: "!00000003",
+    }),
+    message("meshtastic:45", "🔥", {
+      reaction: "🔥",
+      reply_to_message_id: "meshtastic:42",
+      sender: "!00000002",
+    }),
+    message("meshtastic:46", "❓", {
+      reaction: "❓",
+      reply_to_message_id: '<missing onclick="globalThis.pwned=true">',
+      sender: "!00000004",
+    }),
+  ].map((record) => panel._sanitizeMessageRecord(record));
+  assert.ok(records.every(Boolean));
+
+  const entries = panel._messageTimelineEntries(records);
+  assert.equal(entries.length, 2, "three attached packets must not render as rows");
+  assert.equal(entries[0].message.message_id, "outbound-local-uuid");
+  assert.equal(entries[0].message.mesh_packet_id, "meshtastic:42");
+  assert.equal(entries[0].orphan_reaction, false);
+  assert.deepEqual(entries[0].reactions, [
+    { reaction: "👍", count: 2, senders: ["!00000002", "!00000003"] },
+    { reaction: "🔥", count: 1, senders: ["!00000002"] },
+  ]);
+  assert.equal(entries[1].message.message_id, "meshtastic:46");
+  assert.equal(entries[1].orphan_reaction, true);
+  assert.deepEqual(entries[1].reactions, []);
+
+  assert.equal(panel._sanitizeMessageRecord(message("bad-one", "👍", {
+    reaction: "👍",
+    reply_to_message_id: null,
+  })), null);
+  assert.equal(panel._sanitizeMessageRecord(message("bad-two", "👍🔥", {
+    reaction: "👍🔥",
+    reply_to_message_id: "meshtastic:42",
+  })), null, "backend contract is exactly one Unicode scalar");
+  assert.ok(panel._sanitizeMessageRecord({
+    ...message("threaded-reply", "ordinary reply"),
+    reply_to_message_id: "meshtastic:42",
+  }), "a non-reaction threaded reply remains a normal message");
+
+  panel._activeView = "messages";
+  panel._messageConversation = "broadcast:0";
+  panel._messages = records;
+  panel._snapshot = { nodes: {}, gateways: {}, recent_messages: [] };
+  panel.querySelector = () => null;
+  panel.querySelectorAll = () => [];
+  panel.contains = () => false;
+  panel._renderMessages();
+  assert.equal(globalThis.pwned, undefined);
+  assert.match(panel.innerHTML, /data-message-id="outbound-local-uuid"/);
+  assert.match(panel.innerHTML, /message-reactions/);
+  assert.match(panel.innerHTML, /👍/);
+  assert.match(panel.innerHTML, /🔥/);
+  assert.match(panel.innerHTML, /Reaction to a message that is not available/);
+  assert.doesNotMatch(panel.innerHTML, /<missing onclick=/);
+  assert.match(panel.innerHTML, /&lt;missing onclick=/);
+"""
+    )
+
+
+def test_message_scroll_restore_keeps_bottom_or_exact_reading_position() -> None:
+    """Refreshing follows new messages only for a reader already near bottom."""
+    _run_panel_script(
+        r"""
+  assert.equal(typeof panel._captureMessageScrollState, "function");
+  assert.equal(typeof panel._restoreMessageScrollState, "function");
+  let timeline = {
+    scrollTop: 700,
+    scrollHeight: 1000,
+    clientHeight: 250,
+    getAttribute(name) { return name === "data-conversation-key" ? "broadcast:0" : null; },
+  };
+  panel.querySelector = (selector) => selector === "#meshnet-message-timeline" ? timeline : null;
+  const nearBottom = panel._captureMessageScrollState();
+  assert.deepEqual(nearBottom, {
+    conversation_key: "broadcast:0",
+    scroll_top: 700,
+    near_bottom: true,
+  });
+  timeline = {
+    scrollTop: 0,
+    scrollHeight: 1400,
+    clientHeight: 250,
+    getAttribute() { return "broadcast:0"; },
+  };
+  panel._restoreMessageScrollState(nearBottom, "broadcast:0");
+  assert.equal(timeline.scrollTop, 1150, "near-bottom readers follow appended messages");
+
+  timeline = {
+    scrollTop: 275,
+    scrollHeight: 1000,
+    clientHeight: 250,
+    getAttribute() { return "broadcast:0"; },
+  };
+  const reading = panel._captureMessageScrollState();
+  assert.equal(reading.near_bottom, false);
+  timeline = {
+    scrollTop: 0,
+    scrollHeight: 1500,
+    clientHeight: 250,
+    getAttribute() { return "broadcast:0"; },
+  };
+  panel._restoreMessageScrollState(reading, "broadcast:0");
+  assert.equal(timeline.scrollTop, 275, "refresh must retain an older reading position");
+
+  timeline = {
+    scrollTop: 123,
+    scrollHeight: 800,
+    clientHeight: 200,
+    getAttribute() { return "direct:meshtastic:!00000001"; },
+  };
+  panel._restoreMessageScrollState(reading, "direct:meshtastic:!00000001");
+  assert.equal(timeline.scrollTop, 600, "a newly selected conversation opens at its bottom");
+  panel._restoreMessageScrollState(null, "direct:meshtastic:!00000001");
+  assert.equal(timeline.scrollTop, 600);
+"""
+    )
+
+
 def test_message_draft_focus_and_thread_survive_poll_but_clear_on_detach() -> None:
     """Polling preserves active work; leaving the panel abandons memory state."""
     _run_panel_script(
@@ -489,6 +649,74 @@ def test_haversine_and_spring_mapping_are_finite_monotonic_and_clamped() -> None
     )
 
 
+def test_graph_renders_and_moves_visible_physical_distance_labels_in_miles() -> None:
+    """Validated physical distances get visible mile labels without new evidence."""
+    _run_panel_script(
+        r"""
+  assert.equal(typeof panel._formatEdgeDistanceMiles, "function");
+  assert.equal(panel._formatEdgeDistanceMiles(0), "0.0 mi");
+  assert.equal(panel._formatEdgeDistanceMiles(1609.344), "1.0 mi");
+  assert.equal(panel._formatEdgeDistanceMiles(8046.72), "5.0 mi");
+  assert.equal(panel._formatEdgeDistanceMiles(160934.4), "100 mi");
+  for (const invalid of [null, undefined, -1, Number.NaN, Number.POSITIVE_INFINITY, "1609"])
+    assert.equal(panel._formatEdgeDistanceMiles(invalid), null);
+
+  const topology = {
+    nodes: [
+      { node_key: "a", node_id: "a", long_name: "A", online: true },
+      { node_key: "b", node_id: "b", long_name: "B", online: true },
+      { node_key: "c", node_id: "c", long_name: "C", online: true },
+    ],
+    gateways: [],
+    totalNodes: 3,
+    totalGateways: 0,
+    edges: [
+      {
+        from: "node:a",
+        to: "node:b",
+        type: "route",
+        distance_meters: 1609.344,
+        target_length: 150,
+      },
+      {
+        from: "node:b",
+        to: "node:c",
+        type: "route",
+        distance_meters: null,
+        target_length: 140,
+      },
+    ],
+  };
+  const html = panel._graph(topology);
+  assert.match(html, />1\.0 mi<\/text>/);
+  assert.equal((html.match(/class="edge-distance"/g) || []).length, 1);
+  assert.match(html, /Physical distance unavailable/);
+
+  panel._graphPositions = new Map([
+    ["node:a", { x: 100, y: 200, vx: 0, vy: 0 }],
+    ["node:b", { x: 300, y: 400, vx: 0, vy: 0 }],
+  ]);
+  const attributes = {};
+  const label = {
+    getAttribute(name) {
+      return name === "data-graph-distance-from" ? "node:a"
+        : name === "data-graph-distance-to" ? "node:b" : null;
+    },
+    setAttribute(name, value) { attributes[name] = value; },
+  };
+  const svg = {
+    querySelectorAll(selector) {
+      if (selector === "[data-graph-distance-from][data-graph-distance-to]") return [label];
+      return [];
+    },
+  };
+  panel.querySelector = (selector) => selector === "#meshnet-topology-graph" ? svg : null;
+  panel._applyGraphPositions();
+  assert.deepEqual(attributes, { x: "200", y: "296" });
+"""
+    )
+
+
 def test_distance_annotation_never_invents_edges_or_uses_signal_as_gps() -> None:
     """Only route/neighbor evidence creates an edge, regardless of proximity."""
     _run_panel_script(
@@ -576,7 +804,7 @@ def test_distance_annotation_never_invents_edges_or_uses_signal_as_gps() -> None
 
 
 def test_fresh_non_mqtt_neighbor_evidence_adds_one_distance_sized_deduplicated_edge() -> None:
-    """NeighborInfo is passive RF evidence, not distance or an RF trigger."""
+    """NeighborInfo is cached RF evidence, not distance or an automatic RF trigger."""
     _run_panel_script(
         r"""
   const originalNow = Date.now;
@@ -662,6 +890,23 @@ def test_fresh_non_mqtt_neighbor_evidence_adds_one_distance_sized_deduplicated_e
   }).edges.length, 0, "larger future timestamps are rejected");
   assert.equal(topologyFor({ ...fresh, neighbors_via_mqtt: true }).edges.length, 0);
   assert.equal(topologyFor({ ...fresh, neighbor_count: 2 }).edges.length, 0);
+  const tooManyNeighbors = Array.from(
+    { length: 11 },
+    (_item, index) => `!${(index + 1).toString(16).padStart(8, "0")}`,
+  );
+  assert.equal(panel._neighborIdentifiers({
+    ...baseNodes[0],
+    routing: {
+      ...fresh,
+      neighbors: tooManyNeighbors,
+      neighbor_count: tooManyNeighbors.length,
+      neighbors_provenance: "manual_request",
+    },
+  }), null, "requested NeighborInfo evidence is capped at the firmware maximum of ten");
+  const requested = topologyFor({ ...fresh, neighbors_provenance: "manual_request" });
+  assert.equal(requested.edges[0].provenance, "manual_request");
+  assert.match(panel._graph(requested), /Requested NeighborInfo/);
+  assert.equal(topologyFor({ ...fresh, neighbors_provenance: "untrusted" }).edges.length, 0);
   const { neighbors_via_mqtt: _omitted, ...unknownProvenance } = fresh;
   assert.equal(topologyFor(unknownProvenance).edges.length, 0);
   assert.equal(topologyFor({ ...fresh, neighbors: ["!2"] }).edges.length, 0);

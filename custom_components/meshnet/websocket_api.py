@@ -150,6 +150,8 @@ async def async_register_websocket_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, websocket_send_message)
     websocket_api.async_register_command(hass, websocket_traceroute)
     websocket_api.async_register_command(hass, websocket_traceroute_status)
+    websocket_api.async_register_command(hass, websocket_neighbor_info)
+    websocket_api.async_register_command(hass, websocket_neighbor_info_status)
     websocket_api.async_register_command(hass, websocket_panel_log)
     websocket_api.async_register_command(hass, websocket_settings_get)
     websocket_api.async_register_command(hass, websocket_settings_preview)
@@ -679,6 +681,74 @@ async def websocket_traceroute_status(
 
 @websocket_api.websocket_command(
     {
+        vol.Required("type"): "meshnet/neighbor_info",
+        vol.Required(ATTR_GATEWAY_ID): _GATEWAY_ID,
+        vol.Required(ATTR_TARGET_NODE): vol.All(
+            str, vol.Length(min=1, max=128)
+        ),
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_neighbor_info(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Run one explicit, server-governed BLE NeighborInfo request."""
+    coordinator = _get_coordinator(hass)
+    try:
+        result = await coordinator.async_manual_neighbor_info(
+            gateway_id=msg[ATTR_GATEWAY_ID],
+            target_node=msg[ATTR_TARGET_NODE],
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        connection.send_error(
+            msg["id"],
+            "neighbor_info_failed",
+            "MeshNet could not complete the NeighborInfo request",
+        )
+        return
+    send_sensitive_result(connection, msg["id"], result)
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "meshnet/neighbor_info/status",
+        vol.Required(ATTR_TARGET_NODE): vol.All(
+            str, vol.Length(min=1, max=128)
+        ),
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_neighbor_info_status(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Read persisted NeighborInfo cooldown/result state without RF."""
+    try:
+        coordinator = _get_coordinator(hass)
+        result = await coordinator.store.async_get_neighbor_info_request_status(
+            msg[ATTR_TARGET_NODE]
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        connection.send_error(
+            msg["id"],
+            "neighbor_info_status_failed",
+            "MeshNet could not load the NeighborInfo request status",
+        )
+        return
+    send_sensitive_result(connection, msg["id"], result)
+
+
+@websocket_api.websocket_command(
+    {
         vol.Required("type"): "meshnet/panel_log",
         vol.Required("operation"): vol.In(PANEL_OPERATIONS),
         vol.Required("category"): vol.In(PANEL_ERROR_CATEGORIES),
@@ -927,6 +997,9 @@ def _panel_node(node: Any, *, identity_valid: bool) -> dict[str, Any]:
     neighbors_via_mqtt = node.routing.get("neighbors_via_mqtt")
     if isinstance(neighbors_via_mqtt, bool):
         routing["neighbors_via_mqtt"] = neighbors_via_mqtt
+    neighbors_provenance = node.routing.get("neighbors_provenance")
+    if neighbors_provenance in {"passive", "manual_request"}:
+        routing["neighbors_provenance"] = neighbors_provenance
     return {
         "node_key": node.node_key,
         "protocol": node.protocol,

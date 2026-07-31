@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -118,6 +120,7 @@ def test_neighborinfo_normalizes_exact_bounded_passive_edges() -> None:
         "neighbor_count": 2,
         "neighbors_updated_at": "2023-11-14T22:13:20+00:00",
         "neighbors_via_mqtt": False,
+        "neighbors_provenance": "passive",
     }
 
 
@@ -166,8 +169,8 @@ def test_neighborinfo_is_bounded_and_retains_mqtt_provenance() -> None:
     node = meshtastic_packet_to_node(packet)
 
     assert node is not None
-    assert len(node.routing["neighbors"]) == 64
-    assert node.routing["neighbor_count"] == 64
+    assert len(node.routing["neighbors"]) == 10
+    assert node.routing["neighbor_count"] == 10
     assert node.routing["neighbors_via_mqtt"] is True
 
 
@@ -189,6 +192,262 @@ def test_cached_neighborinfo_uses_its_original_observation_time() -> None:
     assert node is not None
     assert node.routing["neighbors"] == ["!11121314"]
     assert node.routing["neighbors_updated_at"] == "2023-11-14T22:13:20+00:00"
+
+
+def _active_neighbor_request_client(
+    *,
+    respond: bool = True,
+    via_mqtt: bool = False,
+    neighbor_count: int = 1,
+    bad_correlations_first: bool = False,
+):
+    local_num = 0x10203040
+    target_num = 0x50607080
+    client = MeshtasticBluetoothClient(
+        address="AA:BB:CC:DD:EE:FF",
+        device_provider=lambda: None,
+        admin_response_timeout=0.02,
+    )
+
+    class Connection:
+        is_connected = True
+        owns_endpoint = True
+
+        def __init__(self) -> None:
+            self.packets: list[Any] = []
+
+        async def async_send(self, payload: bytes, *, force_read: bool = False) -> None:
+            assert force_read is False
+            request = mesh_pb2.ToRadio()
+            request.ParseFromString(payload)
+            packet = request.packet
+            self.packets.append(packet)
+            assert packet.to == target_num
+            assert getattr(packet, "from") == local_num
+            assert packet.channel == 0
+            assert packet.want_ack is True
+            assert packet.priority == mesh_pb2.MeshPacket.Priority.RELIABLE
+            assert packet.decoded.portnum == portnums_pb2.NEIGHBORINFO_APP
+            assert packet.decoded.want_response is True
+            requested = mesh_pb2.NeighborInfo()
+            requested.ParseFromString(bytes(packet.decoded.payload))
+            assert len(requested.neighbors) == 1
+            assert requested.neighbors[0].node_id == 0
+            assert requested.neighbors[0].snr == 0
+            if not respond:
+                return
+
+            def deliver_neighbor(
+                *,
+                source: int = target_num,
+                destination: int = local_num,
+                channel: int = 0,
+                request_id: int | None = None,
+                reporter: int = target_num,
+                mqtt: bool = False,
+            ) -> None:
+                report = mesh_pb2.NeighborInfo(
+                    node_id=reporter,
+                    last_sent_by_id=reporter,
+                    node_broadcast_interval_secs=3600,
+                )
+                for index in range(neighbor_count):
+                    report.neighbors.add(
+                        node_id=0x11121314 + index,
+                        snr=-2.25 + index,
+                    )
+                response = mesh_pb2.FromRadio()
+                setattr(response.packet, "from", source)
+                response.packet.to = destination
+                response.packet.channel = channel
+                response.packet.id = 44
+                response.packet.rx_time = 1_700_000_000
+                response.packet.via_mqtt = mqtt
+                response.packet.decoded.portnum = portnums_pb2.NEIGHBORINFO_APP
+                response.packet.decoded.request_id = (
+                    int(packet.id) if request_id is None else request_id
+                )
+                response.packet.decoded.payload = report.SerializeToString()
+                client._handle_from_radio(response.SerializeToString())
+
+            def deliver_routing_error(
+                *, destination: int = local_num, mqtt: bool = False
+            ) -> None:
+                routing = mesh_pb2.Routing()
+                routing.error_reason = mesh_pb2.Routing.Error.Value("NO_ROUTE")
+                response = mesh_pb2.FromRadio()
+                setattr(response.packet, "from", target_num)
+                response.packet.to = destination
+                response.packet.channel = 0
+                response.packet.via_mqtt = mqtt
+                response.packet.decoded.portnum = portnums_pb2.ROUTING_APP
+                response.packet.decoded.request_id = int(packet.id)
+                response.packet.decoded.payload = routing.SerializeToString()
+                client._handle_from_radio(response.SerializeToString())
+
+            if bad_correlations_first:
+                deliver_neighbor(request_id=int(packet.id) + 1)
+                deliver_neighbor(source=target_num + 1)
+                deliver_neighbor(destination=local_num + 1)
+                deliver_neighbor(channel=1)
+                deliver_neighbor(reporter=target_num + 1)
+                deliver_routing_error(destination=local_num + 1)
+                deliver_routing_error(mqtt=True)
+            deliver_neighbor(mqtt=via_mqtt)
+
+    connection = Connection()
+    client._connection = connection  # type: ignore[assignment]
+    client._connected = True
+    client._my_node_num = local_num
+    client._nodes = {
+        local_num: {"num": local_num},
+        target_num: {
+            "num": target_num,
+            "user": {"id": "!50607080", "shortName": "TEST"},
+        },
+    }
+    return client, connection
+
+
+def test_manual_neighbor_info_request_is_one_correlated_exact_unicast() -> None:
+    """One explicit request returns and passively projects one bounded report."""
+
+    async def run() -> None:
+        client, connection = _active_neighbor_request_client()
+
+        result = await client.async_manual_neighbor_info("!50607080")
+
+        assert len(connection.packets) == 1
+        assert result == {
+            "correlation_id": str(connection.packets[0].id),
+            "source": "!50607080",
+            "destination": "!10203040",
+            "channel": 0,
+            "node_broadcast_interval_secs": 3600,
+            "neighbors": [{"node_id": "!11121314", "snr": -2.25}],
+        }
+        assert client.node_snapshot()[0x50607080]["neighborInfo"] == {
+            "nodeId": 0x50607080,
+            "lastSentById": 0x50607080,
+            "nodeBroadcastIntervalSecs": 3600,
+            "neighbors": [{"nodeId": 0x11121314, "snr": -2.25}],
+        }
+        assert (
+            client.node_snapshot()[0x50607080]["neighborInfoProvenance"]
+            == "manual_request"
+        )
+        projected = meshtastic_node_to_state(
+            client.node_snapshot()[0x50607080], gateway_id="ble-gateway"
+        )
+        assert projected is not None
+        assert projected.routing["neighbors_provenance"] == "manual_request"
+
+    asyncio.run(run())
+
+
+def test_manual_neighbor_info_rejects_mqtt_response_and_inconsistent_target() -> None:
+    """MQTT cannot satisfy a local request and cached identity must agree."""
+
+    async def run() -> None:
+        mqtt_client, mqtt_connection = _active_neighbor_request_client(
+            via_mqtt=True
+        )
+        with pytest.raises(RuntimeError, match="timed out"):
+            await mqtt_client.async_manual_neighbor_info("!50607080")
+        assert len(mqtt_connection.packets) == 1
+
+        bad_client, bad_connection = _active_neighbor_request_client()
+        bad_client._nodes[0x50607080]["user"]["id"] = "!99999999"
+        with pytest.raises(RuntimeError, match="identity is inconsistent"):
+            await bad_client.async_manual_neighbor_info("!50607080")
+        assert bad_connection.packets == []
+
+        missing_client, missing_connection = _active_neighbor_request_client()
+        missing_client._nodes[0x50607080]["user"].pop("id")
+        with pytest.raises(RuntimeError, match="identity is inconsistent"):
+            await missing_client.async_manual_neighbor_info("!50607080")
+        assert missing_connection.packets == []
+
+    asyncio.run(run())
+
+
+def test_manual_neighbor_info_response_is_capped_at_firmware_maximum() -> None:
+    """Even oversized provider protobufs expose at most ten neighbors."""
+
+    async def run() -> None:
+        client, _connection = _active_neighbor_request_client(neighbor_count=12)
+        result = await client.async_manual_neighbor_info("!50607080")
+        assert len(result["neighbors"]) == 10
+
+    asyncio.run(run())
+
+
+def test_manual_neighbor_info_ignores_every_mismatched_correlation() -> None:
+    """Only exact local RF response and routing envelopes settle the waiter."""
+
+    async def run() -> None:
+        client, connection = _active_neighbor_request_client(
+            bad_correlations_first=True
+        )
+        result = await client.async_manual_neighbor_info("!50607080")
+        assert result["source"] == "!50607080"
+        assert result["correlation_id"] == str(connection.packets[0].id)
+
+    asyncio.run(run())
+
+
+def test_unsolicited_neighbor_info_replaces_manual_provenance_with_passive() -> None:
+    """A later passive report cannot inherit a previous manual correlation."""
+
+    async def run() -> None:
+        client, _connection = _active_neighbor_request_client()
+        await client.async_manual_neighbor_info("!50607080")
+        assert (
+            client.node_snapshot()[0x50607080]["neighborInfoProvenance"]
+            == "manual_request"
+        )
+
+        passive_report = mesh_pb2.NeighborInfo(
+            node_id=0x50607080,
+            last_sent_by_id=0x50607080,
+            node_broadcast_interval_secs=3600,
+        )
+        passive_report.neighbors.add(node_id=0x21222324, snr=-1.5)
+        response = mesh_pb2.FromRadio()
+        setattr(response.packet, "from", 0x50607080)
+        response.packet.to = 0xFFFFFFFF
+        response.packet.channel = 0
+        response.packet.id = 45
+        response.packet.rx_time = 1_700_000_001
+        response.packet.decoded.portnum = portnums_pb2.NEIGHBORINFO_APP
+        response.packet.decoded.payload = passive_report.SerializeToString()
+        client._handle_from_radio(response.SerializeToString())
+
+        snapshot = client.node_snapshot()[0x50607080]
+        assert snapshot["neighborInfoProvenance"] == "passive"
+        projected = meshtastic_node_to_state(
+            snapshot, gateway_id="ble-gateway"
+        )
+        assert projected is not None
+        assert projected.routing["neighbors_provenance"] == "passive"
+        assert projected.routing["neighbors"] == ["!21222324"]
+
+    asyncio.run(run())
+
+
+def test_manual_neighbor_info_timeout_is_never_retried() -> None:
+    """An unanswered request sends once and leaves no pending response owner."""
+
+    async def run() -> None:
+        client, connection = _active_neighbor_request_client(respond=False)
+
+        with pytest.raises(RuntimeError, match="timed out"):
+            await client.async_manual_neighbor_info("!50607080")
+
+        assert len(connection.packets) == 1
+        assert client._pending_neighbor_info_responses == {}
+
+    asyncio.run(run())
 
 
 def test_numeric_meshtastic_broadcast_destination_is_canonicalized() -> None:

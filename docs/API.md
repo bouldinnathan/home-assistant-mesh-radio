@@ -27,7 +27,18 @@ Returns the normalized mesh snapshot:
 }
 ```
 
-Returns recent message history oldest-first.
+Returns recent message history oldest-first. Meshtastic records may include a
+validated `mesh_packet_id` (`meshtastic:<uint32>`), `reply_to_message_id`, and
+one-Unicode-scalar `reaction`. Those public fields are projected separately
+from retained provider metadata so the panel can attach a reaction only to the
+exact on-air message it references. A reply whose target is outside the loaded
+history remains a visible orphan instead of being attached by sender, time, or
+text similarity.
+
+BLE and native serial/TCP sends retain the packet ID returned by the radio.
+The MQTT publish format does not return an on-air packet ID at submission time,
+so an incoming reaction cannot be joined to that local outbound MQTT record
+unless the original packet is later observed as a received record.
 
 ## Send Message
 
@@ -68,8 +79,10 @@ outbox return `queued` and emit a correlated, privacy-safe
 ```
 
 This admin-only command accepts one exact cached Meshtastic identity and one
-connected Bluetooth gateway. The server atomically reserves the one-hour
-integration-wide cooldown before submitting exactly one RF request. It rejects broadcast,
+connected Bluetooth gateway. The server atomically reserves the one-minute
+integration-wide cooldown before submitting one RouteDiscovery application
+packet, with no MeshNet retry. Firmware routing, relaying, and reliable-packet
+behavior can still create more than one physical RF transmission. It rejects broadcast,
 name-based, self, unknown, non-Bluetooth, and incompatible targets. There is no
 service, scheduled form, automatic caller, or retry path.
 
@@ -90,6 +103,46 @@ The result reports `available` or `cooldown`, the persisted next-allowed time,
 remaining seconds, the exact gateway/target used by the last reservation, and
 the sanitized completed route/SNR evidence when present. The status call takes
 no target and cannot reserve airtime or reach a radio.
+
+## Manual NeighborInfo Request
+
+```json
+{
+  "type": "meshnet/neighbor_info",
+  "gateway_id": "garage_radio",
+  "target_node": "meshtastic:!1234abcd"
+}
+```
+
+This administrator-only command submits one Meshtastic Bluetooth unicast
+application packet using the protocol's NeighborInfo request marker, with no
+MeshNet retry. The server reserves
+persisted 180-second integration-wide and same-target cooldowns before RF.
+There is no service, automatic caller, broadcast, batch,
+or retry path. No response is a bounded unknown outcome and still consumes both
+reservations.
+
+This request path is experimental and verified against Meshtastic firmware
+2.7.26. The target must have the Neighbor Info module enabled; older firmware
+may reject the request or time out. A successful response is the target's
+cached zero-hop neighbor report, capped at ten entries—not a live RF scan. An
+empty successful report means the target returned no cached neighbors; a
+timeout does not mean zero neighbors.
+
+Read the selected target's persisted cooldown and last sanitized response
+without sending RF:
+
+```json
+{
+  "type": "meshnet/neighbor_info/status",
+  "target_node": "meshtastic:!1234abcd"
+}
+```
+
+The result includes global, target, and effective next-allowed timestamps and
+remaining seconds, plus at most ten neighbors from the last bounded response.
+That response is tagged `manual_request`; unsolicited and legacy NeighborInfo
+evidence remains `passive`.
 
 ## Remote Node Settings
 

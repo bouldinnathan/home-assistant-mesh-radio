@@ -23,6 +23,8 @@ _REMOTE_SETTINGS_GET_TYPE = "meshnet/remote_settings/get"
 _REMOTE_SETTINGS_PREVIEW_TYPE = "meshnet/remote_settings/preview"
 _REMOTE_SETTINGS_APPLY_TYPE = "meshnet/remote_settings/apply"
 _TRACEROUTE_TYPE = "meshnet/traceroute"
+_NEIGHBOR_INFO_TYPE = "meshnet/neighbor_info"
+_NEIGHBOR_INFO_STATUS_TYPE = "meshnet/neighbor_info/status"
 _SEND_MESSAGE_TYPE = "meshnet/send_message"
 _CALL_SERVICE_TYPE = "call_service"
 _MESHNET_DOMAIN = "meshnet"
@@ -41,6 +43,8 @@ _SENSITIVE_COMMAND_FIELDS = {
     _REMOTE_SETTINGS_PREVIEW_TYPE: frozenset({"gateway_id", "target_node", "changes"}),
     _REMOTE_SETTINGS_APPLY_TYPE: frozenset({"gateway_id", "target_node"}),
     _TRACEROUTE_TYPE: frozenset({"gateway_id", "target_node"}),
+    _NEIGHBOR_INFO_TYPE: frozenset({"gateway_id", "target_node"}),
+    _NEIGHBOR_INFO_STATUS_TYPE: frozenset({"target_node"}),
     _SEND_MESSAGE_TYPE: frozenset({"message", "target_node", "gateway_id", "channel"}),
 }
 _REDACTED = "<redacted by MeshNet>"

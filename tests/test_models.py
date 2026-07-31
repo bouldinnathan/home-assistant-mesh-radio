@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from custom_components.meshnet.models import (
+    MeshPacket,
+    MessageRecord,
     NodeState,
     canonical_node_key,
     coerce_float,
@@ -10,6 +12,33 @@ from custom_components.meshnet.models import (
     merge_dict,
     parse_timestamp,
 )
+
+
+def test_message_relationship_fields_round_trip_without_provider_raw_data() -> None:
+    message = MessageRecord(
+        message_id="meshtastic:22",
+        protocol="meshtastic",
+        gateway_id="gateway-1",
+        sender="!12345678",
+        receiver="!ffffffff",
+        channel="0",
+        text="👍",
+        reply_to_message_id="meshtastic:11",
+        reaction="👍",
+    )
+
+    restored = MessageRecord.from_dict(message.as_dict())
+
+    assert restored.reply_to_message_id == "meshtastic:11"
+    assert restored.reaction == "👍"
+    packet = MeshPacket(
+        protocol="meshtastic",
+        gateway_id="gateway-1",
+        reply_to_message_id="meshtastic:11",
+        reaction="👍",
+    )
+    assert packet.as_dict()["reply_to_message_id"] == "meshtastic:11"
+    assert packet.as_dict()["reaction"] == "👍"
 
 
 def test_numeric_coercion_rejects_booleans_nonfinite_values_and_overflow() -> None:
