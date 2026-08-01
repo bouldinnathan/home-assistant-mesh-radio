@@ -376,18 +376,22 @@ Meshtastic-Bluetooth-only, exact-target-only, allowlisted to owner/display
 fields, and fenced from SecurityConfig, keys, PSKs, destructive commands, and
 Home Assistant services.
 
-The traceroute command reserves a SQLite cooldown before any provider call. It
-permits one manual traceroute across the integration every 60 seconds;
-changing the gateway or destination cannot bypass that global floor, and a
-timeout consumes the reservation. Its admin-only status command reads the
-persisted cooldown and bounded last result without sending RF. No service,
-poller, reconnect task, or automatic graph path can invoke traceroute.
+The traceroute command rejects self and cached-only targets before reserving a
+SQLite cooldown, then copies the connected radio's configured LoRa hop limit
+into one RouteDiscovery request. It permits one manual traceroute across the
+integration every 60 seconds; changing the gateway or destination cannot
+bypass that global floor, and a timeout consumes the reservation. Stable error
+codes distinguish a zero-RF preflight from a post-reservation unknown outcome.
+Its admin-only status command reads the persisted cooldown and bounded last
+result without sending RF. No service, poller, reconnect task, or automatic
+graph path can invoke traceroute.
 
 The NeighborInfo command is similarly manual and administrator-only. Its
 SQLite reservation combines 180-second integration-wide and same-target floors
-shared across gateways. The BLE client sends one exact unicast request marker,
-accepts only a local non-MQTT source/to/channel/request-ID correlated response,
-caps it at ten neighbors, and never retries. Its status endpoint reads the
+shared across gateways. The BLE client sends one exact unicast request marker
+using the radio's configured LoRa hop limit, accepts only a local non-MQTT
+source/to/channel/request-ID correlated response, caps it at ten neighbors, and
+never retries. Its status endpoint reads the
 persisted cooldown and sanitized result without reaching a radio. Firmware
 2.7.26 is the verified request implementation and the target module must be
 enabled; older firmware may reject or time out. A response is cached zero-hop

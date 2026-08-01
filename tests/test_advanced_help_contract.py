@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 
 GUIDE = Path("docs/ADVANCED_MESH_OPERATIONS.md")
+README = Path("README.md")
+EXAMPLE_AUTOMATIONS = Path("examples/automations.yaml")
 
 
 def _guide() -> str:
@@ -49,3 +51,30 @@ def test_advanced_guide_separates_evidence_distance_and_signal_strength() -> Non
     assert "SNR/RSSI never substitutes for GPS" in guide
     assert "Home Assistant location fallback" in guide
     assert "20, 50, or 100 most recently heard nodes" in guide
+
+
+def test_hacs_readme_has_basic_message_and_telemetry_instructions() -> None:
+    """The HACS landing page must explain normal operation without doc hunting."""
+    readme = README.read_text(encoding="utf-8")
+
+    for required in (
+        "Messages and sensor data quick start",
+        "meshnet.broadcast_message",
+        "meshnet.send_message",
+        "meshnet_message_received",
+        "Receive and log radio telemetry",
+        "Home Assistant Recorder",
+        "Online",
+        "Last heard",
+    ):
+        assert required in readme
+
+
+def test_published_automation_examples_use_real_targets_and_event_fields() -> None:
+    """Public examples must not depend on rejected identities or absent fields."""
+    examples = EXAMPLE_AUTOMATIONS.read_text(encoding="utf-8")
+
+    assert "meshtastic:security" not in examples
+    assert "trigger.event.data.priority" not in examples
+    assert "trigger.event.data.message_type" not in examples
+    assert "trigger.event.data.delivery" in examples

@@ -537,6 +537,13 @@ Restart Home Assistant after restoring.
 
 ## Uninstall
 
+If you want zero MeshNet presentation data in this browser, first open the main
+**Mesh** view and press the card-layout **Reset** button. That deletes the sole
+versioned browser-storage record (card order and bounded sizes only). HACS
+cannot run the removed panel afterward, so it cannot perform that browser-side
+step during uninstall. No message, node, gateway, setting, credential, or key
+is stored in that record.
+
 Deleting the config entry or uninstalling through HACS never changes external
 BlueZ bonds. This is deliberate: BlueZ exposes no bond-generation identifier,
 so a stored address cannot prove that another app did not recreate the current

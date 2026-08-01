@@ -25,6 +25,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
+from .aiomeshtastic.errors import MeshtasticNeighborInfoError
 from .const import (
     ATTR_CHANNEL,
     ATTR_GATEWAY_ID,
@@ -82,7 +83,7 @@ from .node_identity import (
     meshtastic_unsafe_identity_keys,
     project_effective_nodes,
 )
-from .panel_telemetry import PanelTelemetry
+from .panel_telemetry import PanelTelemetry, safe_error_type
 from .rate_limiter import TokenBucket
 from .remote_admin import RemoteAdminManager
 from .store import MeshStore
@@ -158,6 +159,80 @@ LOCATION_PROVENANCE_WARNING = (
 
 _AGE_BUCKETS = ("<15m", "15m-1h", "1-6h", "6-24h", ">=1d", "unknown")
 _HOP_BUCKETS = ("0", "1", "2", "3", "4-7", ">=8", "unknown")
+
+_TRACEROUTE_PUBLIC_MESSAGES = {
+    "traceroute_unavailable": "Manual traceroute is temporarily unavailable",
+    "traceroute_gateway_not_found": "The selected traceroute gateway is unavailable",
+    "traceroute_requires_bluetooth": "Traceroute requires a connected Meshtastic Bluetooth gateway",
+    "traceroute_gateway_disconnected": "The selected traceroute gateway is disconnected",
+    "traceroute_target_invalid": "Select one exact Meshtastic node",
+    "traceroute_target_unknown": "The selected traceroute target is unavailable in the active radio session",
+    "traceroute_target_self": "A gateway cannot traceroute itself",
+    "traceroute_cooldown": "The integration-wide traceroute cooldown is active",
+    "traceroute_timeout": "The traceroute timed out and was not retried",
+    "traceroute_invalid_response": "The traceroute response failed validation",
+    "traceroute_lifecycle_changed": "Manual traceroute result was discarded because the integration lifecycle changed",
+    "traceroute_failed": "The traceroute could not be completed",
+    "traceroute_preflight_failed": "MeshNet could not validate traceroute availability",
+}
+
+_NEIGHBOR_INFO_PUBLIC_MESSAGES = {
+    "neighbor_info_unavailable": "Manual NeighborInfo is temporarily unavailable",
+    "neighbor_info_gateway_not_found": "The selected NeighborInfo gateway is unavailable",
+    "neighbor_info_requires_bluetooth": "NeighborInfo requires a connected Meshtastic Bluetooth gateway",
+    "neighbor_info_gateway_disconnected": "The selected NeighborInfo gateway is disconnected",
+    "neighbor_info_target_invalid": "Select one exact Meshtastic node",
+    "neighbor_info_target_unknown": "The selected NeighborInfo target is unavailable in the active radio session",
+    "neighbor_info_target_self": "A gateway cannot request its own NeighborInfo",
+    "neighbor_info_cooldown": "The NeighborInfo cooldown is active",
+    "neighbor_info_preflight_failed": "MeshNet could not validate NeighborInfo availability",
+    "neighbor_info_unsupported": "The target does not support remote NeighborInfo or its NeighborInfo module is disabled",
+    "neighbor_info_rejected": "The NeighborInfo request was rejected by the mesh and was not retried",
+    "neighbor_info_timeout": "The NeighborInfo request timed out and was not retried",
+    "neighbor_info_disconnected": "Bluetooth disconnected while waiting for NeighborInfo; the request was not retried",
+    "neighbor_info_send_failed": "NeighborInfo transmission could not be confirmed and was not retried",
+    "neighbor_info_invalid_response": "The NeighborInfo response failed validation",
+    "neighbor_info_lifecycle_changed": "The NeighborInfo result was discarded because the integration lifecycle changed",
+    "neighbor_info_failed": "The NeighborInfo request could not be completed",
+}
+
+
+class TracerouteError(HomeAssistantError):
+    """A privacy-safe traceroute failure with an explicit RF safety phase."""
+
+    def __init__(
+        self,
+        code: str,
+        *,
+        rf_may_have_been_sent: bool = False,
+        telemetry_category: str = "validation",
+    ) -> None:
+        if code not in _TRACEROUTE_PUBLIC_MESSAGES:
+            code = "traceroute_failed"
+        self.code = code
+        self.public_message = _TRACEROUTE_PUBLIC_MESSAGES[code]
+        self.rf_may_have_been_sent = rf_may_have_been_sent
+        self.telemetry_category = telemetry_category
+        super().__init__(self.public_message)
+
+
+class NeighborInfoError(HomeAssistantError):
+    """A privacy-safe NeighborInfo failure with an explicit RF safety phase."""
+
+    def __init__(
+        self,
+        code: str,
+        *,
+        rf_may_have_been_sent: bool = False,
+        telemetry_category: str = "validation",
+    ) -> None:
+        if code not in _NEIGHBOR_INFO_PUBLIC_MESSAGES:
+            code = "neighbor_info_failed"
+        self.code = code
+        self.public_message = _NEIGHBOR_INFO_PUBLIC_MESSAGES[code]
+        self.rf_may_have_been_sent = rf_may_have_been_sent
+        self.telemetry_category = telemetry_category
+        super().__init__(self.public_message)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1651,8 +1726,9 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             or getattr(self, "_shutting_down", False)
             or getattr(self, "_reconnect_suspended", False)
         ):
-            raise HomeAssistantError(
-                "Manual radio operations are temporarily unavailable"
+            raise TracerouteError(
+                "traceroute_unavailable",
+                telemetry_category="lifecycle",
             )
         task = asyncio.current_task()
         tasks = getattr(self, "_traceroute_tasks", None)
@@ -1667,8 +1743,9 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                 or getattr(self, "_shutting_down", False)
                 or getattr(self, "_reconnect_suspended", False)
             ):
-                raise HomeAssistantError(
-                    "Manual radio operations are temporarily unavailable"
+                raise TracerouteError(
+                    "traceroute_unavailable",
+                    telemetry_category="lifecycle",
                 )
             return await self._async_manual_traceroute(
                 gateway_id=gateway_id,
@@ -1686,36 +1763,64 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
     ) -> dict[str, Any]:
         """Run one explicit, cooldown-protected BLE unicast traceroute."""
         if not isinstance(gateway_id, str) or not gateway_id or len(gateway_id) > 128:
-            raise HomeAssistantError("Invalid MeshNet gateway ID")
+            raise TracerouteError("traceroute_gateway_not_found")
         gateway = self.gateways.get(gateway_id)
         if gateway is None:
-            raise HomeAssistantError("Unknown MeshNet gateway")
+            raise TracerouteError(
+                "traceroute_gateway_not_found",
+                telemetry_category="availability",
+            )
         if (
             _known_protocol(gateway.config.protocol) != PROTOCOL_MESHTASTIC
             or gateway.config.transport != TRANSPORT_BLUETOOTH
         ):
-            raise HomeAssistantError("Manual traceroute requires a Meshtastic Bluetooth gateway")
+            raise TracerouteError("traceroute_requires_bluetooth")
         if not gateway.status.connected:
-            raise HomeAssistantError("The selected gateway is not connected")
+            raise TracerouteError(
+                "traceroute_gateway_disconnected",
+                telemetry_category="availability",
+            )
         if not isinstance(target_node, str) or target_node != target_node.strip() or len(target_node) > 128:
-            raise HomeAssistantError("Select one exact known node")
+            raise TracerouteError("traceroute_target_invalid")
         node = self.snapshot.nodes.get(target_node)
         if node is None or node.node_key != target_node:
-            raise HomeAssistantError("Select one exact known node")
+            raise TracerouteError(
+                "traceroute_target_unknown",
+                telemetry_category="availability",
+            )
         if _known_protocol(node.protocol) != PROTOCOL_MESHTASTIC:
-            raise HomeAssistantError("Select one Meshtastic node")
+            raise TracerouteError("traceroute_target_invalid")
         provider_target = canonical_meshtastic_node_id(node.node_id)
         if provider_target is None or target_node != f"meshtastic:{provider_target}":
-            raise HomeAssistantError("The selected node identity is invalid")
+            raise TracerouteError("traceroute_target_invalid")
         local_node_id = canonical_meshtastic_node_id(getattr(gateway, "local_node_id", None))
         if local_node_id is not None and provider_target == local_node_id:
-            raise HomeAssistantError("A gateway cannot traceroute itself")
+            raise TracerouteError("traceroute_target_self")
 
-        reservation = await self.store.async_reserve_traceroute(
-            gateway_id,
-            target_node,
-            cooldown_seconds=MANUAL_TRACEROUTE_COOLDOWN_SECONDS,
-        )
+        observed_checker = getattr(self, "node_observed_this_session", None)
+        if (
+            hasattr(self, "_session_observed_node_keys")
+            and callable(observed_checker)
+            and not observed_checker(target_node)
+        ):
+            raise TracerouteError(
+                "traceroute_target_unknown",
+                telemetry_category="availability",
+            )
+
+        try:
+            reservation = await self.store.async_reserve_traceroute(
+                gateway_id,
+                target_node,
+                cooldown_seconds=MANUAL_TRACEROUTE_COOLDOWN_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise TracerouteError(
+                "traceroute_preflight_failed",
+                telemetry_category="availability",
+            ) from None
         reserved = (
             reservation
             if isinstance(reservation, bool)
@@ -1723,9 +1828,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             and (reservation.get("reserved") is True or reservation.get("status") == "reserved")
         )
         if not reserved:
-            raise HomeAssistantError(
-                "MeshNet permits at most one manual traceroute every 60 seconds"
-            )
+            raise TracerouteError("traceroute_cooldown")
 
         try:
             provider_result = await gateway.async_manual_traceroute(provider_target)
@@ -1733,28 +1836,68 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             raise
         except Exception as err:
             category = _diagnostic_error_category(str(err))
-            raise HomeAssistantError(f"Manual traceroute failed ({category})") from None
+            code = "traceroute_timeout" if category == "timeout" else "traceroute_failed"
+            raise TracerouteError(
+                code,
+                rf_may_have_been_sent=True,
+                telemetry_category="timeout" if category == "timeout" else "connection",
+            ) from None
 
         if (
             not getattr(self, "_radio_operations_accepting", True)
             or getattr(self, "_shutting_down", False)
             or getattr(self, "_reconnect_suspended", False)
         ):
-            raise HomeAssistantError(
-                "Manual traceroute result was discarded because the integration "
-                "lifecycle changed"
+            raise TracerouteError(
+                "traceroute_lifecycle_changed",
+                rf_may_have_been_sent=True,
+                telemetry_category="lifecycle",
             )
 
-        result = self._validated_manual_traceroute_result(
-            provider_result,
-            gateway_id=gateway_id,
-            target_node=target_node,
-            provider_target=provider_target,
-            local_node_id=local_node_id,
-        )
-        await self.store.async_store_traceroute_result(gateway_id, target_node, result)
+        try:
+            result = self._validated_manual_traceroute_result(
+                provider_result,
+                gateway_id=gateway_id,
+                target_node=target_node,
+                provider_target=provider_target,
+                local_node_id=local_node_id,
+            )
+        except HomeAssistantError:
+            raise TracerouteError(
+                "traceroute_invalid_response",
+                rf_may_have_been_sent=True,
+                telemetry_category="data",
+            ) from None
+        try:
+            await self.store.async_store_traceroute_result(
+                gateway_id, target_node, result
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise TracerouteError(
+                "traceroute_failed",
+                rf_may_have_been_sent=True,
+                telemetry_category="availability",
+            ) from None
         status_getter = getattr(self.store, "async_get_traceroute_status", None)
-        status = await status_getter(gateway_id, target_node) if callable(status_getter) else None
+        try:
+            status = (
+                await status_getter(gateway_id, target_node)
+                if callable(status_getter)
+                else None
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            # The RF result was already validated and durably stored. Failure
+            # of this optional convenience read must not turn a successful
+            # one-shot request into an ambiguous failure in the panel.
+            _LOGGER.debug(
+                "Could not attach traceroute cooldown metadata (%s)",
+                _safe_error_type(err),
+            )
+            status = None
         if isinstance(status, Mapping):
             next_allowed_at = status.get("next_allowed_at")
             if isinstance(next_allowed_at, str):
@@ -1847,8 +1990,9 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             or getattr(self, "_shutting_down", False)
             or getattr(self, "_reconnect_suspended", False)
         ):
-            raise HomeAssistantError(
-                "Manual radio operations are temporarily unavailable"
+            raise NeighborInfoError(
+                "neighbor_info_unavailable",
+                telemetry_category="lifecycle",
             )
         task = asyncio.current_task()
         tasks = getattr(self, "_traceroute_tasks", None)
@@ -1863,8 +2007,9 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                 or getattr(self, "_shutting_down", False)
                 or getattr(self, "_reconnect_suspended", False)
             ):
-                raise HomeAssistantError(
-                    "Manual radio operations are temporarily unavailable"
+                raise NeighborInfoError(
+                    "neighbor_info_unavailable",
+                    telemetry_category="lifecycle",
                 )
             return await self._async_manual_neighbor_info(
                 gateway_id=gateway_id,
@@ -1886,42 +2031,68 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             or not gateway_id
             or len(gateway_id) > 128
         ):
-            raise HomeAssistantError("Invalid MeshNet gateway ID")
+            raise NeighborInfoError("neighbor_info_gateway_not_found")
         gateway = self.gateways.get(gateway_id)
         if gateway is None:
-            raise HomeAssistantError("Unknown MeshNet gateway")
+            raise NeighborInfoError(
+                "neighbor_info_gateway_not_found",
+                telemetry_category="availability",
+            )
         if (
             _known_protocol(gateway.config.protocol) != PROTOCOL_MESHTASTIC
             or gateway.config.transport != TRANSPORT_BLUETOOTH
         ):
-            raise HomeAssistantError(
-                "Manual NeighborInfo requires a Meshtastic Bluetooth gateway"
-            )
+            raise NeighborInfoError("neighbor_info_requires_bluetooth")
         if not gateway.status.connected:
-            raise HomeAssistantError("The selected gateway is not connected")
+            raise NeighborInfoError(
+                "neighbor_info_gateway_disconnected",
+                telemetry_category="availability",
+            )
         if (
             not isinstance(target_node, str)
             or target_node != target_node.strip()
             or len(target_node) > 128
         ):
-            raise HomeAssistantError("Select one exact known node")
+            raise NeighborInfoError("neighbor_info_target_invalid")
         node = self.snapshot.nodes.get(target_node)
         if node is None or node.node_key != target_node:
-            raise HomeAssistantError("Select one exact known node")
+            raise NeighborInfoError(
+                "neighbor_info_target_unknown",
+                telemetry_category="availability",
+            )
         if _known_protocol(node.protocol) != PROTOCOL_MESHTASTIC:
-            raise HomeAssistantError("Select one Meshtastic node")
+            raise NeighborInfoError("neighbor_info_target_invalid")
         provider_target = canonical_meshtastic_node_id(node.node_id)
         if provider_target is None or target_node != f"meshtastic:{provider_target}":
-            raise HomeAssistantError("The selected node identity is invalid")
+            raise NeighborInfoError("neighbor_info_target_invalid")
         local_node_id = canonical_meshtastic_node_id(
             getattr(gateway, "local_node_id", None)
         )
         if local_node_id is not None and provider_target == local_node_id:
-            raise HomeAssistantError("A gateway cannot request itself")
+            raise NeighborInfoError("neighbor_info_target_self")
 
-        reservation = await self.store.async_reserve_neighbor_info_request(
-            gateway_id, target_node
-        )
+        observed_checker = getattr(self, "node_observed_this_session", None)
+        if (
+            hasattr(self, "_session_observed_node_keys")
+            and callable(observed_checker)
+            and not observed_checker(target_node)
+        ):
+            raise NeighborInfoError(
+                "neighbor_info_target_unknown",
+                telemetry_category="availability",
+            )
+
+        try:
+            reservation = await self.store.async_reserve_neighbor_info_request(
+                gateway_id, target_node
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise NeighborInfoError(
+                "neighbor_info_preflight_failed",
+                telemetry_category="availability",
+            ) from None
         reserved = (
             reservation
             if isinstance(reservation, bool)
@@ -1932,42 +2103,95 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             )
         )
         if not reserved:
-            raise HomeAssistantError(
-                "The NeighborInfo request cooldown is active"
-            )
+            raise NeighborInfoError("neighbor_info_cooldown")
+        reserved_next_allowed_at = (
+            reservation.get("next_allowed_at")
+            if isinstance(reservation, Mapping)
+            and isinstance(reservation.get("next_allowed_at"), str)
+            else None
+        )
         try:
             provider_result = await gateway.async_manual_neighbor_info(
                 provider_target
             )
         except asyncio.CancelledError:
             raise
-        except Exception as err:
-            category = _diagnostic_error_category(str(err))
-            raise HomeAssistantError(
-                f"Manual NeighborInfo failed ({category})"
+        except MeshtasticNeighborInfoError as err:
+            category = {
+                "neighbor_info_timeout": "timeout",
+                "neighbor_info_disconnected": "connection",
+                "neighbor_info_send_failed": "connection",
+                "neighbor_info_rejected": "availability",
+                "neighbor_info_unsupported": "availability",
+            }.get(err.code, "internal")
+            raise NeighborInfoError(
+                err.code,
+                rf_may_have_been_sent=True,
+                telemetry_category=category,
+            ) from None
+        except TimeoutError:
+            raise NeighborInfoError(
+                "neighbor_info_timeout",
+                rf_may_have_been_sent=True,
+                telemetry_category="timeout",
+            ) from None
+        except Exception:
+            raise NeighborInfoError(
+                "neighbor_info_failed",
+                rf_may_have_been_sent=True,
+                telemetry_category="connection",
             ) from None
         if (
             not getattr(self, "_radio_operations_accepting", True)
             or getattr(self, "_shutting_down", False)
             or getattr(self, "_reconnect_suspended", False)
         ):
-            raise HomeAssistantError(
-                "Manual NeighborInfo result was discarded because the "
-                "integration lifecycle changed"
+            raise NeighborInfoError(
+                "neighbor_info_lifecycle_changed",
+                rf_may_have_been_sent=True,
+                telemetry_category="lifecycle",
             )
-        result = self._validated_manual_neighbor_info_result(
-            provider_result,
-            gateway_id=gateway_id,
-            target_node=target_node,
-            provider_target=provider_target,
-            local_node_id=local_node_id,
-        )
-        await self.store.async_store_neighbor_info_result(
-            gateway_id, target_node, result
-        )
-        status = await self.store.async_get_neighbor_info_request_status(
-            target_node
-        )
+        try:
+            result = self._validated_manual_neighbor_info_result(
+                provider_result,
+                gateway_id=gateway_id,
+                target_node=target_node,
+                provider_target=provider_target,
+                local_node_id=local_node_id,
+            )
+        except Exception:
+            raise NeighborInfoError(
+                "neighbor_info_invalid_response",
+                rf_may_have_been_sent=True,
+                telemetry_category="data",
+            ) from None
+        try:
+            await self.store.async_store_neighbor_info_result(
+                gateway_id, target_node, result
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise NeighborInfoError(
+                "neighbor_info_failed",
+                rf_may_have_been_sent=True,
+                telemetry_category="internal",
+            ) from None
+        if reserved_next_allowed_at is not None:
+            result["next_allowed_at"] = reserved_next_allowed_at
+        try:
+            status = await self.store.async_get_neighbor_info_request_status(
+                target_node
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            _LOGGER.warning(
+                "NeighborInfo result stored but cooldown status refresh failed; "
+                "returning the validated result (error_type=%s)",
+                safe_error_type(type(err).__name__),
+            )
+            return result
         if isinstance(status, Mapping):
             next_allowed_at = status.get("next_allowed_at")
             if isinstance(next_allowed_at, str):

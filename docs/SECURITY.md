@@ -239,6 +239,23 @@ address-scoped current-bond deletion; it is off by default and warns that other
 apps may be disconnected. This consent is not presented as proof that the
 current bond is the historical one MeshNet created.
 
+## Browser Layout Storage
+
+MeshNet persists one non-sensitive presentation value in the current browser:
+the main Mesh workspace card layout. The versioned record has a 4 KiB maximum,
+requires the exact fixed card-ID permutation, and accepts only allowlisted
+integer width/height values within UI bounds. Invalid, unknown-version, or
+oversized data is deleted. Storage denial or quota failure falls back to
+in-memory defaults without a Home Assistant service, WebSocket, SQLite, or
+radio write.
+
+Messages, node or gateway data, settings drafts, endpoints, credentials,
+public/private keys, and graph positions are outside that schema and are never
+written to browser storage. **Reset** removes the record. HACS cannot execute
+JavaScript after uninstall, so use **Reset** first when zero browser-layout
+residue is required; leaving the bounded layout record cannot affect Home
+Assistant or a radio.
+
 ## Diagnostics
 
 MeshNet's `data` section contains detailed cached health, lifecycle, version, telemetry, and

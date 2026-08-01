@@ -12,6 +12,9 @@ try:
     from meshtastic.protobuf import mesh_pb2, portnums_pb2
 
     from custom_components.meshnet.aiomeshtastic.client import MeshtasticBluetoothClient
+    from custom_components.meshnet.aiomeshtastic.errors import (
+        MeshtasticNeighborInfoError,
+    )
     from custom_components.meshnet.meshtastic_client import (
         meshtastic_node_to_state,
         meshtastic_packet_to_node,
@@ -200,13 +203,15 @@ def _active_neighbor_request_client(
     via_mqtt: bool = False,
     neighbor_count: int = 1,
     bad_correlations_first: bool = False,
+    routing_error: str | None = None,
+    response_timeout: float = 0.02,
 ):
     local_num = 0x10203040
     target_num = 0x50607080
     client = MeshtasticBluetoothClient(
         address="AA:BB:CC:DD:EE:FF",
         device_provider=lambda: None,
-        admin_response_timeout=0.02,
+        admin_response_timeout=response_timeout,
     )
 
     class Connection:
@@ -227,6 +232,7 @@ def _active_neighbor_request_client(
             assert packet.channel == 0
             assert packet.want_ack is True
             assert packet.priority == mesh_pb2.MeshPacket.Priority.RELIABLE
+            assert packet.hop_limit == 3
             assert packet.decoded.portnum == portnums_pb2.NEIGHBORINFO_APP
             assert packet.decoded.want_response is True
             requested = mesh_pb2.NeighborInfo()
@@ -271,10 +277,13 @@ def _active_neighbor_request_client(
                 client._handle_from_radio(response.SerializeToString())
 
             def deliver_routing_error(
-                *, destination: int = local_num, mqtt: bool = False
+                *,
+                reason: str = "NO_ROUTE",
+                destination: int = local_num,
+                mqtt: bool = False,
             ) -> None:
                 routing = mesh_pb2.Routing()
-                routing.error_reason = mesh_pb2.Routing.Error.Value("NO_ROUTE")
+                routing.error_reason = mesh_pb2.Routing.Error.Value(reason)
                 response = mesh_pb2.FromRadio()
                 setattr(response.packet, "from", target_num)
                 response.packet.to = destination
@@ -293,12 +302,16 @@ def _active_neighbor_request_client(
                 deliver_neighbor(reporter=target_num + 1)
                 deliver_routing_error(destination=local_num + 1)
                 deliver_routing_error(mqtt=True)
+            if routing_error is not None:
+                deliver_routing_error(reason=routing_error)
+                return
             deliver_neighbor(mqtt=via_mqtt)
 
     connection = Connection()
     client._connection = connection  # type: ignore[assignment]
     client._connected = True
     client._my_node_num = local_num
+    client._settings._configs["lora"] = SimpleNamespace(hop_limit=3)
     client._nodes = {
         local_num: {"num": local_num},
         target_num: {
@@ -352,8 +365,9 @@ def test_manual_neighbor_info_rejects_mqtt_response_and_inconsistent_target() ->
         mqtt_client, mqtt_connection = _active_neighbor_request_client(
             via_mqtt=True
         )
-        with pytest.raises(RuntimeError, match="timed out"):
+        with pytest.raises(MeshtasticNeighborInfoError) as timed_out:
             await mqtt_client.async_manual_neighbor_info("!50607080")
+        assert timed_out.value.code == "neighbor_info_timeout"
         assert len(mqtt_connection.packets) == 1
 
         bad_client, bad_connection = _active_neighbor_request_client()
@@ -441,11 +455,74 @@ def test_manual_neighbor_info_timeout_is_never_retried() -> None:
     async def run() -> None:
         client, connection = _active_neighbor_request_client(respond=False)
 
-        with pytest.raises(RuntimeError, match="timed out"):
+        with pytest.raises(MeshtasticNeighborInfoError) as timed_out:
             await client.async_manual_neighbor_info("!50607080")
+        assert timed_out.value.code == "neighbor_info_timeout"
 
         assert len(connection.packets) == 1
         assert client._pending_neighbor_info_responses == {}
+        diagnostics = client.diagnostic_snapshot()
+        assert diagnostics["neighbor_info_timeout_count"] == 1
+        assert diagnostics["neighbor_info_rejection_count"] == 0
+        assert diagnostics["neighbor_info_cancellation_count"] == 0
+        assert diagnostics["last_neighbor_info_outcome"] == "timed_out"
+
+    asyncio.run(run())
+
+
+def test_manual_neighbor_info_routing_rejection_is_exact_and_diagnostic() -> None:
+    """A correlated firmware NAK exposes only its stable enum and is not retried."""
+
+    async def run() -> None:
+        client, connection = _active_neighbor_request_client(
+            routing_error="BAD_REQUEST"
+        )
+
+        with pytest.raises(MeshtasticNeighborInfoError) as rejected:
+            await client.async_manual_neighbor_info("!50607080")
+        assert rejected.value.code == "neighbor_info_unsupported"
+
+        assert len(connection.packets) == 1
+        assert client._pending_neighbor_info_responses == {}
+        diagnostics = client.diagnostic_snapshot()
+        assert diagnostics["neighbor_info_rejection_count"] == 1
+        assert diagnostics["neighbor_info_timeout_count"] == 0
+        assert diagnostics["neighbor_info_cancellation_count"] == 0
+        assert diagnostics["last_neighbor_info_outcome"] == "rejected"
+        assert diagnostics["last_neighbor_info_routing_error"] == "BAD_REQUEST"
+        assert diagnostics["neighbor_info_routing_error_counts"] == {
+            "BAD_REQUEST": 1
+        }
+
+    asyncio.run(run())
+
+
+def test_manual_neighbor_info_cancellation_is_distinct_and_never_retried() -> None:
+    """Caller cancellation tears down the sole waiter without another RF send."""
+
+    async def run() -> None:
+        client, connection = _active_neighbor_request_client(
+            respond=False,
+            response_timeout=30.0,
+        )
+        task = asyncio.create_task(
+            client.async_manual_neighbor_info("!50607080")
+        )
+        for _ in range(10):
+            if connection.packets:
+                break
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert len(connection.packets) == 1
+        assert client._pending_neighbor_info_responses == {}
+        diagnostics = client.diagnostic_snapshot()
+        assert diagnostics["neighbor_info_cancellation_count"] == 1
+        assert diagnostics["neighbor_info_timeout_count"] == 0
+        assert diagnostics["neighbor_info_rejection_count"] == 0
+        assert diagnostics["last_neighbor_info_outcome"] == "cancelled"
 
     asyncio.run(run())
 

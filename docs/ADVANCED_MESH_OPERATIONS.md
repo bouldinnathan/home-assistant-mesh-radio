@@ -21,7 +21,7 @@ correlate, cancel, and verify every request without blocking Home Assistant.
 | Apply remote settings | Yes | Never | Meshtastic Bluetooth | Sanitized result only |
 | Run a traceroute | Yes | Never | Meshtastic Bluetooth | Cooldown and sanitized route |
 | Request NeighborInfo | Yes | Never | Meshtastic Bluetooth | Cooldowns and sanitized report |
-| Reorder or resize main Mesh cards | No | Never | Not applicable | Current panel-instance memory only |
+| Reorder or resize main Mesh cards | No | Never | Not applicable | Validated browser-only layout |
 | Move, filter, or sort the graph | No | Browser animation only | Not applicable | Current panel-instance memory only |
 
 The following rules are invariants, not UI suggestions:
@@ -50,10 +50,14 @@ The following rules are invariants, not UI suggestions:
 
 Each side card on the main **Mesh** view can be reordered with a drag handle or
 the accessible earlier/later buttons. A corner handle supports pointer resizing
-and keyboard arrow resizing. Order and size are bounded and remain only in the
-current panel instance; they are never written to browser storage, Home
-Assistant state or configuration, SQLite, or radio firmware. **Reset** and
-panel detachment both restore the default layout.
+and keyboard arrow resizing. Order and size are saved in a versioned browser
+record so they survive navigation and reloads. Its exact schema accepts only
+the fixed card-ID permutation and allowlisted bounded integer dimensions; it
+cannot contain messages, node or gateway data, settings drafts, credentials,
+or keys. It is never written to Home Assistant state or configuration, SQLite,
+or radio firmware. Invalid or inaccessible browser storage fails closed to the
+in-memory defaults. **Reset** restores the default and deletes the browser
+record; use it before uninstall if the browser record must also be removed.
 
 Both direct-message recipient selectors and the remote-administration,
 traceroute, and NeighborInfo target selectors share one deterministic order:
@@ -61,6 +65,11 @@ favorites first, then valid last-seen timestamps from newest to oldest, with
 stable name/identity tie-breakers. Favorite stars and last-seen labels are
 visible in each selector. Invalid, ambiguous, and duplicate identities are not
 offered as advanced radio-operation targets.
+
+Traceroute applies two additional selected-gateway checks: the gateway's own
+node and nodes not observed during the active radio session are omitted. The
+backend repeats those checks before cooldown reservation, so a stale browser
+cannot turn a rejected preflight into RF traffic.
 
 The node-row **NeighborInfo** button performs no status request and transmits no
 RF packet. It revalidates and selects one exact cached Meshtastic identity,
@@ -245,8 +254,9 @@ Traceroute is intentionally separate from graph refresh.
 3. Press **Traceroute**, review the RF-traffic notice, and confirm.
 4. MeshNet reserves the integration-wide cooldown in SQLite.
 5. One RouteDiscovery application packet is submitted to that destination;
-   MeshNet performs no application retry. Firmware may still relay or
-   retransmit reliable traffic.
+   it inherits the connected radio's configured LoRa hop limit. MeshNet
+   performs no application retry. Firmware may still relay or retransmit
+   reliable traffic.
 6. A correlated response, routing rejection, or timeout completes the action.
 
 The button displays the next permitted time. The backend permits at most one
@@ -259,6 +269,12 @@ airtime budget. A rejected local validation does not reserve airtime; once the
 backend reaches the reservation step, all outcomes consume the minute because RF
 transmission may have occurred.
 
+The panel distinguishes stable preflight failures from an unknown
+post-reservation outcome. Self, stale-session, gateway, and validation failures
+send no RF and do not fabricate a new browser cooldown. If a request may have
+been submitted, the panel remains locked and the persisted status endpoint is
+authoritative before another attempt.
+
 There is no traceroute Home Assistant service and no automation action in the
 initial implementation. It cannot be invoked by snapshot polling, coordinator
 refresh, reconnection, diagnostics, graph animation, map opening, or startup.
@@ -270,7 +286,8 @@ An administrator may request one exact known Meshtastic node's cached
 NeighborInfo report through a connected Bluetooth gateway. MeshNet atomically
 reserves 180-second integration-wide and same-target cooldowns in SQLite
 before submitting one unicast application packet without an application-level
-retry. Those floors
+retry. The request inherits the connected controller radio's configured LoRa
+hop limit. Those floors
 are shared by every gateway and browser and survive Home Assistant restarts.
 
 The request is never sent by graph rendering, refresh, startup, reconnection,
@@ -283,6 +300,13 @@ enabled on the target. Older firmware may reject it or time out. The successful
 result is cached zero-hop evidence, not a live scan; an empty successful report
 means no cached neighbors, while a timeout is unknown. Every post-reservation
 outcome consumes both cooldowns.
+
+Privacy-safe Bluetooth diagnostics count response, routing rejection, timeout,
+cancellation, send failure, and disconnect separately. A correlated routing
+NAK retains only its bounded protocol enum (for example `BAD_REQUEST`), never a
+node ID or raw packet. `BAD_REQUEST` can mean that the target firmware
+does not support the request or Neighbor Info is disabled; MeshNet still never
+retries it.
 
 ### Route interpretation
 
@@ -459,8 +483,9 @@ This is not promiscuous capture:
 - Packet deduplication and LoRa/MQTT provenance remain visible where known.
 
 For automations, prefer a node's Home Assistant sensor state over a generic
-packet event. Entity availability and `last_heard` show freshness; MeshNet does
-not poll remote sensors merely because a dashboard is open.
+packet event. A cached sensor remains available after its node goes offline, so
+check that node's **Online** and **Last heard** entities for freshness. MeshNet
+does not poll remote sensors merely because a dashboard is open.
 
 ## Privacy, Recovery, and Uninstall
 
@@ -470,15 +495,19 @@ Advanced features keep MeshNet compartmentalized as a custom integration:
 - The browser cannot call provider objects directly.
 - Cooldowns and cached routes live in `meshnet.sqlite3` with the existing
   integration history; they do not alter Home Assistant core databases.
-- Browser drafts, card order and size, and force-layout coordinates are
-  current-panel-instance memory only.
+- Browser drafts and force-layout coordinates remain current-panel-instance
+  memory only. The sole persistent browser value is the versioned Mesh-card
+  layout: an exact allowlist of card IDs and bounded integer sizes. **Reset**
+  deletes it; no content, identity, setting, credential, or key is eligible.
 - Diagnostics remain cached and redacted and never run remote admin or
   traceroute.
 - Unloading cancels in-flight waiters and animation owners. Late callbacks are
   fenced by gateway generation.
 - Removing the integration stops adapters and entities. HACS removal deletes
   component code; deleting `meshnet.sqlite3` after the integration is unloaded
-  removes the optional history/cooldown cache.
+  removes the optional history/cooldown cache. HACS cannot execute removed
+  panel code, so press **Reset** before uninstall to remove the browser-only
+  card-layout record too.
 
 If a remote setting has an unknown outcome, stop. Do not repeatedly press
 Apply. Reconnect locally with the official app/CLI, inspect the target, restore
@@ -521,6 +550,9 @@ The implementation is complete only when automated tests prove all of these:
 
 - Broadcast, self, unknown, ambiguous, wrong-protocol, and wrong-transport
   destinations fail before reservation or transmission.
+- The selected gateway and cached-only nodes are removed from the browser
+  target list; the backend independently requires active-session observation.
+- The packet copies the controller radio's bounded configured LoRa hop limit.
 - Reservation is atomic, stored before send, survives database reopen, and
   permits one manual traceroute across the entire MeshNet integration every
   60 seconds.

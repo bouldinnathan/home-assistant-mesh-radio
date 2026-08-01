@@ -621,6 +621,30 @@ after updating, then hard-refresh the browser once. The current panel has a
 separate **Delivery** selector, node sort selector, **Message** buttons, a Map
 link, and the heading **Cached evidence topology — no traceroutes sent automatically**.
 
+### Manual Traceroute or NeighborInfo Fails
+
+Install MeshNet 0.10.0 or newer, restart Home Assistant, and hard-refresh the
+browser. Earlier direct-Bluetooth request packets left the LoRa hop-limit field
+at its zero protobuf default, so a node reachable only through relays could
+fail even while normal app traffic worked. Current requests copy the connected
+radio's configured hop limit and are still submitted exactly once.
+
+Traceroute no longer offers the selected gateway itself or a node retained only
+from an older session. A self, unknown, stale-session, disconnected-gateway, or
+other preflight error occurs before cooldown reservation and sends no RF. A
+timeout or failure after reservation has an unknown RF outcome: do not retry;
+use **Reload persisted status** and wait for the one-minute floor.
+
+For NeighborInfo, use **Load persisted status**, select one exact active node,
+then perform the two-step request/confirmation once. The target must run
+compatible firmware and have its Neighbor Info module enabled. A routing
+`BAD_REQUEST` indicates that the target rejected the application request and
+can mean the module is disabled or unsupported. A timeout is not an empty
+neighbor list. Both cases consume the three-minute floors and are never
+automatically retried. Download diagnostics to compare the bounded
+`neighbor_info_*` response, rejection, timeout, cancellation, send-failure,
+and disconnect counters; those fields contain no node identities.
+
 ### Sidebar Control Loses Focus During Refresh
 
 MeshNet 0.5.10 continues collecting its five-second snapshots while a message

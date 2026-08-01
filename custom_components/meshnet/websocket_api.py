@@ -34,6 +34,8 @@ from .const import (
 )
 from .coordinator import (
     MeshNetCoordinator,
+    NeighborInfoError,
+    TracerouteError,
     message_api_dict,
     message_submission_response,
 )
@@ -128,11 +130,20 @@ async def _async_panel_operation(
         raise
     except Exception as err:
         category, error_type = classify_exception(err)
+        explicit_category = getattr(err, "telemetry_category", None)
+        if explicit_category in PANEL_ERROR_CATEGORIES:
+            category = explicit_category
+        explicit_code = getattr(err, "code", None)
+        error_code = (
+            explicit_code
+            if explicit_code in PANEL_ERROR_CODES
+            else "operation_failed"
+        )
         telemetry.record_failure(
             operation,
             category=category,
             error_type=error_type,
-            error_code="operation_failed",
+            error_code=error_code,
             duration_seconds=time.monotonic() - started,
         )
         raise
@@ -627,20 +638,26 @@ async def websocket_traceroute(
     """Run one explicit, server-governed BLE traceroute."""
     coordinator = _get_coordinator(hass)
     try:
-        result = await coordinator.async_manual_traceroute(
-            gateway_id=msg[ATTR_GATEWAY_ID],
-            target_node=msg[ATTR_TARGET_NODE],
+        result = await _async_panel_operation(
+            coordinator,
+            "traceroute_request",
+            lambda: coordinator.async_manual_traceroute(
+                gateway_id=msg[ATTR_GATEWAY_ID],
+                target_node=msg[ATTR_TARGET_NODE],
+            ),
         )
     except asyncio.CancelledError:
         raise
+    except TracerouteError as err:
+        connection.send_error(msg["id"], err.code, err.public_message)
     except Exception:
         connection.send_error(
             msg["id"],
             "traceroute_failed",
             "MeshNet could not complete the traceroute",
         )
-        return
-    send_sensitive_result(connection, msg["id"], result)
+    else:
+        send_sensitive_result(connection, msg["id"], result)
 
 
 @websocket_api.websocket_command(
@@ -662,11 +679,20 @@ async def websocket_traceroute_status(
     msg: dict[str, Any],
 ) -> None:
     """Read the integration-wide traceroute cooldown without transmitting RF."""
+    coordinator: Any | None = None
     try:
         if set(msg) != _TRACEROUTE_STATUS_KEYS:
             raise ValueError
         coordinator = _get_coordinator(hass)
-        result = await coordinator.store.async_get_global_traceroute_status()
+
+        async def load_status() -> Any:
+            return await coordinator.store.async_get_global_traceroute_status()
+
+        result = await _async_panel_operation(
+            coordinator,
+            "traceroute_status",
+            load_status,
+        )
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -698,20 +724,26 @@ async def websocket_neighbor_info(
     """Run one explicit, server-governed BLE NeighborInfo request."""
     coordinator = _get_coordinator(hass)
     try:
-        result = await coordinator.async_manual_neighbor_info(
-            gateway_id=msg[ATTR_GATEWAY_ID],
-            target_node=msg[ATTR_TARGET_NODE],
+        result = await _async_panel_operation(
+            coordinator,
+            "neighbor_info_request",
+            lambda: coordinator.async_manual_neighbor_info(
+                gateway_id=msg[ATTR_GATEWAY_ID],
+                target_node=msg[ATTR_TARGET_NODE],
+            ),
         )
     except asyncio.CancelledError:
         raise
+    except NeighborInfoError as err:
+        connection.send_error(msg["id"], err.code, err.public_message)
     except Exception:
         connection.send_error(
             msg["id"],
             "neighbor_info_failed",
             "MeshNet could not complete the NeighborInfo request",
         )
-        return
-    send_sensitive_result(connection, msg["id"], result)
+    else:
+        send_sensitive_result(connection, msg["id"], result)
 
 
 @websocket_api.websocket_command(
@@ -730,10 +762,15 @@ async def websocket_neighbor_info_status(
     msg: dict[str, Any],
 ) -> None:
     """Read persisted NeighborInfo cooldown/result state without RF."""
+    coordinator: Any | None = None
     try:
         coordinator = _get_coordinator(hass)
-        result = await coordinator.store.async_get_neighbor_info_request_status(
-            msg[ATTR_TARGET_NODE]
+        result = await _async_panel_operation(
+            coordinator,
+            "neighbor_info_status",
+            lambda: coordinator.store.async_get_neighbor_info_request_status(
+                msg[ATTR_TARGET_NODE]
+            ),
         )
     except asyncio.CancelledError:
         raise
@@ -884,6 +921,7 @@ def _panel_snapshot(coordinator: MeshNetCoordinator) -> dict[str, Any]:
     """Project only fields used by the panel, excluding raw provider state."""
     source = coordinator.snapshot
     node_items = list(islice(source.nodes.items(), MAX_PANEL_NODES))
+    observed_checker = getattr(coordinator, "node_observed_this_session", None)
     unsafe_node_keys = getattr(coordinator, "_unsafe_meshtastic_node_keys", None)
     if unsafe_node_keys is None:
         unsafe_node_keys = meshtastic_unsafe_identity_keys(dict(node_items))
@@ -893,6 +931,11 @@ def _panel_snapshot(coordinator: MeshNetCoordinator) -> dict[str, Any]:
             node_key: _panel_node(
                 node,
                 identity_valid=node_key not in unsafe_node_keys,
+                observed_this_session=(
+                    bool(observed_checker(node_key))
+                    if callable(observed_checker)
+                    else False
+                ),
             )
             for node_key, node in node_items
         },
@@ -935,7 +978,12 @@ def _panel_gateway(coordinator: MeshNetCoordinator, gateway_id: str, status: Any
     return projected
 
 
-def _panel_node(node: Any, *, identity_valid: bool) -> dict[str, Any]:
+def _panel_node(
+    node: Any,
+    *,
+    identity_valid: bool,
+    observed_this_session: bool = False,
+) -> dict[str, Any]:
     """Return the bounded node shape required by the sidebar."""
     connectivity = {
         key: node.connectivity[key]
@@ -1008,6 +1056,7 @@ def _panel_node(node: Any, *, identity_valid: bool) -> dict[str, Any]:
             if str(node.protocol).strip().casefold() == PROTOCOL_MESHTASTIC
             else True
         ),
+        "observed_this_session": observed_this_session is True,
         "node_id": node.node_id,
         "mac": node.mac,
         "public_key": node.public_key,

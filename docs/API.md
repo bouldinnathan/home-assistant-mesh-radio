@@ -81,14 +81,24 @@ outbox return `queued` and emit a correlated, privacy-safe
 This admin-only command accepts one exact cached Meshtastic identity and one
 connected Bluetooth gateway. The server atomically reserves the one-minute
 integration-wide cooldown before submitting one RouteDiscovery application
-packet, with no MeshNet retry. Firmware routing, relaying, and reliable-packet
-behavior can still create more than one physical RF transmission. It rejects broadcast,
-name-based, self, unknown, non-Bluetooth, and incompatible targets. There is no
+packet using the connected radio's configured LoRa hop limit, with no MeshNet
+retry. Firmware routing, relaying, and reliable-packet behavior can still create
+more than one physical RF transmission. It rejects broadcast, name-based, self,
+unknown, cached-only, non-Bluetooth, and incompatible targets. There is no
 service, scheduled form, automatic caller, or retry path.
 
 Successful results are versioned, bounded, correlated, and contain only the
 validated source, destination, channel, route identifiers, status, and time.
 Raw packets and provider exception text are never returned.
+
+Rejected commands use stable privacy-safe error codes, including
+`traceroute_target_self`, `traceroute_target_unknown`,
+`traceroute_gateway_disconnected`, `traceroute_cooldown`, and
+`traceroute_preflight_failed`. Those failures occur before provider submission
+and do not create a new cooldown. `traceroute_timeout`,
+`traceroute_invalid_response`, and the fallback `traceroute_failed` mean RF may
+have been submitted; the caller must reload persisted status and must not retry
+blindly.
 
 Read the current global cooldown and last bounded result without creating RF
 traffic:
@@ -115,12 +125,13 @@ no target and cannot reserve airtime or reach a radio.
 ```
 
 This administrator-only command submits one Meshtastic Bluetooth unicast
-application packet using the protocol's NeighborInfo request marker, with no
-MeshNet retry. The server reserves
+application packet using the protocol's NeighborInfo request marker and the
+connected radio's configured LoRa hop limit, with no MeshNet retry. The server reserves
 persisted 180-second integration-wide and same-target cooldowns before RF.
 There is no service, automatic caller, broadcast, batch,
 or retry path. No response is a bounded unknown outcome and still consumes both
-reservations.
+reservations. The selected gateway itself and nodes not observed in the active
+radio session are rejected before reservation.
 
 This request path is experimental and verified against Meshtastic firmware
 2.7.26. The target must have the Neighbor Info module enabled; older firmware
@@ -128,6 +139,20 @@ may reject the request or time out. A successful response is the target's
 cached zero-hop neighbor report, capped at ten entries—not a live RF scan. An
 empty successful report means the target returned no cached neighbors; a
 timeout does not mean zero neighbors.
+
+Bluetooth diagnostics distinguish a correlated routing rejection, timeout,
+cancellation, send failure, and disconnect. Only bounded protocol-enum reason
+names and counters are projected; raw packets and node identities are omitted.
+
+Zero-RF preflight failures use stable codes such as
+`neighbor_info_target_self`, `neighbor_info_target_unknown`,
+`neighbor_info_gateway_disconnected`, and `neighbor_info_preflight_failed`.
+Post-reservation outcomes use `neighbor_info_unsupported`,
+`neighbor_info_rejected`, `neighbor_info_timeout`,
+`neighbor_info_disconnected`, `neighbor_info_send_failed`, or the bounded
+fallback `neighbor_info_failed`. Callers must treat the latter group as a
+possibly transmitted request, reload persisted status, and never retry it
+blindly.
 
 Read the selected target's persisted cooldown and last sanitized response
 without sending RF:

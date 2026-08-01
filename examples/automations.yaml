@@ -64,24 +64,28 @@
   action:
     - action: meshnet.send_message
       data:
-        target_node: "meshtastic:security"
+        gateway_id: meshtastic_bluetooth_1
+        target_node: "!12345678"
+        channel: "1"
         message: "Gate door opened."
         priority: high
         message_type: direct
 
-- alias: MeshNet Emergency Message To Phone
-  id: meshnet_emergency_message_to_phone
+- alias: MeshNet Direct Or Channel Message To Phone
+  id: meshnet_direct_or_channel_message_to_phone
   mode: queued
   trigger:
     - platform: event
       event_type: meshnet_message_received
   condition:
     - condition: template
-      value_template: "{{ trigger.event.data.priority == 'emergency' or trigger.event.data.message_type == 'emergency' }}"
+      value_template: >-
+        {{ trigger.event.data.schema_version == 1
+           and trigger.event.data.delivery in ['direct', 'channel'] }}
   action:
     - service: notify.mobile_app_your_phone
       data:
-        title: "Emergency mesh message"
+        title: "Mesh message"
         message: "{{ trigger.event.data.sender }}: {{ trigger.event.data.text }}"
 
 - alias: MeshNet Log All Received Messages
@@ -96,22 +100,24 @@
         name: MeshNet
         message: "{{ trigger.event.data.sender }} -> {{ trigger.event.data.receiver }}: {{ trigger.event.data.text }}"
 
-- alias: MeshNet Announce Emergency Message
-  id: meshnet_announce_emergency_message
+- alias: MeshNet Announce Direct Or Channel Message
+  id: meshnet_announce_direct_or_channel_message
   mode: queued
   trigger:
     - platform: event
       event_type: meshnet_message_received
   condition:
     - condition: template
-      value_template: "{{ trigger.event.data.priority == 'emergency' or trigger.event.data.message_type == 'emergency' }}"
+      value_template: >-
+        {{ trigger.event.data.schema_version == 1
+           and trigger.event.data.delivery in ['direct', 'channel'] }}
   action:
     - service: tts.speak
       target:
         entity_id: tts.home_assistant_cloud
       data:
         media_player_entity_id: media_player.living_room
-        message: "Emergency mesh message. {{ trigger.event.data.text }}"
+        message: "Mesh message. {{ trigger.event.data.text }}"
 
 - alias: MeshNet Proxmox Server Alert
   id: meshnet_proxmox_server_alert

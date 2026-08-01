@@ -23,6 +23,24 @@ class MeshtasticConfigurationError(MeshtasticAsyncError):
     """The radio did not complete the Meshtastic configuration handshake."""
 
 
+class MeshtasticNeighborInfoError(MeshtasticConfigurationError):
+    """A NeighborInfo request failed with a fixed, identity-free code."""
+
+    _CODES = frozenset(
+        {
+            "neighbor_info_disconnected",
+            "neighbor_info_rejected",
+            "neighbor_info_send_failed",
+            "neighbor_info_timeout",
+            "neighbor_info_unsupported",
+        }
+    )
+
+    def __init__(self, code: str) -> None:
+        self.code = code if code in self._CODES else "neighbor_info_send_failed"
+        super().__init__(self.code)
+
+
 class MeshtasticRemoteAdminError(MeshtasticConfigurationError):
     """A remote-admin request failed with a stable, non-secret category."""
 

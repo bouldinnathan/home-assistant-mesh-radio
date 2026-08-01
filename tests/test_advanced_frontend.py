@@ -73,14 +73,19 @@ assert.ok(PanelClass, "panel custom element was not registered");
 
 
 def test_messages_tab_is_a_first_class_view() -> None:
-    """Expose Messages beside Mesh and settings without browser persistence."""
+    """Expose Messages beside Mesh without persisting message state in the browser."""
     source = _source()
 
     assert 'data-meshnet-view="messages"' in source
     assert 'type: "meshnet/messages"' in source
     assert "_renderMessages" in source
-    assert "localStorage" not in source
     assert "sessionStorage" not in source
+    persistence = source[
+        source.index("  _persistMeshCardLayout()") : source.index("  _orderedMeshCards(")
+    ]
+    assert "_messages" not in persistence
+    assert "_messageConversation" not in persistence
+    assert "_draft" not in persistence
 
     _run_panel_script(
         r"""

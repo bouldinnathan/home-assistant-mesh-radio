@@ -9,24 +9,43 @@ from test_advanced_frontend import _run_panel_script
 PANEL = Path("custom_components/meshnet/frontend/meshnet-panel.js")
 
 
-def test_mesh_card_layout_is_instance_local_bounded_and_storage_free() -> None:
-    """Moving/resizing cards survives rerenders without persistent storage or I/O."""
+def test_mesh_card_layout_is_persistent_bounded_and_presentation_only() -> None:
+    """A validated local layout survives reload without persisting sensitive state.
+
+    Browser storage is readable by same-origin frontend code, so the allowlisted
+    payload may contain only card IDs and bounded integer geometry. In particular,
+    it must never contain messages, node data, gateway settings, keys, or drafts.
+    """
     source = PANEL.read_text(encoding="utf-8")
-    assert "localStorage" not in source
+    assert 'MESH_LAYOUT_STORAGE_KEY = "meshnet.frontend.mesh-workspace-layout.v1"' in source
+    assert "MESH_LAYOUT_SCHEMA_VERSION = 1" in source
+    assert "MESH_LAYOUT_STORAGE_MAX_LENGTH = 4096" in source
+    assert "window.localStorage" in source
+    assert source.count("localStorage") == 1
     assert "sessionStorage" not in source
     assert "data-mesh-card" in source
     assert "data-mesh-drag-handle" in source
     assert "data-mesh-resize-handle" in source
     assert "max-width: min(${MESH_CARD_MAX_WIDTH}px, 48vw" in source
     assert ".mesh-card-resize-handle { display: none; }" in source
-    assert "Layout resets when you leave MeshNet." in source
+    assert "Layout is saved only in this browser; Reset removes it." in source
 
     _run_panel_script(
         r"""
-  assert.equal(typeof panel._moveMeshCard, "function");
-  assert.equal(typeof panel._setMeshCardSize, "function");
-  assert.ok(Array.isArray(panel._meshCardOrder));
-  assert.ok(panel._meshCardSizes instanceof Map);
+  const values = new Map();
+  let getCalls = 0;
+  let setCalls = 0;
+  let removeCalls = 0;
+  window.localStorage = {
+    getItem(key) { getCalls += 1; return values.has(key) ? values.get(key) : null; },
+    setItem(key, value) { setCalls += 1; values.set(key, value); },
+    removeItem(key) { removeCalls += 1; values.delete(key); },
+  };
+  const persistentPanel = new PanelClass();
+  assert.equal(typeof persistentPanel._moveMeshCard, "function");
+  assert.equal(typeof persistentPanel._setMeshCardSize, "function");
+  assert.ok(Array.isArray(persistentPanel._meshCardOrder));
+  assert.ok(persistentPanel._meshCardSizes instanceof Map);
 
   assert.equal(typeof panel._orderedMeshCards, "function");
   const requiredCards = [
@@ -40,35 +59,37 @@ def test_mesh_card_layout_is_instance_local_bounded_and_storage_free() -> None:
     "recent-messages",
     "rf-heat",
   ];
-  assert.deepEqual(panel._meshCardOrder, requiredCards);
-  const initialOrder = [...panel._meshCardOrder];
+  assert.deepEqual(persistentPanel._meshCardOrder, requiredCards);
+  const initialOrder = [...persistentPanel._meshCardOrder];
   let calls = 0;
-  panel._hass = {
+  persistentPanel._hass = {
     async callWS() { calls += 1; throw new Error("layout must be local"); },
     async callService() { calls += 1; throw new Error("layout must be local"); },
   };
+  persistentPanel._draft.message = "TOP_SECRET_COMPOSER_BODY";
+  persistentPanel._settingsDraft = { "security.private_key": "TOP_SECRET_KEY" };
 
-  const nodeIndex = panel._meshCardOrder.indexOf("nodes");
-  panel._moveMeshCard("nodes", "earlier");
-  assert.equal(panel._meshCardOrder.indexOf("nodes"), nodeIndex - 1);
+  const nodeIndex = persistentPanel._meshCardOrder.indexOf("nodes");
+  persistentPanel._moveMeshCard("nodes", "earlier");
+  assert.equal(persistentPanel._meshCardOrder.indexOf("nodes"), nodeIndex - 1);
   assert.deepEqual(
-    panel._orderedMeshCards(["send-message", "nodes", "gateways"]),
+    persistentPanel._orderedMeshCards(["send-message", "nodes", "gateways"]),
     ["send-message", "gateways", "nodes"],
     "the render helper applies instance order to any available subset",
   );
-  assert.equal(new Set(panel._meshCardOrder).size, requiredCards.length);
+  assert.equal(new Set(persistentPanel._meshCardOrder).size, requiredCards.length);
   assert.deepEqual(
-    [...panel._meshCardOrder].sort(),
+    [...persistentPanel._meshCardOrder].sort(),
     [...requiredCards].sort(),
     "moving cannot lose, duplicate, or invent a card",
   );
 
-  panel._setMeshCardSize("nodes", 640, 480);
-  assert.deepEqual(panel._meshCardSizes.get("nodes"), {
+  persistentPanel._setMeshCardSize("nodes", 640, 480);
+  assert.deepEqual(persistentPanel._meshCardSizes.get("nodes"), {
     width: 640,
     height: 480,
   });
-  const acceptedSize = { ...panel._meshCardSizes.get("nodes") };
+  const acceptedSize = { ...persistentPanel._meshCardSizes.get("nodes") };
   for (const invalid of [
     [Number.NaN, 480],
     [640, Number.POSITIVE_INFINITY],
@@ -76,44 +97,125 @@ def test_mesh_card_layout_is_instance_local_bounded_and_storage_free() -> None:
     [640, 0],
     ["640", 480],
   ]) {
-    panel._setMeshCardSize("nodes", invalid[0], invalid[1]);
-    assert.deepEqual(panel._meshCardSizes.get("nodes"), acceptedSize);
+    persistentPanel._setMeshCardSize("nodes", invalid[0], invalid[1]);
+    assert.deepEqual(persistentPanel._meshCardSizes.get("nodes"), acceptedSize);
   }
-  panel._setMeshCardSize("nodes", 1_000_000, 1_000_000);
-  const clamped = panel._meshCardSizes.get("nodes");
+  persistentPanel._setMeshCardSize("nodes", 1_000_000, 1_000_000);
+  const clamped = persistentPanel._meshCardSizes.get("nodes");
   assert.ok(Number.isSafeInteger(clamped.width) && clamped.width <= 720);
   assert.ok(Number.isSafeInteger(clamped.height) && clamped.height <= 1200);
 
-  const beforeInvalidMove = [...panel._meshCardOrder];
-  panel._moveMeshCard("not-a-card", "earlier");
-  panel._moveMeshCard("nodes", "sideways");
-  assert.deepEqual(panel._meshCardOrder, beforeInvalidMove);
-  panel._setMeshCardSize("not-a-card", 500, 500);
-  assert.equal(panel._meshCardSizes.has("not-a-card"), false);
+  const beforeInvalidMove = [...persistentPanel._meshCardOrder];
+  persistentPanel._moveMeshCard("not-a-card", "earlier");
+  persistentPanel._moveMeshCard("nodes", "sideways");
+  assert.deepEqual(persistentPanel._meshCardOrder, beforeInvalidMove);
+  persistentPanel._setMeshCardSize("not-a-card", 500, 500);
+  assert.equal(persistentPanel._meshCardSizes.has("not-a-card"), false);
   assert.equal(calls, 0);
 
-  panel._meshLayoutInteraction = { kind: "drag", card_id: "nodes" };
-  assert.equal(panel._panelInteractionActive(), true);
+  const stored = JSON.parse(values.get("meshnet.frontend.mesh-workspace-layout.v1"));
+  assert.deepEqual(Object.keys(stored).sort(), ["order", "schema_version", "sizes"]);
+  assert.equal(stored.schema_version, 1);
+  assert.deepEqual(Object.keys(stored.sizes), ["nodes"]);
+  assert.deepEqual(stored.sizes.nodes, clamped);
+  assert.equal(JSON.stringify(stored).includes("TOP_SECRET_COMPOSER_BODY"), false);
+  assert.equal(JSON.stringify(stored).includes("TOP_SECRET_KEY"), false);
+  assert.ok(setCalls >= 3);
+
+  persistentPanel._meshLayoutInteraction = { kind: "drag", card_id: "nodes" };
+  assert.equal(persistentPanel._panelInteractionActive(), true);
   let renders = 0;
-  panel._safeRender = () => { renders += 1; return true; };
-  assert.equal(panel._renderPollSnapshot(), false);
-  assert.equal(panel._pollRenderPending, true);
+  persistentPanel._safeRender = () => { renders += 1; return true; };
+  assert.equal(persistentPanel._renderPollSnapshot(), false);
+  assert.equal(persistentPanel._pollRenderPending, true);
   assert.equal(renders, 0, "polling cannot replace a card during layout interaction");
-  panel._meshLayoutInteraction = null;
+  persistentPanel._meshLayoutInteraction = null;
 
   const secondPanel = new PanelClass();
-  assert.deepEqual(secondPanel._meshCardOrder, initialOrder);
-  assert.equal(secondPanel._meshCardSizes.size, 0);
-  assert.notEqual(secondPanel._meshCardOrder, panel._meshCardOrder);
-  assert.notEqual(secondPanel._meshCardSizes, panel._meshCardSizes);
+  assert.deepEqual(secondPanel._meshCardOrder, persistentPanel._meshCardOrder);
+  assert.deepEqual(secondPanel._meshCardSizes.get("nodes"), clamped);
+  assert.notEqual(secondPanel._meshCardOrder, persistentPanel._meshCardOrder);
+  assert.notEqual(secondPanel._meshCardSizes, persistentPanel._meshCardSizes);
 
-  panel._detachWindowFailureHandlers = () => {};
-  panel._stopGraphAnimation = () => {};
-  panel._clearSecretSettingsDrafts = () => {};
-  panel.disconnectedCallback();
-  assert.deepEqual(panel._meshCardOrder, initialOrder);
-  assert.equal(panel._meshCardSizes.size, 0);
-  assert.equal(panel._meshLayoutInteraction, null);
+  persistentPanel._setMeshCardSize("nodes", 610, 510, false);
+  persistentPanel._meshLayoutInteraction = { kind: "resize", card_id: "nodes" };
+  persistentPanel._detachWindowFailureHandlers = () => {};
+  persistentPanel._stopGraphAnimation = () => {};
+  persistentPanel._clearSecretSettingsDrafts = () => {};
+  persistentPanel.disconnectedCallback();
+  assert.deepEqual(persistentPanel._meshCardSizes.get("nodes"), { width: 610, height: 510 });
+  assert.equal(persistentPanel._meshLayoutInteraction, null);
+  const afterDetachPanel = new PanelClass();
+  assert.deepEqual(afterDetachPanel._meshCardOrder, persistentPanel._meshCardOrder);
+  assert.deepEqual(afterDetachPanel._meshCardSizes.get("nodes"), { width: 610, height: 510 });
+
+  afterDetachPanel._resetMeshCardLayout();
+  assert.deepEqual(afterDetachPanel._meshCardOrder, initialOrder);
+  assert.equal(afterDetachPanel._meshCardSizes.size, 0);
+  assert.equal(values.has("meshnet.frontend.mesh-workspace-layout.v1"), false);
+  assert.equal(removeCalls, 1);
+  assert.deepEqual(new PanelClass()._meshCardOrder, initialOrder);
+  assert.ok(getCalls >= 3);
+"""
+    )
+
+
+def test_mesh_card_layout_storage_rejects_malformed_and_denied_state() -> None:
+    """Malformed, oversized, unknown, or inaccessible storage fails to defaults."""
+    _run_panel_script(
+        r"""
+  const key = "meshnet.frontend.mesh-workspace-layout.v1";
+  const defaults = [
+    "send-message", "gateways", "remote-admin", "traceroute", "neighbor-info",
+    "panel-diagnostics", "nodes", "recent-messages", "rf-heat",
+  ];
+  let value = null;
+  let removes = 0;
+  window.localStorage = {
+    getItem(storageKey) { assert.equal(storageKey, key); return value; },
+    setItem(storageKey, encoded) { assert.equal(storageKey, key); value = encoded; },
+    removeItem(storageKey) { assert.equal(storageKey, key); removes += 1; value = null; },
+  };
+  const invalid = [
+    "{not-json",
+    "x".repeat(4097),
+    JSON.stringify({ schema_version: 2, order: defaults, sizes: {} }),
+    JSON.stringify({ schema_version: 1, order: defaults.slice(1), sizes: {} }),
+    JSON.stringify({ schema_version: 1, order: [...defaults.slice(0, -1), "unknown"], sizes: {} }),
+    JSON.stringify({ schema_version: 1, order: defaults, sizes: { nodes: { width: 279, height: 200 } } }),
+    JSON.stringify({ schema_version: 1, order: defaults, sizes: { nodes: { width: 400, height: 200, secret: "x" } } }),
+    JSON.stringify({ schema_version: 1, order: defaults, sizes: {}, extra: true }),
+  ];
+  for (const encoded of invalid) {
+    value = encoded;
+    const rejected = new PanelClass();
+    assert.deepEqual(rejected._meshCardOrder, defaults);
+    assert.equal(rejected._meshCardSizes.size, 0);
+    assert.equal(value, null, "invalid state is removed instead of partially recovered");
+  }
+  assert.equal(removes, invalid.length);
+
+  Object.defineProperty(window, "localStorage", {
+    configurable: true,
+    get() { throw new Error("SecurityError"); },
+  });
+  const denied = new PanelClass();
+  assert.deepEqual(denied._meshCardOrder, defaults);
+  assert.doesNotThrow(() => denied._moveMeshCard("nodes", "earlier"));
+
+  Object.defineProperty(window, "localStorage", {
+    configurable: true,
+    value: {
+      getItem() { return null; },
+      setItem() { throw new Error("QuotaExceededError"); },
+      removeItem() { throw new Error("SecurityError"); },
+    },
+  });
+  const quotaDenied = new PanelClass();
+  assert.doesNotThrow(() => quotaDenied._setMeshCardSize("nodes", 500, 400));
+  assert.deepEqual(quotaDenied._meshCardSizes.get("nodes"), { width: 500, height: 400 });
+  assert.doesNotThrow(() => quotaDenied._resetMeshCardLayout());
+  assert.equal(quotaDenied._meshCardSizes.size, 0);
 """
     )
 
@@ -203,6 +305,7 @@ def test_neighbor_info_row_shortcut_only_opens_existing_safe_flow() -> None:
     node_id: "!1234abcd",
     protocol: "meshtastic",
     identity_valid: true,
+    observed_this_session: true,
     long_name: "Safe target",
     short_name: "SAFE",
     favorite: true,

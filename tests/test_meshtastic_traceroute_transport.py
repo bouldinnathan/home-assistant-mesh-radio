@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -118,6 +119,21 @@ def test_ble_traceroute_is_one_exact_correlated_unicast() -> None:
         ]
         assert result["snr_towards"] == [1.0, -2.0]
         assert result["snr_back"] == [3.0]
+
+    asyncio.run(run())
+
+
+def test_ble_traceroute_uses_the_radios_configured_hop_limit() -> None:
+    """RouteDiscovery must not silently become a direct-only hop-zero packet."""
+
+    async def run() -> None:
+        client, connection = _active_client()
+        client._settings._configs["lora"] = SimpleNamespace(hop_limit=5)
+
+        await client.async_manual_traceroute(TARGET_ID)
+
+        assert len(connection.packets) == 1
+        assert connection.packets[0].hop_limit == 5
 
     asyncio.run(run())
 

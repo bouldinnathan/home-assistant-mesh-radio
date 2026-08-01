@@ -1,6 +1,6 @@
 # MeshNet for Home Assistant
 
-MeshNet turns Home Assistant into one operating surface for Meshtastic and MeshCore radios. It creates gateway and node entities, records telemetry and messages, tracks valid GPS positions, exposes actions and events, and provides an admin-only mesh panel with app-like broadcast/channel/direct conversations, reorderable and resizable main-view cards, favorites-aware node sorting, native Map access, a moving distance-aware cached-evidence graph, validated live gateway settings, guarded Meshtastic remote administration, and manual cooldown-protected radio tools.
+MeshNet turns Home Assistant into one operating surface for Meshtastic and MeshCore radios. It creates gateway and node entities, exposes supported passive telemetry as Home Assistant entities, receives and sends messages, tracks valid GPS positions, exposes actions and events, and provides an admin-only mesh panel with app-like broadcast/channel/direct conversations, reorderable and resizable main-view cards, favorites-aware node sorting, native Map access, a moving distance-aware cached-evidence graph, validated live gateway settings, guarded Meshtastic remote administration, and manual cooldown-protected radio tools.
 
 > [!IMPORTANT]
 > The current package is an in-process Home Assistant custom integration. Use it
@@ -18,6 +18,16 @@ MeshNet targets Home Assistant 2025.1.4 and newer. Evaluate the current custom
 integration only on a test Home Assistant OS or Container instance; the isolated
 App/sidecar described below is the intended production package. Existing Core
 and Supervised installations can run the integration only on a best-effort basis.
+
+Normal HACS installation:
+
+1. Open the HACS link above and choose **Download**.
+2. Restart Home Assistant.
+3. Open **Settings -> Devices & services -> Add integration -> MeshNet**.
+4. Add a gateway with the guided form. No gateway YAML is required.
+
+The repository scripts below are optional helpers for a manual or disposable
+test installation; HACS users do not need to run them.
 
 From a copy of this repository, run a safe preview:
 
@@ -85,6 +95,125 @@ fallback, not a requirement.
 | MeshCore | MQTT/REST JSON bridge | Advanced; requires a bridge implementing the documented JSON contract |
 
 MQTT is not a magic replacement for a broker or bridge. Meshtastic MQTT consumes only the decoded `/json/` branch; MeshCore MQTT and REST require a compatible external JSON bridge.
+
+## Messages and sensor data quick start
+
+After a gateway shows online, open **MeshNet -> Messages** in the Home Assistant
+sidebar. Incoming decoded text appears automatically. To send interactively,
+choose **Broadcast**, **Channel**, or **Direct**, select the exact gateway and
+recipient/channel, enter a short message, and press **Send**. The node dropdown
+is safest for direct messages because it supplies the cached canonical identity.
+
+The same operations are available under **Developer Tools -> Actions** and in
+Home Assistant automations. Broadcast to an already-configured radio channel:
+
+```yaml
+action: meshnet.broadcast_message
+data:
+  gateway_id: "garage_radio"
+  channel: "1"
+  message: "Generator battery low"
+  priority: normal
+  message_type: broadcast
+```
+
+Send to one exact Meshtastic node:
+
+```yaml
+action: meshnet.send_message
+data:
+  gateway_id: "garage_radio"
+  target_node: "!1234abcd"
+  channel: "1"
+  message: "Generator battery low"
+  priority: high
+  message_type: direct
+```
+
+Replace the example gateway, node, and channel with values shown by your
+MeshNet panel. Always set `gateway_id` when more than one protocol or gateway
+is configured. A channel number from `0` through `7` only selects a channel
+that already exists on the radio; it does not create a channel or install a
+PSK. A private-channel message is still retained locally in MeshNet history,
+Home Assistant events, automation traces, and backups. `sent` means that the
+provider/radio accepted the submission, not that a person read it. A compatible
+offline gateway may queue the message for later replay.
+
+To turn received messages into Home Assistant notifications, listen for the
+documented `meshnet_message_received` event:
+
+```yaml
+alias: Mesh message to Home Assistant
+triggers:
+  - trigger: event
+    event_type: meshnet_message_received
+conditions:
+  - condition: template
+    value_template: >-
+      {{ trigger.event.data.schema_version == 1
+         and trigger.event.data.delivery in ['direct', 'channel'] }}
+actions:
+  - action: persistent_notification.create
+    data:
+      title: "Mesh message"
+      message: >-
+        {{ trigger.event.data.sender | default('Unknown', true) }}:
+        {{ trigger.event.data.text }}
+mode: queued
+```
+
+### Receive and log radio telemetry
+
+1. Attach a supported sensor and enable its telemetry module on the radio with
+   an official Meshtastic or MeshCore client. MeshNet does not turn remote
+   sensors on merely because its panel is open.
+2. Leave the configured gateway connected until the node transmits telemetry.
+   MeshNet passively accepts only documented values that the gateway receives
+   and is authorized to decrypt; it does not poll the mesh for dashboard data.
+3. Open **Settings -> Devices & services -> MeshNet -> Devices -> your node**.
+   Supplied values appear as normal `sensor` or `binary_sensor` entities. The
+   allowlist includes temperature, humidity, pressure, CO2, air quality, wind,
+   rainfall, soil, particulate, light, electrical, battery, and radio metrics.
+4. Open an entity's **History** view or use its exact entity ID in a dashboard
+   or automation. Home Assistant Recorder stores state changes when Recorder
+   is enabled and that entity is not excluded.
+
+MeshNet creates individual sensor entities, not a `weather` forecast entity.
+Common typed measurements have units and statistics metadata; other generic
+metrics may have ordinary state history without long-term statistics. A cached
+node keeps its last reading after it goes offline, so safety-related automations
+must also check that node's **Online** and **Last heard** entities. Home
+Assistant Recorder retention is separate from MeshNet's packet/message
+`history_days` setting, and HACS uninstall does not erase Recorder or backup
+history.
+
+Home Assistant sensor values can currently be sent over the mesh as bounded
+text, not as forged native radio-telemetry packets. This example sends once
+when a local temperature crosses the threshold rather than repeatedly polling
+or spamming RF:
+
+```yaml
+alias: Mesh high-temperature alert
+triggers:
+  - trigger: numeric_state
+    entity_id: sensor.garden_temperature
+    above: 35
+actions:
+  - action: meshnet.broadcast_message
+    data:
+      gateway_id: "garage_radio"
+      channel: "1"
+      priority: high
+      message: >-
+        Garden temperature is {{ states('sensor.garden_temperature') }}
+        {{ state_attr('sensor.garden_temperature', 'unit_of_measurement') or '' }}
+mode: single
+```
+
+See [Usage](docs/USAGE.md#messages-telemetry-and-history) for entity freshness,
+Recorder, incoming-event, and automation details. See
+[Advanced Mesh Operations](docs/ADVANCED_MESH_OPERATIONS.md#home-assistant-automations-and-network-failures)
+for delivery states, failure events, and radio-safety limits.
 
 ### Direct Meshtastic Bluetooth
 
@@ -180,15 +309,30 @@ excluded destructive operations.
 
 ### Advanced local mesh tools
 
-Version 0.9.0 makes each side card on the main **Mesh** view reorderable and
-resizable with drag handles plus accessible move and keyboard-resize controls.
-The layout exists only in the current panel instance: it is not written to
-browser storage, Home Assistant, or a radio, and **Reset** or detaching the
-panel restores the default. Every node selector displays favorites first, then
-valid last-seen timestamps from newest to oldest, with visible favorite and
-last-seen labels. The **NeighborInfo** button beside a node's **Message** button
-only selects and reveals the existing **Load status → Request → Confirm** flow;
-the shortcut sends no RF traffic by itself.
+Version 0.10.0 keeps each browser's main **Mesh** card order and bounded card
+sizes across navigation and reloads. The versioned browser record accepts only
+the fixed card-ID set and integer geometry; it cannot contain messages, node or
+gateway data, settings drafts, or keys. Storage denial falls back to memory
+only, and **Reset** deletes the record. It is never written to Home Assistant or
+a radio. Because uninstalling HACS code cannot run JavaScript afterward, press
+**Reset** before uninstall if you also want this harmless browser-only layout
+record removed.
+
+Manual Meshtastic Bluetooth traceroute and NeighborInfo packets now inherit the
+connected radio's configured LoRa hop limit. Traceroute choices exclude the
+selected gateway itself and nodes not observed in the active radio session;
+those preflight failures reserve no cooldown and send no RF. Once either
+one-shot request may have left the radio, MeshNet preserves its existing
+cooldown and never retries it. NeighborInfo diagnostics distinguish a firmware
+routing rejection, timeout, cancellation, send failure, and disconnect without
+including node identities.
+
+Version 0.9.0 made each side card reorderable and resizable with drag handles
+plus accessible move and keyboard-resize controls. Every node selector displays
+favorites first, then valid last-seen timestamps from newest to oldest, with
+visible favorite and last-seen labels. The **NeighborInfo** button beside a
+node's **Message** button only selects and reveals the existing **Load status →
+Request → Confirm** flow; the shortcut sends no RF traffic by itself.
 
 Version 0.8.0 attaches reactions by exact Meshtastic packet ID, preserves the
 message reading position across refreshes, labels graph-edge distance in miles,
@@ -275,7 +419,19 @@ python -m ruff check .
 bash -n setup.sh install.sh verify_setup.sh uninstall.sh
 ```
 
-The integration source is `custom_components/meshnet`. Runtime history is stored as `meshnet.sqlite3` in the Home Assistant configuration directory. The admin-only three-dot menu provides a detailed, cached **Download diagnostics** report covering versions, lifecycle/task state, retained identity-free Bluetooth failure phases and counters, constructor ownership, gateway and node radio health, repairs, registries, and SQLite/outbox aggregates. It performs no radio operations and redacts or omits identities, endpoints, credentials, message/raw content, precise locations, and occupancy-related state from MeshNet's data section. Home Assistant's standard outer wrapper and filename can still contain the config-entry ID and system metadata, so inspect and rename a report before sharing it. The panel and WebSocket API also require an administrator account.
+The integration source is `custom_components/meshnet`. MeshNet's current-node
+cache plus packet, message, outbox, and guarded-tool history is stored as
+`meshnet.sqlite3` in the Home Assistant configuration directory. Home Assistant
+entity history is separate and is controlled by Recorder. The admin-only
+three-dot menu provides a detailed, cached **Download diagnostics** report
+covering versions, lifecycle/task state, retained identity-free Bluetooth
+failure phases and counters, constructor ownership, gateway and node radio
+health, repairs, registries, and SQLite/outbox aggregates. It performs no radio
+operations and redacts or omits identities, endpoints, credentials, message/raw
+content, precise locations, and occupancy-related state from MeshNet's data
+section. Home Assistant's standard outer wrapper and filename can still contain
+the config-entry ID and system metadata, so inspect and rename a report before
+sharing it. The panel and WebSocket API also require an administrator account.
 
 ## License
 

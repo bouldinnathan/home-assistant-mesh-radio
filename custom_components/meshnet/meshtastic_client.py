@@ -103,6 +103,29 @@ _MESHTASTIC_SENSOR_KEYS = frozenset(
 _BLUEZ_ADAPTER_INTERFACE = "org.bluez.Adapter1"
 _LOCAL_ADAPTER_RE = re.compile(r"hci[0-9]+\Z")
 _BLUETOOTH_ADDRESS_RE = re.compile(r"[0-9A-F]{2}(?::[0-9A-F]{2}){5}\Z")
+_ROUTING_ERROR_DIAGNOSTIC_NAMES = frozenset(
+    {
+        "NO_ROUTE",
+        "GOT_NAK",
+        "TIMEOUT",
+        "NO_INTERFACE",
+        "MAX_RETRANSMIT",
+        "NO_CHANNEL",
+        "TOO_LARGE",
+        "NO_RESPONSE",
+        "DUTY_CYCLE_LIMIT",
+        "BAD_REQUEST",
+        "NOT_AUTHORIZED",
+        "PKI_FAILED",
+        "PKI_UNKNOWN_PUBKEY",
+        "ADMIN_BAD_SESSION_KEY",
+        "ADMIN_PUBLIC_KEY_UNAUTHORIZED",
+        "RATE_LIMIT_EXCEEDED",
+        "PKI_SEND_FAIL_PUBLIC_KEY",
+        "UNKNOWN",
+    }
+)
+_MAX_DIAGNOSTIC_COUNTER = 2_147_483_647
 _BLUETOOTH_FAILURE_DIAGNOSTIC_FIELDS = frozenset(
     {
         "implementation",
@@ -143,6 +166,12 @@ _BLUETOOTH_FAILURE_DIAGNOSTIC_FIELDS = frozenset(
         "neighbor_info_request_count",
         "neighbor_info_response_count",
         "neighbor_info_timeout_count",
+        "neighbor_info_rejection_count",
+        "neighbor_info_cancellation_count",
+        "neighbor_info_send_failure_count",
+        "neighbor_info_disconnect_count",
+        "last_neighbor_info_outcome",
+        "last_neighbor_info_routing_error",
         "neighbor_info_waiter_count",
         "connection_generation",
         "settings_complete_sequence",
@@ -260,6 +289,34 @@ def _project_bluetooth_failure_diagnostics(source: Any) -> dict[str, Any] | None
     )
     if projected is None or not isinstance(source, dict):
         return projected
+    raw_neighbor_errors = source.get("neighbor_info_routing_error_counts")
+    if isinstance(raw_neighbor_errors, dict):
+        neighbor_errors: dict[str, int] = {}
+        # This mapping originates in the local client and currently has fewer
+        # than twenty protocol-enum keys. Bound it anyway so a future provider
+        # cannot turn diagnostics collection into unbounded work.
+        for raw_reason, raw_count in tuple(raw_neighbor_errors.items())[:64]:
+            if (
+                isinstance(raw_count, bool)
+                or not isinstance(raw_count, int)
+                or raw_count < 0
+            ):
+                continue
+            reason = (
+                raw_reason
+                if isinstance(raw_reason, str)
+                and raw_reason in _ROUTING_ERROR_DIAGNOSTIC_NAMES
+                else "UNKNOWN"
+            )
+            count = min(raw_count, _MAX_DIAGNOSTIC_COUNTER)
+            neighbor_errors[reason] = min(
+                neighbor_errors.get(reason, 0) + count,
+                _MAX_DIAGNOSTIC_COUNTER,
+            )
+        if neighbor_errors:
+            projected["neighbor_info_routing_error_counts"] = dict(
+                sorted(neighbor_errors.items())
+            )
     for key in ("last_transport_before_cleanup", "transport"):
         nested = _project_diagnostic_mapping(
             source.get(key),

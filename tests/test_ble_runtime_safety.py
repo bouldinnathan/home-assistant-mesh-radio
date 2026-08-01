@@ -767,6 +767,55 @@ def test_ble_failure_diagnostic_projection_rejects_identity_and_content() -> Non
     assert projected["last_transport_before_cleanup"]["state"] == "failed"
 
 
+def test_neighbor_info_diagnostic_projection_is_bounded_and_identity_free() -> None:
+    """Manual-request outcomes survive projection without accepting free text."""
+    source = {
+        "implementation": "MeshtasticBluetoothClient",
+        "neighbor_info_request_count": 4,
+        "neighbor_info_response_count": 1,
+        "neighbor_info_timeout_count": 1,
+        "neighbor_info_rejection_count": 2,
+        "neighbor_info_cancellation_count": 3,
+        "neighbor_info_send_failure_count": 1,
+        "neighbor_info_disconnect_count": 1,
+        "last_neighbor_info_outcome": "rejected",
+        "last_neighbor_info_routing_error": "BAD_REQUEST",
+        "neighbor_info_routing_error_counts": {
+            "BAD_REQUEST": 2,
+            "NO_ROUTE": -1,
+            "NO_RESPONSE": True,
+            "private target name": 4,
+            "another private value": 2_147_483_648,
+        },
+    }
+
+    class Transport:
+        @staticmethod
+        def diagnostic_snapshot() -> dict[str, Any]:
+            return source
+
+    projected = MeshtasticClient._safe_bluetooth_diagnostics(Transport())
+
+    assert projected == {
+        "implementation": "MeshtasticBluetoothClient",
+        "neighbor_info_request_count": 4,
+        "neighbor_info_response_count": 1,
+        "neighbor_info_timeout_count": 1,
+        "neighbor_info_rejection_count": 2,
+        "neighbor_info_cancellation_count": 3,
+        "neighbor_info_send_failure_count": 1,
+        "neighbor_info_disconnect_count": 1,
+        "last_neighbor_info_outcome": "rejected",
+        "last_neighbor_info_routing_error": "BAD_REQUEST",
+        "neighbor_info_routing_error_counts": {
+            "BAD_REQUEST": 2,
+            "UNKNOWN": 2_147_483_647,
+        },
+    }
+    assert "private target name" not in repr(projected)
+    assert "another private value" not in repr(projected)
+
+
 def test_existing_disconnected_ble_transport_is_restarted_not_reported_ready() -> None:
     async def run() -> None:
         hass = _FakeHass()

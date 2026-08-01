@@ -47,6 +47,7 @@ from .errors import (
     MeshtasticCleanupError,
     MeshtasticConfigurationError,
     MeshtasticConnectionError,
+    MeshtasticNeighborInfoError,
     MeshtasticNotConnectedError,
     MeshtasticRemoteAdminError,
 )
@@ -357,6 +358,13 @@ class MeshtasticBluetoothClient:
         self._neighbor_info_request_count = 0
         self._neighbor_info_response_count = 0
         self._neighbor_info_timeout_count = 0
+        self._neighbor_info_rejection_count = 0
+        self._neighbor_info_cancellation_count = 0
+        self._neighbor_info_send_failure_count = 0
+        self._neighbor_info_disconnect_count = 0
+        self._neighbor_info_routing_error_counts: dict[str, int] = {}
+        self._last_neighbor_info_outcome = "not_requested"
+        self._last_neighbor_info_routing_error: str | None = None
         self._last_connected_monotonic: float | None = None
 
     @property
@@ -631,6 +639,10 @@ class MeshtasticBluetoothClient:
             packet.id = self._next_packet_id()
             packet.want_ack = True
             packet.priority = mesh_pb2.MeshPacket.Priority.RELIABLE
+            # Match the official client's _sendPacket behavior. Leaving this
+            # at protobuf's zero default makes the request direct-only even
+            # when the radio is configured for multi-hop routing.
+            packet.hop_limit = self._settings.hop_limit()
             packet.decoded.portnum = portnums_pb2.TRACEROUTE_APP
             packet.decoded.want_response = True
             packet.decoded.payload = mesh_pb2.RouteDiscovery().SerializeToString()
@@ -745,6 +757,10 @@ class MeshtasticBluetoothClient:
             packet.id = self._next_packet_id()
             packet.want_ack = True
             packet.priority = mesh_pb2.MeshPacket.Priority.RELIABLE
+            # Match the official client's _sendPacket behavior. A zero value
+            # makes this a direct-only RF request and can make a valid
+            # multi-hop target return a routing NAK.
+            packet.hop_limit = self._settings.hop_limit()
             packet.decoded.portnum = portnums_pb2.NEIGHBORINFO_APP
             packet.decoded.want_response = True
             packet.decoded.payload = request.SerializeToString()
@@ -757,22 +773,39 @@ class MeshtasticBluetoothClient:
             self._pending_neighbor_info_responses[request_id] = pending
             to_radio = mesh_pb2.ToRadio()
             to_radio.packet.CopyFrom(packet)
+            self._last_neighbor_info_outcome = "sending"
+            self._last_neighbor_info_routing_error = None
             try:
                 await connection.async_send(to_radio.SerializeToString())
-            except BaseException:
+            except asyncio.CancelledError:
+                self._neighbor_info_cancellation_count += 1
+                self._last_neighbor_info_outcome = "cancelled"
                 if self._pending_neighbor_info_responses.get(request_id) is pending:
                     self._pending_neighbor_info_responses.pop(request_id, None)
                 raise
+            except Exception as err:
+                self._neighbor_info_send_failure_count += 1
+                self._last_neighbor_info_outcome = "send_failed"
+                if self._pending_neighbor_info_responses.get(request_id) is pending:
+                    self._pending_neighbor_info_responses.pop(request_id, None)
+                raise MeshtasticNeighborInfoError(
+                    "neighbor_info_send_failed"
+                ) from err
             self._neighbor_info_request_count += 1
+            if not future.done():
+                self._last_neighbor_info_outcome = "awaiting_response"
 
         try:
             async with asyncio.timeout(self._admin_response_timeout):
                 report = await future
+        except asyncio.CancelledError:
+            self._neighbor_info_cancellation_count += 1
+            self._last_neighbor_info_outcome = "cancelled"
+            raise
         except TimeoutError as err:
             self._neighbor_info_timeout_count += 1
-            raise MeshtasticConfigurationError(
-                "Meshtastic NeighborInfo response timed out; the request was not retried"
-            ) from err
+            self._last_neighbor_info_outcome = "timed_out"
+            raise MeshtasticNeighborInfoError("neighbor_info_timeout") from err
         finally:
             if (
                 request_id is not None
@@ -782,6 +815,7 @@ class MeshtasticBluetoothClient:
                 self._pending_neighbor_info_responses.pop(request_id, None)
 
         self._neighbor_info_response_count += 1
+        self._last_neighbor_info_outcome = "responded"
         neighbors: list[dict[str, Any]] = []
         seen: set[int] = set()
         for neighbor in list(report.neighbors)[:10]:
@@ -1425,6 +1459,23 @@ class MeshtasticBluetoothClient:
             "neighbor_info_request_count": self._neighbor_info_request_count,
             "neighbor_info_response_count": self._neighbor_info_response_count,
             "neighbor_info_timeout_count": self._neighbor_info_timeout_count,
+            "neighbor_info_rejection_count": self._neighbor_info_rejection_count,
+            "neighbor_info_cancellation_count": (
+                self._neighbor_info_cancellation_count
+            ),
+            "neighbor_info_send_failure_count": (
+                self._neighbor_info_send_failure_count
+            ),
+            "neighbor_info_disconnect_count": (
+                self._neighbor_info_disconnect_count
+            ),
+            "neighbor_info_routing_error_counts": dict(
+                self._neighbor_info_routing_error_counts
+            ),
+            "last_neighbor_info_outcome": self._last_neighbor_info_outcome,
+            "last_neighbor_info_routing_error": (
+                self._last_neighbor_info_routing_error
+            ),
             "neighbor_info_waiter_count": len(
                 self._pending_neighbor_info_responses
             ),
@@ -1808,9 +1859,23 @@ class MeshtasticBluetoothClient:
                 return True
             selected = _selected_admin_field(routing)
             if selected == "error_reason" and int(routing.error_reason):
+                try:
+                    reason = mesh_pb2.Routing.Error.Name(
+                        int(routing.error_reason)
+                    )
+                except ValueError:
+                    reason = "UNKNOWN"
+                self._neighbor_info_rejection_count += 1
+                self._neighbor_info_routing_error_counts[reason] = (
+                    self._neighbor_info_routing_error_counts.get(reason, 0) + 1
+                )
+                self._last_neighbor_info_outcome = "rejected"
+                self._last_neighbor_info_routing_error = reason
                 pending_neighbor.future.set_exception(
-                    MeshtasticConfigurationError(
-                        "Meshtastic NeighborInfo request was rejected by the mesh"
+                    MeshtasticNeighborInfoError(
+                        "neighbor_info_unsupported"
+                        if reason == "BAD_REQUEST"
+                        else "neighbor_info_rejected"
                     )
                 )
             # A successful routing ACK is not the NeighborInfo response.
@@ -2137,13 +2202,16 @@ class MeshtasticBluetoothClient:
                     MeshtasticConnectionError("Meshtastic Bluetooth disconnected during traceroute")
                 )
         self._pending_traceroute_responses.clear()
+        pending_neighbor_disconnect = False
         for pending in tuple(self._pending_neighbor_info_responses.values()):
             if not pending.future.done():
+                pending_neighbor_disconnect = True
                 pending.future.set_exception(
-                    MeshtasticConnectionError(
-                        "Meshtastic Bluetooth disconnected during NeighborInfo request"
-                    )
+                    MeshtasticNeighborInfoError("neighbor_info_disconnected")
                 )
+        if pending_neighbor_disconnect:
+            self._neighbor_info_disconnect_count += 1
+            self._last_neighbor_info_outcome = "disconnected"
         self._pending_neighbor_info_responses.clear()
         self._manual_neighbor_info_response_packets.clear()
         self._internal_admin_request_ids.clear()

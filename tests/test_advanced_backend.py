@@ -476,6 +476,8 @@ def _traceroute_coordinator(
     coordinator._gateway_generation = 1
     coordinator._shutting_down = False
     coordinator._reconnect_suspended = False
+    coordinator._session_observed_node_keys = {node.node_key}
+    coordinator._effective_observed_node_keys = {node.node_key}
     coordinator.snapshot = MeshSnapshot(nodes={node.node_key: node})
     coordinator._node_alias_redirects = {node.node_key: node.node_key}
     coordinator.gateways = {config.gateway_id: gateway}
@@ -506,6 +508,51 @@ def test_manual_traceroute_reserves_before_one_exact_unicast_and_correlates(
         assert result["schema_version"] == 1
         assert result["correlation_id"] == "trace-correlation"
         assert result["destination"] == "meshtastic:!1234abcd"
+
+    asyncio.run(run())
+
+
+def test_manual_traceroute_preflight_codes_self_and_stale_targets_without_rf(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Self and cached-only targets fail distinctly before reserve or provider."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+        coordinator, gateway, order = _traceroute_coordinator(coordinator_class)
+        error_type = coordinator_class.async_manual_traceroute.__globals__[
+            "TracerouteError"
+        ]
+
+        remote_key = "meshtastic:!1234abcd"
+        coordinator._session_observed_node_keys.clear()
+        coordinator._effective_observed_node_keys.clear()
+        with pytest.raises(error_type) as stale:
+            await coordinator.async_manual_traceroute(
+                gateway_id="ble-gateway",
+                target_node=remote_key,
+            )
+        assert stale.value.code == "traceroute_target_unknown"
+        assert stale.value.rf_may_have_been_sent is False
+
+        local = NodeState(
+            node_key="meshtastic:!aaaaaaaa",
+            protocol=PROTOCOL_MESHTASTIC,
+            node_id="!aaaaaaaa",
+        )
+        coordinator.snapshot.nodes[local.node_key] = local
+        coordinator._session_observed_node_keys.add(local.node_key)
+        coordinator._effective_observed_node_keys.add(local.node_key)
+        with pytest.raises(error_type) as self_target:
+            await coordinator.async_manual_traceroute(
+                gateway_id="ble-gateway",
+                target_node=local.node_key,
+            )
+        assert self_target.value.code == "traceroute_target_self"
+        assert self_target.value.rf_may_have_been_sent is False
+        assert coordinator.store.reservations == 0
+        assert gateway.calls == []
+        assert order == []
 
     asyncio.run(run())
 
@@ -597,6 +644,7 @@ def _neighbor_info_coordinator(
     coordinator_class,
     *,
     send_error: Exception | None = None,
+    status_error: Exception | None = None,
 ):
     order: list[str] = []
     node = NodeState(
@@ -623,13 +671,18 @@ def _neighbor_info_coordinator(
             )
             self.reservations += 1
             order.append("reserve")
-            return {"reserved": self.reservations == 1}
+            return {
+                "reserved": self.reservations == 1,
+                "next_allowed_at": "2026-07-30T12:03:00+00:00",
+            }
 
         async def async_store_neighbor_info_result(self, *_args, **_kwargs):
             order.append("store-result")
 
         async def async_get_neighbor_info_request_status(self, target_node):
             assert target_node == "meshtastic:!1234abcd"
+            if status_error is not None:
+                raise status_error
             return {"next_allowed_at": "2026-07-30T12:03:00+00:00"}
 
     class Gateway:
@@ -668,6 +721,8 @@ def _neighbor_info_coordinator(
     coordinator._reconnect_suspended = False
     coordinator._radio_operations_accepting = True
     coordinator._traceroute_tasks = set()
+    coordinator._session_observed_node_keys = {node.node_key}
+    coordinator._effective_observed_node_keys = {node.node_key}
     coordinator.snapshot = MeshSnapshot(nodes={node.node_key: node})
     coordinator.gateways = {config.gateway_id: gateway}
     coordinator.store = Store()
@@ -710,27 +765,104 @@ def test_manual_neighbor_info_timeout_consumes_reservation_and_never_retries(
 
     async def run() -> None:
         coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
-        error_type = coordinator_class.async_manual_traceroute.__globals__[
-            "HomeAssistantError"
+        error_type = coordinator_class.async_manual_neighbor_info.__globals__[
+            "NeighborInfoError"
         ]
         coordinator, gateway, order = _neighbor_info_coordinator(
             coordinator_class,
             send_error=TimeoutError("private endpoint timed out"),
         )
 
-        with pytest.raises(error_type):
+        with pytest.raises(error_type) as timeout:
             await coordinator.async_manual_neighbor_info(
                 gateway_id="ble-gateway",
                 target_node="meshtastic:!1234abcd",
             )
-        with pytest.raises(error_type):
+        assert timeout.value.code == "neighbor_info_timeout"
+        assert timeout.value.rf_may_have_been_sent is True
+        with pytest.raises(error_type) as cooldown:
             await coordinator.async_manual_neighbor_info(
                 gateway_id="ble-gateway",
                 target_node="meshtastic:!1234abcd",
             )
+        assert cooldown.value.code == "neighbor_info_cooldown"
+        assert cooldown.value.rf_may_have_been_sent is False
 
         assert order == ["reserve", "send", "reserve"]
         assert gateway.calls == ["!1234abcd"]
+
+    asyncio.run(run())
+
+
+def test_manual_neighbor_info_preflight_rejects_self_and_cached_only_without_rf(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The provider and durable cooldown are untouched for ineligible nodes."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+        coordinator, gateway, order = _neighbor_info_coordinator(coordinator_class)
+        error_type = coordinator_class.async_manual_neighbor_info.__globals__[
+            "NeighborInfoError"
+        ]
+        remote_key = "meshtastic:!1234abcd"
+
+        coordinator._session_observed_node_keys.clear()
+        coordinator._effective_observed_node_keys.clear()
+        with pytest.raises(error_type) as cached_only:
+            await coordinator.async_manual_neighbor_info(
+                gateway_id="ble-gateway",
+                target_node=remote_key,
+            )
+        assert cached_only.value.code == "neighbor_info_target_unknown"
+        assert cached_only.value.rf_may_have_been_sent is False
+
+        local = NodeState(
+            node_key="meshtastic:!aaaaaaaa",
+            protocol=PROTOCOL_MESHTASTIC,
+            node_id="!aaaaaaaa",
+        )
+        coordinator.snapshot.nodes[local.node_key] = local
+        coordinator._session_observed_node_keys.add(local.node_key)
+        coordinator._effective_observed_node_keys.add(local.node_key)
+        with pytest.raises(error_type) as self_target:
+            await coordinator.async_manual_neighbor_info(
+                gateway_id="ble-gateway",
+                target_node=local.node_key,
+            )
+        assert self_target.value.code == "neighbor_info_target_self"
+        assert self_target.value.rf_may_have_been_sent is False
+        assert coordinator.store.reservations == 0
+        assert gateway.calls == []
+        assert order == []
+
+    asyncio.run(run())
+
+
+def test_manual_neighbor_info_status_refresh_failure_preserves_stored_success(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An optional status read cannot erase a validated, persisted RF result."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+        sentinel = "private status path /dev/serial/by-id/secret"
+        coordinator, gateway, order = _neighbor_info_coordinator(
+            coordinator_class,
+            status_error=RuntimeError(sentinel),
+        )
+
+        result = await coordinator.async_manual_neighbor_info(
+            gateway_id="ble-gateway",
+            target_node="meshtastic:!1234abcd",
+        )
+
+        assert order == ["reserve", "send", "store-result"]
+        assert gateway.calls == ["!1234abcd"]
+        assert result["next_allowed_at"] == "2026-07-30T12:03:00+00:00"
+        assert "error_type=RuntimeError" in caplog.text
+        assert sentinel not in caplog.text
 
     asyncio.run(run())
 

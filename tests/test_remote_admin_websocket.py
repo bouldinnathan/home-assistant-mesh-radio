@@ -13,12 +13,17 @@ pytest.importorskip("homeassistant")
 
 from homeassistant.exceptions import Unauthorized  # noqa: E402
 
+from custom_components.meshnet.coordinator import (  # noqa: E402
+    NeighborInfoError,
+    TracerouteError,
+)
 from custom_components.meshnet.websocket_api import (  # noqa: E402
     websocket_neighbor_info,
     websocket_neighbor_info_status,
     websocket_remote_settings_apply,
     websocket_remote_settings_get,
     websocket_remote_settings_preview,
+    websocket_traceroute,
     websocket_traceroute_status,
 )
 
@@ -126,6 +131,53 @@ def test_traceroute_status_is_admin_only_and_performs_no_rf() -> None:
         assert envelope["type"] == "result"
         assert envelope["success"] is True
         assert envelope["result"] == status
+
+    asyncio.run(run())
+
+
+def test_traceroute_preflight_error_keeps_stable_code_and_backend_telemetry() -> None:
+    """The panel can distinguish a zero-RF rejection from an unknown outcome."""
+
+    async def run() -> None:
+        coordinator = SimpleNamespace(
+            async_manual_traceroute=AsyncMock(
+                side_effect=TracerouteError("traceroute_target_self")
+            )
+        )
+        connection = SimpleNamespace(
+            send_message=MagicMock(),
+            send_error=MagicMock(),
+        )
+
+        await websocket_traceroute.__wrapped__.__wrapped__(
+            _hass(coordinator),
+            connection,
+            {
+                "id": 8,
+                "type": "meshnet/traceroute",
+                "gateway_id": "ble-gateway",
+                "target_node": "meshtastic:!aaaaaaaa",
+            },
+        )
+
+        connection.send_message.assert_not_called()
+        connection.send_error.assert_called_once_with(
+            8,
+            "traceroute_target_self",
+            "A gateway cannot traceroute itself",
+        )
+        coordinator.async_manual_traceroute.assert_awaited_once_with(
+            gateway_id="ble-gateway",
+            target_node="meshtastic:!aaaaaaaa",
+        )
+        telemetry = coordinator.panel_telemetry.snapshot()
+        stats = telemetry["operations"]["traceroute_request"]
+        assert stats["request_count"] == 1
+        assert stats["failure_count"] == 1
+        assert telemetry["failure_events"][-1]["error_code"] == (
+            "traceroute_target_self"
+        )
+        assert telemetry["failure_events"][-1]["category"] == "validation"
 
     asyncio.run(run())
 
@@ -288,6 +340,52 @@ def test_neighbor_info_request_and_status_are_admin_only_exact_boundaries() -> N
             gateway_id="ble-gateway", target_node=target
         )
         assert connection.send_message.call_args.args[0]["result"] == result
+        telemetry = coordinator.panel_telemetry.snapshot()["operations"]
+        assert telemetry["neighbor_info_status"]["success_count"] == 1
+        assert telemetry["neighbor_info_request"]["success_count"] == 1
+
+    asyncio.run(run())
+
+
+def test_neighbor_info_typed_failure_keeps_fixed_code_and_dedicated_telemetry() -> None:
+    """A zero-RF NeighborInfo rejection reaches the UI without private detail."""
+
+    async def run() -> None:
+        coordinator = SimpleNamespace(
+            async_manual_neighbor_info=AsyncMock(
+                side_effect=NeighborInfoError("neighbor_info_target_self")
+            )
+        )
+        connection = SimpleNamespace(
+            send_message=MagicMock(),
+            send_error=MagicMock(),
+        )
+
+        await websocket_neighbor_info.__wrapped__.__wrapped__(
+            _hass(coordinator),
+            connection,
+            {
+                "id": 24,
+                "type": "meshnet/neighbor_info",
+                "gateway_id": "ble-gateway",
+                "target_node": "meshtastic:!aaaaaaaa",
+            },
+        )
+
+        connection.send_message.assert_not_called()
+        connection.send_error.assert_called_once_with(
+            24,
+            "neighbor_info_target_self",
+            "A gateway cannot request its own NeighborInfo",
+        )
+        telemetry = coordinator.panel_telemetry.snapshot()
+        stats = telemetry["operations"]["neighbor_info_request"]
+        assert stats["request_count"] == 1
+        assert stats["failure_count"] == 1
+        event = telemetry["failure_events"][-1]
+        assert event["operation"] == "neighbor_info_request"
+        assert event["error_code"] == "neighbor_info_target_self"
+        assert event["category"] == "validation"
 
     asyncio.run(run())
 

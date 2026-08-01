@@ -13,6 +13,9 @@ const MESH_CARD_MIN_WIDTH = 280;
 const MESH_CARD_MAX_WIDTH = 720;
 const MESH_CARD_MIN_HEIGHT = 120;
 const MESH_CARD_MAX_HEIGHT = 1200;
+const MESH_LAYOUT_SCHEMA_VERSION = 1;
+const MESH_LAYOUT_STORAGE_KEY = "meshnet.frontend.mesh-workspace-layout.v1";
+const MESH_LAYOUT_STORAGE_MAX_LENGTH = 4096;
 
 class MeshNetPanel extends HTMLElement {
   constructor() {
@@ -61,12 +64,14 @@ class MeshNetPanel extends HTMLElement {
     this._graphAnimationIterations = 0;
     this._graphDrag = null;
     this._graphDragCleanup = null;
-    // Mesh workspace layout belongs only to this attached panel instance. It
-    // deliberately never enters browser storage or Home Assistant state.
+    // Card geometry is non-sensitive presentation state. It is the only panel
+    // state allowed in browser storage; drafts, messages, keys, node data, and
+    // gateway data must never be added to this payload.
     this._meshCardOrder = [...MESH_CARD_IDS];
     this._meshCardSizes = new Map();
     this._meshLayoutInteraction = null;
     this._meshLayoutCleanup = null;
+    this._loadMeshCardLayout();
     this._remoteGatewayId = "";
     this._remoteTargetNode = "";
     this._remoteSettingsSnapshot = null;
@@ -144,10 +149,9 @@ class MeshNetPanel extends HTMLElement {
     this._neighborInfoStatusRequestGeneration += 1;
     this._settingsRequestGeneration += 1;
     this._stopGraphAnimation();
+    if (this._meshLayoutInteraction) this._persistMeshCardLayout();
     this._cancelMeshLayoutInteraction();
     this._graphPositions.clear();
-    this._meshCardOrder = [...MESH_CARD_IDS];
-    this._meshCardSizes.clear();
     this._messages = [];
     this._messageConversation = "broadcast:0";
     this._messageLoading = false;
@@ -374,6 +378,38 @@ class MeshNetPanel extends HTMLElement {
       "connection_lost",
       "unknown_error",
       "invalid_format",
+      "traceroute_unavailable",
+      "traceroute_gateway_not_found",
+      "traceroute_requires_bluetooth",
+      "traceroute_gateway_disconnected",
+      "traceroute_target_invalid",
+      "traceroute_target_unknown",
+      "traceroute_target_self",
+      "traceroute_cooldown",
+      "traceroute_timeout",
+      "traceroute_invalid_response",
+      "traceroute_lifecycle_changed",
+      "traceroute_failed",
+      "traceroute_preflight_failed",
+      "traceroute_status_failed",
+      "neighbor_info_unavailable",
+      "neighbor_info_gateway_not_found",
+      "neighbor_info_requires_bluetooth",
+      "neighbor_info_gateway_disconnected",
+      "neighbor_info_target_invalid",
+      "neighbor_info_target_unknown",
+      "neighbor_info_target_self",
+      "neighbor_info_cooldown",
+      "neighbor_info_preflight_failed",
+      "neighbor_info_unsupported",
+      "neighbor_info_rejected",
+      "neighbor_info_timeout",
+      "neighbor_info_disconnected",
+      "neighbor_info_send_failed",
+      "neighbor_info_invalid_response",
+      "neighbor_info_lifecycle_changed",
+      "neighbor_info_failed",
+      "neighbor_info_status_failed",
     ];
     return allowed.includes(candidate) ? candidate : "other";
   }
@@ -436,6 +472,10 @@ class MeshNetPanel extends HTMLElement {
       "focus",
       "validation",
       "lifecycle",
+      "availability",
+      "connection",
+      "data",
+      "internal",
     ], "lifecycle");
     const errorType = this._safeErrorType(error);
     const errorCode = this._safeErrorCode(error);
@@ -540,11 +580,11 @@ class MeshNetPanel extends HTMLElement {
       remote_settings_preview: "remote_settings_preview",
       remote_settings_apply: "remote_settings_apply",
       traceroute_event: "event_handler",
-      traceroute_request: "traceroute",
-      traceroute_status: "traceroute",
+      traceroute_request: "traceroute_request",
+      traceroute_status: "traceroute_status",
       neighbor_info_event: "event_handler",
-      neighbor_info_request: "event_handler",
-      neighbor_info_status: "event_handler",
+      neighbor_info_request: "neighbor_info_request",
+      neighbor_info_status: "neighbor_info_status",
       reporting: "reporting",
     };
     let operation = operationMap[event.operation] || "reporting";
@@ -566,6 +606,10 @@ class MeshNetPanel extends HTMLElement {
       focus: "internal",
       validation: "validation",
       lifecycle: "lifecycle",
+      availability: "availability",
+      connection: "connection",
+      data: "data",
+      internal: "internal",
     };
     let category = categoryMap[event.category] || "unknown";
     if (event.error_code === "unauthorized") category = "authentication";
@@ -603,6 +647,38 @@ class MeshNetPanel extends HTMLElement {
       invalid_format: "invalid_schema",
       unauthorized: "operation_failed",
       unknown_error: "unexpected_error",
+      traceroute_unavailable: "traceroute_unavailable",
+      traceroute_gateway_not_found: "traceroute_gateway_not_found",
+      traceroute_requires_bluetooth: "traceroute_requires_bluetooth",
+      traceroute_gateway_disconnected: "traceroute_gateway_disconnected",
+      traceroute_target_invalid: "traceroute_target_invalid",
+      traceroute_target_unknown: "traceroute_target_unknown",
+      traceroute_target_self: "traceroute_target_self",
+      traceroute_cooldown: "traceroute_cooldown",
+      traceroute_timeout: "traceroute_timeout",
+      traceroute_invalid_response: "traceroute_invalid_response",
+      traceroute_lifecycle_changed: "traceroute_lifecycle_changed",
+      traceroute_failed: "traceroute_failed",
+      traceroute_preflight_failed: "traceroute_preflight_failed",
+      traceroute_status_failed: "traceroute_status_failed",
+      neighbor_info_unavailable: "neighbor_info_unavailable",
+      neighbor_info_gateway_not_found: "neighbor_info_gateway_not_found",
+      neighbor_info_requires_bluetooth: "neighbor_info_requires_bluetooth",
+      neighbor_info_gateway_disconnected: "neighbor_info_gateway_disconnected",
+      neighbor_info_target_invalid: "neighbor_info_target_invalid",
+      neighbor_info_target_unknown: "neighbor_info_target_unknown",
+      neighbor_info_target_self: "neighbor_info_target_self",
+      neighbor_info_cooldown: "neighbor_info_cooldown",
+      neighbor_info_preflight_failed: "neighbor_info_preflight_failed",
+      neighbor_info_unsupported: "neighbor_info_unsupported",
+      neighbor_info_rejected: "neighbor_info_rejected",
+      neighbor_info_timeout: "neighbor_info_timeout",
+      neighbor_info_disconnected: "neighbor_info_disconnected",
+      neighbor_info_send_failed: "neighbor_info_send_failed",
+      neighbor_info_invalid_response: "neighbor_info_invalid_response",
+      neighbor_info_lifecycle_changed: "neighbor_info_lifecycle_changed",
+      neighbor_info_failed: "neighbor_info_failed",
+      neighbor_info_status_failed: "neighbor_info_status_failed",
     };
     const defaultCodes = {
       snapshot: "snapshot_failed",
@@ -617,6 +693,10 @@ class MeshNetPanel extends HTMLElement {
       render: "render_failed",
       poll: "poll_failed",
       event_handler: "handler_failed",
+      traceroute_request: "traceroute_failed",
+      traceroute_status: "traceroute_status_failed",
+      neighbor_info_request: "neighbor_info_failed",
+      neighbor_info_status: "neighbor_info_status_failed",
       invalid_recipient: "invalid_recipient",
       reporting: "report_failed",
       global_error: "unexpected_error",
@@ -782,10 +862,15 @@ class MeshNetPanel extends HTMLElement {
       (gateway) => gateway && typeof gateway === "object" && !Array.isArray(gateway),
     );
     const sortedNodes = this._sortNodes(nodes, this._nodeSort);
+    const neighborInfoGateways = this._remoteGatewayCandidates(gateways);
+    const neighborInfoGateway = neighborInfoGateways.find(
+      (gateway) => gateway.gateway_id === this._neighborInfoGatewayId,
+    ) || neighborInfoGateways[0];
     const neighborInfoNodeKeys = new Set(
-      this._remoteNodeCandidates(nodes).map((node) => String(node.node_key)),
+      this._neighborInfoNodeCandidates(nodes, neighborInfoGateway)
+        .map((node) => String(node.node_key)),
     );
-    const neighborInfoGatewayAvailable = this._remoteGatewayCandidates(gateways).length > 0;
+    const neighborInfoGatewayAvailable = Boolean(neighborInfoGateway);
     const directDelivery = this._draft.delivery === "direct";
     const recipientChoices = this._recipientChoices(nodes);
     const unsafeRecipientKeys = new Set(
@@ -1284,7 +1369,7 @@ class MeshNetPanel extends HTMLElement {
         </main>
         <aside class="side" id="meshnet-mesh-cards">
           <div class="mesh-layout-help">
-            <span>Drag or use arrows to reorder. Resize from the corner on wider screens. Layout resets when you leave MeshNet.</span>
+            <span>Drag or use arrows to reorder. Resize from the corner on wider screens. Layout is saved only in this browser; Reset removes it.</span>
             <button class="mesh-layout-reset" id="meshnet-layout-reset" type="button">Reset</button>
           </div>
           <section class="panel" data-mesh-card="send-message">
@@ -1456,6 +1541,20 @@ class MeshNetPanel extends HTMLElement {
       candidates.filter((node) => counts.get(this._meshtasticNodeId(node)) === 1),
       "favorites_recent",
     );
+  }
+
+  _tracerouteNodeCandidates(nodes, gateway) {
+    const localNodeId = gateway && this._isExactRemoteTarget(gateway.local_node_id)
+      ? gateway.local_node_id
+      : "";
+    return this._remoteNodeCandidates(nodes).filter((node) => (
+      node.observed_this_session === true
+      && this._meshtasticNodeId(node) !== localNodeId
+    ));
+  }
+
+  _neighborInfoNodeCandidates(nodes, gateway) {
+    return this._tracerouteNodeCandidates(nodes, gateway);
   }
 
   _isExactRemoteTarget(value) {
@@ -1642,10 +1741,16 @@ class MeshNetPanel extends HTMLElement {
 
   _traceroutePanel(nodes, gateways) {
     const compatibleGateways = this._remoteGatewayCandidates(gateways);
-    const compatibleNodes = this._remoteNodeCandidates(nodes);
     const selectedGateway = compatibleGateways.some(
       (gateway) => gateway.gateway_id === this._tracerouteGatewayId,
     ) ? this._tracerouteGatewayId : compatibleGateways[0] && compatibleGateways[0].gateway_id || "";
+    const selectedGatewayRecord = compatibleGateways.find(
+      (gateway) => gateway.gateway_id === selectedGateway,
+    );
+    const compatibleNodes = this._tracerouteNodeCandidates(
+      nodes,
+      selectedGatewayRecord,
+    );
     const selectedTarget = compatibleNodes.some(
       (node) => `meshtastic:${this._meshtasticNodeId(node)}` === this._tracerouteTargetNode,
     ) ? this._tracerouteTargetNode : compatibleNodes[0]
@@ -1743,10 +1848,16 @@ class MeshNetPanel extends HTMLElement {
 
   _neighborInfoPanel(nodes, gateways) {
     const compatibleGateways = this._remoteGatewayCandidates(gateways);
-    const compatibleNodes = this._remoteNodeCandidates(nodes);
     const selectedGateway = compatibleGateways.some(
       (gateway) => gateway.gateway_id === this._neighborInfoGatewayId,
     ) ? this._neighborInfoGatewayId : compatibleGateways[0] && compatibleGateways[0].gateway_id || "";
+    const selectedGatewayRecord = compatibleGateways.find(
+      (gateway) => gateway.gateway_id === selectedGateway,
+    );
+    const compatibleNodes = this._neighborInfoNodeCandidates(
+      nodes,
+      selectedGatewayRecord,
+    );
     const selectedTarget = compatibleNodes.some(
       (node) => `meshtastic:${this._meshtasticNodeId(node)}` === this._neighborInfoTargetNode,
     ) ? this._neighborInfoTargetNode : compatibleNodes[0]
@@ -4347,7 +4458,10 @@ class MeshNetPanel extends HTMLElement {
       traceroute_no_response: "The destination did not respond. The global cooldown may still be active; do not retry blindly.",
       traceroute_timeout: "Traceroute timed out. RF may have been sent and the global cooldown is active; do not retry blindly.",
       traceroute_invalid_response: "The traceroute response failed validation. RF may have been sent; reload persisted status.",
+      traceroute_lifecycle_changed: "The integration reloaded after RF may have been sent. The result was discarded; reload persisted status before another attempt.",
       traceroute_failed: "Traceroute did not complete. RF may have been sent and the global cooldown may be active; do not retry blindly.",
+      traceroute_unavailable: "Manual traceroute is temporarily unavailable. No RF was sent; wait for the integration to finish reloading.",
+      traceroute_preflight_failed: "Traceroute availability could not be validated. No RF was sent; reload persisted status before trying again.",
       traceroute_status_failed: "Persisted traceroute status could not be verified. RF control remains locked; reload status before trying again.",
       unauthorized: "Administrator access is required to view traceroute status or send a traceroute.",
     };
@@ -4356,6 +4470,43 @@ class MeshNetPanel extends HTMLElement {
     return phase === "status"
       ? "Persisted traceroute status could not be verified. RF control remains locked; reload status before trying again."
       : "Traceroute did not return a verified result. RF may have been sent and the global cooldown is active; do not retry blindly.";
+  }
+
+  _tracerouteFailureMayHaveSentRf(error) {
+    return !new Set([
+      "traceroute_unavailable",
+      "traceroute_gateway_not_found",
+      "traceroute_requires_bluetooth",
+      "traceroute_gateway_disconnected",
+      "traceroute_target_invalid",
+      "traceroute_target_unknown",
+      "traceroute_target_self",
+      "traceroute_cooldown",
+      "traceroute_preflight_failed",
+      "traceroute_status_failed",
+      "unauthorized",
+    ]).has(this._operatorErrorCode(error));
+  }
+
+  _tracerouteFailureCategory(error) {
+    const code = this._operatorErrorCode(error);
+    if (code === "traceroute_timeout" || this._safeErrorCode(error) === "timeout") {
+      return "timeout";
+    }
+    if ([
+      "traceroute_target_invalid",
+      "traceroute_target_self",
+      "traceroute_cooldown",
+    ].includes(code)) return "validation";
+    if ([
+      "traceroute_unavailable",
+      "traceroute_gateway_not_found",
+      "traceroute_gateway_disconnected",
+      "traceroute_target_unknown",
+      "traceroute_preflight_failed",
+    ].includes(code)) return "lifecycle";
+    if (this._safeErrorType(error) === "PanelSchemaError") return "schema";
+    return "websocket";
   }
 
   _remoteAllowedSettingPaths() {
@@ -4850,26 +5001,37 @@ class MeshNetPanel extends HTMLElement {
       if (generation !== this._tracerouteRequestGeneration) return;
       this._recordFailure(
         "traceroute_request",
-        this._safeErrorCode(error) === "timeout" ? "timeout" : this._safeErrorType(error) === "PanelSchemaError" ? "schema" : "websocket",
+        this._tracerouteFailureCategory(error),
         error,
       );
-      const failedAt = Date.now();
-      this._tracerouteGlobalStatus = {
-        schema_version: 1,
-        status: "cooldown",
-        reserved: true,
-        gateway_id: gatewayId,
-        target_node: targetNode,
-        reserved_at: new Date(failedAt).toISOString(),
-        next_allowed_at: new Date(failedAt + 60 * 1000).toISOString(),
-        remaining_seconds: 60,
-        result_updated_at: null,
-        result: null,
-        loaded_at_ms: failedAt,
-      };
-      this._tracerouteStatusReady = true;
+      if (this._tracerouteFailureMayHaveSentRf(error)) {
+        const failedAt = Date.now();
+        this._tracerouteGlobalStatus = {
+          schema_version: 1,
+          status: "cooldown",
+          reserved: true,
+          gateway_id: gatewayId,
+          target_node: targetNode,
+          reserved_at: new Date(failedAt).toISOString(),
+          next_allowed_at: new Date(failedAt + 60 * 1000).toISOString(),
+          remaining_seconds: 60,
+          result_updated_at: null,
+          result: null,
+          loaded_at_ms: failedAt,
+        };
+        this._tracerouteStatusReady = true;
+      } else if ([
+        "traceroute_cooldown",
+        "traceroute_preflight_failed",
+      ].includes(this._operatorErrorCode(error))) {
+        // The provider was not called, but the previously loaded status is no
+        // longer authoritative. Re-lock RF controls until the durable status
+        // endpoint succeeds again.
+        this._tracerouteGlobalStatus = null;
+        this._tracerouteStatusReady = false;
+      }
       this._tracerouteStatus = {
-        kind: "warn",
+        kind: this._tracerouteFailureMayHaveSentRf(error) ? "warn" : "bad",
         text: this._tracerouteErrorText(error, "request"),
       };
     } finally {
@@ -5209,29 +5371,23 @@ class MeshNetPanel extends HTMLElement {
       if (generation !== this._neighborInfoRequestGeneration) return;
       this._recordFailure(
         "neighbor_info_request",
-        this._safeErrorCode(error) === "timeout" ? "timeout" : this._safeErrorType(error) === "PanelSchemaError" ? "schema" : "websocket",
+        this._neighborInfoFailureCategory(error),
         error,
       );
-      const now = Date.now();
       this._neighborInfoResult = null;
-      this._neighborInfoStatusData = {
-        schema_version: 1,
-        scope: "integration_and_target",
-        target_node: targetNode,
-        status: "cooldown",
-        global_remaining_seconds: 180,
-        target_remaining_seconds: 180,
-        remaining_seconds: 180,
-        next_allowed_at: new Date(now + 180000).toISOString(),
-        gateway_id: gatewayId,
-        reserved_at: new Date(now).toISOString(),
-        result_updated_at: null,
-        result: null,
-        loaded_at_ms: now,
+      const errorCode = this._operatorErrorCode(error);
+      const mayHaveSentRf = this._neighborInfoFailureMayHaveSentRf(error);
+      if (mayHaveSentRf || errorCode === "neighbor_info_cooldown") {
+        // A real server reservation may exist. Never replace durable state
+        // with a browser-invented timer: lock RF until status is read back.
+        this._neighborInfoStatusData = null;
+        this._neighborInfoStatusReady = false;
+        this._neighborInfoStatusTarget = targetNode;
+      }
+      this._neighborInfoStatus = {
+        kind: mayHaveSentRf || errorCode === "neighbor_info_cooldown" ? "warn" : "bad",
+        text: this._neighborInfoErrorText(error, "request"),
       };
-      this._neighborInfoStatusReady = true;
-      this._neighborInfoStatusTarget = targetNode;
-      this._neighborInfoStatus = { kind: "warn", text: this._neighborInfoErrorText(error, "request") };
     } finally {
       if (generation === this._neighborInfoRequestGeneration) {
         this._neighborInfoBusy = false;
@@ -5242,15 +5398,78 @@ class MeshNetPanel extends HTMLElement {
 
   _neighborInfoErrorText(error, phase = "request") {
     const fixed = {
+      neighbor_info_unavailable: "NeighborInfo is temporarily unavailable. No RF request was sent.",
+      neighbor_info_gateway_not_found: "The selected NeighborInfo gateway is unavailable. No RF request was sent.",
+      neighbor_info_requires_bluetooth: "Choose a connected Meshtastic Bluetooth gateway. No RF request was sent.",
+      neighbor_info_gateway_disconnected: "The selected Bluetooth gateway disconnected before the request. No RF request was sent.",
+      neighbor_info_target_invalid: "Choose one exact Meshtastic node. No RF request was sent.",
+      neighbor_info_target_unknown: "The target was not observed in the active radio session. No RF request was sent.",
+      neighbor_info_target_self: "Choose a remote node; a gateway cannot request its own NeighborInfo. No RF request was sent.",
+      neighbor_info_cooldown: "A persisted NeighborInfo cooldown is active. No new RF request was sent; reload persisted status before another attempt.",
+      neighbor_info_preflight_failed: "NeighborInfo availability could not be validated. No RF request was sent.",
+      neighbor_info_unsupported: "One NeighborInfo request was sent, but the target does not support it or has Neighbor Info disabled. It was not retried; reload persisted status before another attempt.",
+      neighbor_info_rejected: "One NeighborInfo request was rejected by the mesh. It was not retried; reload persisted status before another attempt.",
+      neighbor_info_timeout: "One NeighborInfo request timed out. RF may have been sent; it was not retried. Reload persisted status before another attempt.",
+      neighbor_info_disconnected: "Bluetooth disconnected after the NeighborInfo request may have been sent. It was not retried; reload persisted status before another attempt.",
+      neighbor_info_send_failed: "NeighborInfo transmission could not be confirmed. RF may have been sent; it was not retried. Reload persisted status before another attempt.",
+      neighbor_info_invalid_response: "A NeighborInfo response failed validation after one request. It was not retried; reload persisted status before another attempt.",
+      neighbor_info_lifecycle_changed: "The integration reloaded after a NeighborInfo request may have been sent. It was not retried; reload persisted status.",
       neighbor_info_status_failed: "Persisted NeighborInfo cooldowns could not be verified. RF control remains locked.",
-      neighbor_info_failed: "NeighborInfo did not return a validated response. RF may have been sent; do not retry until persisted status is reloaded after the cooldown.",
+      neighbor_info_failed: "NeighborInfo did not return a validated response. RF may have been sent; it was not retried. Reload persisted status before another attempt.",
       unauthorized: "Administrator access is required for NeighborInfo controls.",
     };
     const mapped = fixed[this._operatorErrorCode(error)];
     if (mapped) return mapped;
     return phase === "status"
       ? "Persisted NeighborInfo cooldowns could not be verified. RF control remains locked."
-      : "NeighborInfo failed or timed out. RF may have been sent; do not retry blindly.";
+      : "NeighborInfo failed with an unknown outcome. RF may have been sent; it was not retried. Reload persisted status before another attempt.";
+  }
+
+  _neighborInfoFailureMayHaveSentRf(error) {
+    return !new Set([
+      "neighbor_info_unavailable",
+      "neighbor_info_gateway_not_found",
+      "neighbor_info_requires_bluetooth",
+      "neighbor_info_gateway_disconnected",
+      "neighbor_info_target_invalid",
+      "neighbor_info_target_unknown",
+      "neighbor_info_target_self",
+      "neighbor_info_cooldown",
+      "neighbor_info_preflight_failed",
+      "neighbor_info_status_failed",
+      "unauthorized",
+    ]).has(this._operatorErrorCode(error));
+  }
+
+  _neighborInfoFailureCategory(error) {
+    const code = this._operatorErrorCode(error);
+    if (code === "neighbor_info_timeout" || this._safeErrorCode(error) === "timeout") {
+      return "timeout";
+    }
+    if ([
+      "neighbor_info_target_invalid",
+      "neighbor_info_target_self",
+      "neighbor_info_cooldown",
+    ].includes(code)) return "validation";
+    if ([
+      "neighbor_info_unavailable",
+      "neighbor_info_gateway_not_found",
+      "neighbor_info_gateway_disconnected",
+      "neighbor_info_target_unknown",
+      "neighbor_info_preflight_failed",
+      "neighbor_info_unsupported",
+      "neighbor_info_rejected",
+    ].includes(code)) return "availability";
+    if ([
+      "neighbor_info_disconnected",
+      "neighbor_info_send_failed",
+    ].includes(code)) return "connection";
+    if (code === "neighbor_info_lifecycle_changed") return "lifecycle";
+    if (
+      code === "neighbor_info_invalid_response"
+      || this._safeErrorType(error) === "PanelSchemaError"
+    ) return "data";
+    return "websocket";
   }
 
   _validatedTimestamp(value) {
@@ -5298,6 +5517,143 @@ class MeshNetPanel extends HTMLElement {
     return typeof value === "string" && MESH_CARD_IDS.includes(value);
   }
 
+  _meshLayoutStorage() {
+    try {
+      if (typeof window === "undefined") return null;
+      const storage = window.localStorage;
+      if (
+        !storage
+        || typeof storage.getItem !== "function"
+        || typeof storage.setItem !== "function"
+        || typeof storage.removeItem !== "function"
+      ) return null;
+      return storage;
+    } catch (_ignored) {
+      // Hardened browsers may reject storage access. Layout remains usable in
+      // memory and no alternate HA, service, or radio persistence is attempted.
+      return null;
+    }
+  }
+
+  _validateStoredMeshCardLayout(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const rootKeys = Object.keys(value).sort();
+    if (
+      rootKeys.length !== 3
+      || rootKeys[0] !== "order"
+      || rootKeys[1] !== "schema_version"
+      || rootKeys[2] !== "sizes"
+      || value.schema_version !== MESH_LAYOUT_SCHEMA_VERSION
+      || !Array.isArray(value.order)
+      || value.order.length !== MESH_CARD_IDS.length
+      || new Set(value.order).size !== MESH_CARD_IDS.length
+      || value.order.some((cardId) => !this._isMeshCardId(cardId))
+      || !value.sizes
+      || typeof value.sizes !== "object"
+      || Array.isArray(value.sizes)
+    ) return null;
+
+    const sizeKeys = Object.keys(value.sizes);
+    if (
+      sizeKeys.length > MESH_CARD_IDS.length
+      || sizeKeys.some((cardId) => !this._isMeshCardId(cardId))
+    ) return null;
+    const sizes = new Map();
+    for (const cardId of sizeKeys) {
+      const size = value.sizes[cardId];
+      if (
+        !size
+        || typeof size !== "object"
+        || Array.isArray(size)
+        || Object.keys(size).sort().join(",") !== "height,width"
+        || !Number.isSafeInteger(size.width)
+        || !Number.isSafeInteger(size.height)
+        || size.width < MESH_CARD_MIN_WIDTH
+        || size.width > MESH_CARD_MAX_WIDTH
+        || size.height < MESH_CARD_MIN_HEIGHT
+        || size.height > MESH_CARD_MAX_HEIGHT
+      ) return null;
+      sizes.set(cardId, { width: size.width, height: size.height });
+    }
+    return { order: [...value.order], sizes };
+  }
+
+  _removeStoredMeshCardLayout(storage = null) {
+    const target = storage || this._meshLayoutStorage();
+    if (!target) return false;
+    try {
+      target.removeItem(MESH_LAYOUT_STORAGE_KEY);
+      return true;
+    } catch (_ignored) {
+      // Reset still clears the in-memory layout when browser storage is denied.
+      return false;
+    }
+  }
+
+  _loadMeshCardLayout() {
+    this._meshCardOrder = [...MESH_CARD_IDS];
+    this._meshCardSizes = new Map();
+    const storage = this._meshLayoutStorage();
+    if (!storage) return false;
+    let encoded;
+    try {
+      encoded = storage.getItem(MESH_LAYOUT_STORAGE_KEY);
+    } catch (_ignored) {
+      return false;
+    }
+    if (encoded == null) return false;
+    if (
+      typeof encoded !== "string"
+      || encoded.length === 0
+      || encoded.length > MESH_LAYOUT_STORAGE_MAX_LENGTH
+    ) {
+      this._removeStoredMeshCardLayout(storage);
+      return false;
+    }
+    let decoded;
+    try {
+      decoded = JSON.parse(encoded);
+    } catch (_ignored) {
+      this._removeStoredMeshCardLayout(storage);
+      return false;
+    }
+    const layout = this._validateStoredMeshCardLayout(decoded);
+    if (!layout) {
+      this._removeStoredMeshCardLayout(storage);
+      return false;
+    }
+    this._meshCardOrder = layout.order;
+    this._meshCardSizes = layout.sizes;
+    return true;
+  }
+
+  _persistMeshCardLayout() {
+    const storage = this._meshLayoutStorage();
+    if (!storage) return false;
+    const sizes = Object.create(null);
+    for (const cardId of MESH_CARD_IDS) {
+      const size = this._meshCardSizes.get(cardId);
+      if (size) sizes[cardId] = { width: size.width, height: size.height };
+    }
+    const payload = {
+      schema_version: MESH_LAYOUT_SCHEMA_VERSION,
+      order: [...this._meshCardOrder],
+      sizes,
+    };
+    if (!this._validateStoredMeshCardLayout(payload)) return false;
+    let encoded;
+    try {
+      encoded = JSON.stringify(payload);
+      if (encoded.length > MESH_LAYOUT_STORAGE_MAX_LENGTH) return false;
+      storage.setItem(MESH_LAYOUT_STORAGE_KEY, encoded);
+      return true;
+    } catch (_ignored) {
+      // Quota and security failures cannot escape into rendering or trigger a
+      // fallback write through Home Assistant or a connected radio.
+      return false;
+    }
+  }
+
   _orderedMeshCards(availableIds) {
     if (!Array.isArray(availableIds)) return [];
     const available = new Set(
@@ -5319,6 +5675,7 @@ class MeshNetPanel extends HTMLElement {
     [next[index], next[nextIndex]] = [next[nextIndex], next[index]];
     this._meshCardOrder = next;
     this._applyMeshCardOrder();
+    this._persistMeshCardLayout();
     return true;
   }
 
@@ -5338,16 +5695,18 @@ class MeshNetPanel extends HTMLElement {
     }
     this._meshCardOrder = next;
     this._applyMeshCardOrder();
+    this._persistMeshCardLayout();
     return true;
   }
 
-  _setMeshCardSize(cardId, width, height) {
+  _setMeshCardSize(cardId, width, height, persist = true) {
     if (
       !this._isMeshCardId(cardId)
       || !Number.isSafeInteger(width)
       || !Number.isSafeInteger(height)
       || width <= 0
       || height <= 0
+      || typeof persist !== "boolean"
     ) return false;
     const size = {
       width: Math.min(MESH_CARD_MAX_WIDTH, Math.max(MESH_CARD_MIN_WIDTH, width)),
@@ -5355,6 +5714,7 @@ class MeshNetPanel extends HTMLElement {
     };
     this._meshCardSizes.set(cardId, size);
     this._applyMeshCardSize(cardId);
+    if (persist) this._persistMeshCardLayout();
     return true;
   }
 
@@ -5387,6 +5747,7 @@ class MeshNetPanel extends HTMLElement {
   _resetMeshCardLayout() {
     this._meshCardOrder = [...MESH_CARD_IDS];
     this._meshCardSizes.clear();
+    this._removeStoredMeshCardLayout();
     this._applyMeshCardOrder();
   }
 
@@ -5450,6 +5811,7 @@ class MeshNetPanel extends HTMLElement {
 
   _finishMeshLayoutInteraction() {
     this._cancelMeshLayoutInteraction();
+    this._persistMeshCardLayout();
     this._queuePendingPollRender();
   }
 
@@ -5490,7 +5852,7 @@ class MeshNetPanel extends HTMLElement {
       ) return;
       const width = Math.round(rect.width + moveEvent.clientX - startX);
       const height = Math.round(rect.height + moveEvent.clientY - startY);
-      this._setMeshCardSize(cardId, width, height);
+      this._setMeshCardSize(cardId, width, height, false);
     };
     const finish = (finishEvent) => {
       if (
@@ -5633,17 +5995,21 @@ class MeshNetPanel extends HTMLElement {
     const nodes = snapshot && snapshot.nodes && typeof snapshot.nodes === "object"
       ? Object.values(snapshot.nodes)
       : [];
-    const candidates = this._remoteNodeCandidates(nodes);
-    const matches = candidates.filter((node) => node.node_key === requested);
-    if (matches.length !== 1) return false;
     const gateways = snapshot && snapshot.gateways && typeof snapshot.gateways === "object"
       ? Object.values(snapshot.gateways)
       : [];
     const compatibleGateways = this._remoteGatewayCandidates(gateways);
     if (!compatibleGateways.length) return false;
-    const selectedGateway = compatibleGateways.some(
+    const selectedGatewayRecord = compatibleGateways.find(
       (gateway) => gateway.gateway_id === this._neighborInfoGatewayId,
-    ) ? this._neighborInfoGatewayId : compatibleGateways[0].gateway_id;
+    ) || compatibleGateways[0];
+    const candidates = this._neighborInfoNodeCandidates(
+      nodes,
+      selectedGatewayRecord,
+    );
+    const matches = candidates.filter((node) => node.node_key === requested);
+    if (matches.length !== 1) return false;
+    const selectedGateway = selectedGatewayRecord.gateway_id;
     const nodeId = this._meshtasticNodeId(matches[0]);
     const targetNode = `meshtastic:${nodeId}`;
     if (requested !== targetNode || !this._isExactTracerouteTarget(targetNode)) return false;

@@ -89,8 +89,13 @@ def test_gateway_settings_view_is_explicit_and_keeps_drafts_in_memory() -> None:
     assert "this._settingsDraft = Object.create(null)" in source
     assert "Treat navigation away from the panel as abandoning the draft" in source
     assert 'id="meshnet-settings-gateway"${busy ? " disabled" : ""}' in source
-    assert "localStorage" not in source
     assert "sessionStorage" not in source
+    persistence = source[
+        source.index("  _persistMeshCardLayout()") : source.index("  _orderedMeshCards(")
+    ]
+    assert "_settingsDraft" not in persistence
+    assert "_remoteSettingsDraft" not in persistence
+    assert "private_key" not in persistence
 
 
 def test_settings_schema_is_bounded_typed_and_scrubs_secret_values() -> None:

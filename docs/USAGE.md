@@ -30,10 +30,13 @@ The panel shows:
 
 On the main **Mesh** view, drag a side-card handle to reorder cards or use its
 accessible earlier/later buttons. Resize with the corner handle or its keyboard
-arrow controls. Card order and size live only in the current panel instance;
-MeshNet does not write them to browser storage, Home Assistant, or a radio.
-Press **Reset**, or detach/navigate away from the panel, to restore the default
-layout.
+arrow controls. Card order and size persist in this browser across navigation
+and reloads. The versioned, strictly validated browser record contains only the
+fixed card IDs and bounded integer dimensions—never messages, nodes, gateways,
+drafts, settings, credentials, or keys. MeshNet does not send this layout to
+Home Assistant or a radio, and a storage failure simply leaves it in memory.
+Press **Reset** to restore defaults and delete the saved record. If you want no
+browser layout record after uninstall, press **Reset** before removing MeshNet.
 
 For the simplest test, open the sidebar panel, leave **Delivery** on
 **Broadcast** and **Gateway** on **Automatic**, enter a short message, and press
@@ -109,7 +112,10 @@ The backend permits at most one manual traceroute across the entire MeshNet
 integration per minute, reserves that global cooldown before transmitting, never
 retries, and exposes no traceroute service or automation action. The panel
 reloads the persisted cooldown and last bounded result after Home Assistant or
-the browser restarts.
+the browser restarts. It excludes the selected gateway itself and nodes not
+observed in the current radio session before reservation, so those validation
+failures transmit nothing. The packet uses the connected radio's configured
+LoRa hop limit rather than silently forcing a direct-only request.
 
 Administrators may explicitly request NeighborInfo from one exact known node
 through a connected Meshtastic Bluetooth gateway. MeshNet submits one unicast
@@ -120,7 +126,10 @@ experimental path is verified on Meshtastic firmware 2.7.26 and requires the
 target's Neighbor Info module to be enabled. Older firmware may reject it or
 time out. The response is a cached zero-hop report with at most ten neighbors,
 not a live scan; an empty valid response and a timeout are different outcomes.
-A timeout is treated as unknown and consumes both reservations.
+A timeout is treated as unknown and consumes both reservations. The request
+uses the connected radio's configured LoRa hop limit. Diagnostics separately
+count a routing rejection, timeout, cancellation, send failure, and disconnect;
+they retain only bounded protocol-enum reasons, not node identities.
 
 The **NeighborInfo** button beside **Message** in a node row is only a shortcut
 to the guarded controls. It selects the exact node and reveals the existing
@@ -148,6 +157,67 @@ files, position mutation, and raw admin commands are excluded. A timeout is an
 unknown outcome: inspect the radio locally instead of pressing Apply again.
 The full trust model and recovery table are in
 [Advanced Mesh Operations](ADVANCED_MESH_OPERATIONS.md).
+
+## Messages, Telemetry, And History
+
+Incoming decoded text appears automatically under **MeshNet -> Messages**.
+Automations that need message text should listen for
+`meshnet_message_received`; the deprecated `meshnet_packet` event is metadata
+only and is not a telemetry or raw-payload API.
+
+MeshNet passively decodes documented sensor values that a configured gateway
+already receives and can decrypt. Enable the appropriate telemetry module on
+the radio with an official client, wait for that node to transmit, then open:
+
+```text
+Settings -> Devices & services -> MeshNet -> Devices -> <node>
+```
+
+Supported values appear as normal Home Assistant `sensor` or `binary_sensor`
+entities. Use the exact entity IDs shown on that page or under **Developer
+Tools -> States**; do not guess IDs from the examples. Supported finite metrics
+include temperature, humidity, pressure, CO2, air quality, wind, rainfall,
+soil, particulate, light, electrical, battery, and radio observations when the
+provider supplies them. Unknown ports and metric names are dropped.
+
+Home Assistant Recorder stores entity state changes when Recorder is enabled
+and the entity is not excluded. This is separate from MeshNet's `history_days`,
+which controls its own packet/message cache. Typed measurements have units and
+measurement metadata; generic dynamically discovered values may have ordinary
+state history without long-term statistics. MeshNet creates sensor entities,
+not a weather forecast entity.
+
+Sensor state availability currently means that the node remains in MeshNet's
+cache. An offline node can retain its last measurement, so safety-related
+automations must also check the node's **Online** and **Last heard** entities.
+Opening a dashboard never polls remote telemetry or creates RF traffic.
+
+To send a Home Assistant sensor value over the mesh today, place the value in a
+bounded text message. MeshNet does not claim that a Home Assistant value is a
+native Meshtastic or MeshCore telemetry packet. For example:
+
+```yaml
+alias: Mesh high-temperature alert
+trigger:
+  - platform: numeric_state
+    entity_id: sensor.garden_temperature
+    above: 35
+action:
+  - action: meshnet.broadcast_message
+    data:
+      gateway_id: garage_radio
+      channel: "1"
+      priority: high
+      message: >-
+        Garden temperature is {{ states('sensor.garden_temperature') }}
+        {{ state_attr('sensor.garden_temperature', 'unit_of_measurement') or '' }}
+mode: single
+```
+
+Channel `1` is private only when it was already configured with the intended
+PSK on every participating radio. MeshNet does not create, read, or return that
+key. Messages and telemetry may remain in MeshNet SQLite, Home Assistant
+Recorder, automation traces, and backups after HACS uninstall.
 
 ## Verify Gateway Status
 

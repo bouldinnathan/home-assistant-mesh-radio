@@ -24,8 +24,13 @@ def test_remote_admin_and_traceroute_are_visible_explicit_controls_only() -> Non
     assert "copy-only" in source.casefold()
     assert "Private key" not in source
     assert "admin key slot" not in source.casefold()
-    assert "localStorage" not in source
     assert "sessionStorage" not in source
+    persistence = source[
+        source.index("  _persistMeshCardLayout()") : source.index("  _orderedMeshCards(")
+    ]
+    assert "_remoteSettingsDraft" not in persistence
+    assert "_settingsDraft" not in persistence
+    assert "public_key" not in persistence
 
 
 def test_neighbor_info_is_explicit_experimental_and_status_gated() -> None:
@@ -186,6 +191,8 @@ def test_neighbor_info_validation_is_bounded_and_failures_never_claim_zero_neigh
   panel._hass = { async callWS() { throw error; } };
   await panel._requestNeighborInfo("ble-gateway", "meshtastic:!1234abcd");
   assert.equal(panel._neighborInfoResult, null);
+  assert.equal(panel._neighborInfoStatusData, null);
+  assert.equal(panel._neighborInfoStatusReady, false);
   assert.equal(panel._neighborInfoStatus.text.includes(sentinel), false);
   assert.doesNotMatch(panel._neighborInfoStatus.text, /zero|0 neighbors/i);
   assert.match(panel._neighborInfoStatus.text, /may have been sent|do not retry/i);
@@ -518,5 +525,280 @@ def test_remote_ui_rejects_malformed_success_without_retaining_draft_values() ->
   assert.equal(panel._remoteSettingsPreview, null);
   assert.deepEqual(panel._remoteSettingsDraft, {{}});
   assert.equal(JSON.stringify(panel).includes({json.dumps(private_value)}), false);
+"""
+    )
+
+
+def test_traceroute_filters_self_and_cached_only_nodes_for_selected_gateway() -> None:
+    """The UI must not offer targets the active BLE provider will reject."""
+    _run_panel_script(
+        r"""
+  const gateway = {
+    gateway_id: "ble-gateway",
+    name: "BLE gateway",
+    protocol: "meshtastic",
+    transport: "bluetooth",
+    connected: true,
+    local_node_id: "!aaaaaaaa",
+  };
+  const node = (id, observed) => ({
+    node_key: `meshtastic:${id}`,
+    node_id: id,
+    protocol: "meshtastic",
+    identity_valid: true,
+    observed_this_session: observed,
+    long_name: id,
+    last_heard: null,
+  });
+  const candidates = panel._tracerouteNodeCandidates([
+    node("!aaaaaaaa", true),
+    node("!1234abcd", false),
+    node("!87654321", true),
+  ], gateway);
+
+  assert.deepEqual(candidates.map((item) => item.node_id), ["!87654321"]);
+  const html = panel._traceroutePanel([
+    node("!aaaaaaaa", true),
+    node("!1234abcd", false),
+    node("!87654321", true),
+  ], [gateway]);
+  assert.doesNotMatch(html, /meshtastic:!aaaaaaaa/);
+  assert.doesNotMatch(html, /meshtastic:!1234abcd/);
+  assert.match(html, /meshtastic:!87654321/);
+"""
+    )
+
+
+def test_neighbor_info_filters_self_and_cached_only_nodes_for_selected_gateway() -> None:
+    """The panel and node-row shortcut expose only live remote targets."""
+    _run_panel_script(
+        r"""
+  const gateway = {
+    gateway_id: "ble-gateway",
+    name: "BLE gateway",
+    protocol: "meshtastic",
+    transport: "bluetooth",
+    connected: true,
+    local_node_id: "!aaaaaaaa",
+  };
+  const node = (id, observed) => ({
+    node_key: `meshtastic:${id}`,
+    node_id: id,
+    protocol: "meshtastic",
+    identity_valid: true,
+    observed_this_session: observed,
+    long_name: id,
+    last_heard: null,
+  });
+  const local = node("!aaaaaaaa", true);
+  const cached = node("!1234abcd", false);
+  const remote = node("!87654321", true);
+  const candidates = panel._neighborInfoNodeCandidates(
+    [local, cached, remote],
+    gateway,
+  );
+
+  assert.deepEqual(candidates.map((item) => item.node_id), ["!87654321"]);
+  const html = panel._neighborInfoPanel([local, cached, remote], [gateway]);
+  assert.doesNotMatch(html, /meshtastic:!aaaaaaaa/);
+  assert.doesNotMatch(html, /meshtastic:!1234abcd/);
+  assert.match(html, /meshtastic:!87654321/);
+
+  panel._safeRender = () => true;
+  panel._snapshot = {
+    nodes: { local, cached, remote },
+    gateways: { "ble-gateway": gateway },
+  };
+  panel._neighborInfoGatewayId = "ble-gateway";
+  assert.equal(panel._openNeighborInfoForNode(local.node_key), false);
+  assert.equal(panel._openNeighborInfoForNode(cached.node_key), false);
+  assert.equal(panel._openNeighborInfoForNode(remote.node_key), true);
+  assert.equal(panel._neighborInfoTargetNode, remote.node_key);
+"""
+    )
+
+
+def test_neighbor_info_failure_phase_preserves_only_authoritative_status() -> None:
+    """No-RF failures never invent cooldowns; unknown RF outcomes re-lock."""
+    _run_panel_script(
+        r"""
+  panel._safeRender = () => true;
+  panel._queuePanelReport = () => {};
+  const target = "meshtastic:!1234abcd";
+  const available = {
+    schema_version: 1,
+    scope: "integration_and_target",
+    target_node: target,
+    status: "available",
+    global_remaining_seconds: 0,
+    target_remaining_seconds: 0,
+    remaining_seconds: 0,
+    next_allowed_at: null,
+    gateway_id: null,
+    reserved_at: null,
+    result_updated_at: null,
+    result: null,
+    loaded_at_ms: Date.now(),
+  };
+  const dispatch = async (code) => {
+    panel._neighborInfoStatusReady = true;
+    panel._neighborInfoStatusTarget = target;
+    panel._neighborInfoStatusData = available;
+    panel._neighborInfoConfirmation = {
+      gateway_id: "ble-gateway",
+      target_node: target,
+    };
+    const error = new Error("private node !deadbeef /dev/secret");
+    error.code = code;
+    panel._hass = { async callWS() { throw error; } };
+    await panel._requestNeighborInfo("ble-gateway", target);
+    return panel._neighborInfoStatus.text;
+  };
+
+  let text = await dispatch("neighbor_info_target_self");
+  assert.equal(panel._neighborInfoStatusData, available);
+  assert.equal(panel._neighborInfoStatusReady, true);
+  assert.match(text, /No RF request was sent/i);
+  assert.doesNotMatch(text, /deadbeef|\/dev\/secret/i);
+
+  text = await dispatch("neighbor_info_timeout");
+  assert.equal(panel._neighborInfoStatusData, null);
+  assert.equal(panel._neighborInfoStatusReady, false);
+  assert.match(text, /not retried|reload persisted status/i);
+
+  text = await dispatch("neighbor_info_cooldown");
+  assert.equal(panel._neighborInfoStatusData, null);
+  assert.equal(panel._neighborInfoStatusReady, false);
+  assert.match(text, /persisted.*cooldown|reload persisted status/i);
+
+  const requestReport = panel._backendPanelReport({
+    operation: "neighbor_info_request",
+    category: "timeout",
+    error_type: "Error",
+    error_code: "neighbor_info_timeout",
+    occurrence: 1,
+    consecutive: 1,
+  });
+  const statusReport = panel._backendPanelReport({
+    operation: "neighbor_info_status",
+    category: "websocket",
+    error_type: "Error",
+    error_code: "neighbor_info_status_failed",
+    occurrence: 1,
+    consecutive: 1,
+  });
+  assert.equal(requestReport.operation, "neighbor_info_request");
+  assert.equal(requestReport.error_code, "neighbor_info_timeout");
+  assert.equal(statusReport.operation, "neighbor_info_status");
+  assert.equal(statusReport.error_code, "neighbor_info_status_failed");
+"""
+    )
+
+
+def test_traceroute_status_then_confirmation_dispatches_provider_once() -> None:
+    """One successful persisted preflight gates exactly one confirmed request."""
+    _run_panel_script(
+        r"""
+  const requests = [];
+  panel._safeRender = () => true;
+  panel._hass = {
+    async callWS(payload) {
+      requests.push(structuredClone(payload));
+      if (payload.type === "meshnet/traceroute/status") {
+        return {
+          schema_version: 1,
+          scope: "integration",
+          status: "available",
+          reserved: false,
+          gateway_id: null,
+          target_node: null,
+          reserved_at: null,
+          next_allowed_at: null,
+          remaining_seconds: 0,
+          result_updated_at: null,
+          result: null,
+        };
+      }
+      assert.equal(payload.type, "meshnet/traceroute");
+      return {
+        schema_version: 1,
+        status: "complete",
+        gateway_id: "ble-gateway",
+        destination: "meshtastic:!1234abcd",
+        correlation_id: "trace-once",
+        source: "meshtastic:!aaaaaaaa",
+        channel: 0,
+        forward_route: [
+          "meshtastic:!aaaaaaaa",
+          "meshtastic:!1234abcd",
+        ],
+      };
+    },
+  };
+
+  await panel._loadTracerouteStatus();
+  await panel._requestTraceroute("ble-gateway", "meshtastic:!1234abcd");
+  assert.equal(
+    requests.filter((item) => item.type === "meshnet/traceroute").length,
+    0,
+    "the first click only prepares confirmation",
+  );
+  await panel._requestTraceroute("ble-gateway", "meshtastic:!1234abcd");
+
+  assert.equal(
+    requests.filter((item) => item.type === "meshnet/traceroute/status").length,
+    1,
+  );
+  assert.equal(
+    requests.filter((item) => item.type === "meshnet/traceroute").length,
+    1,
+  );
+  assert.equal(
+    panel._tracerouteResults["meshtastic:!1234abcd"].correlation_id,
+    "trace-once",
+  );
+"""
+    )
+
+
+def test_traceroute_preflight_failure_does_not_invent_an_rf_cooldown() -> None:
+    """Stable server preflight errors state that no radio packet was sent."""
+    _run_panel_script(
+        r"""
+  const error = new Error("private provider detail");
+  error.code = "traceroute_target_self";
+  panel._safeRender = () => true;
+  panel._tracerouteStatusReady = true;
+  panel._tracerouteGlobalStatus = {
+    schema_version: 1,
+    status: "available",
+    reserved: false,
+    gateway_id: null,
+    target_node: null,
+    reserved_at: null,
+    next_allowed_at: null,
+    remaining_seconds: 0,
+    result_updated_at: null,
+    result: null,
+  };
+  panel._tracerouteConfirmation = {
+    gateway_id: "ble-gateway",
+    target_node: "meshtastic:!aaaaaaaa",
+  };
+  let sends = 0;
+  panel._hass = { async callWS(payload) {
+    assert.equal(payload.type, "meshnet/traceroute");
+    sends += 1;
+    throw error;
+  } };
+
+  await panel._requestTraceroute("ble-gateway", "meshtastic:!aaaaaaaa");
+
+  assert.equal(sends, 1);
+  assert.equal(panel._tracerouteGlobalStatus.status, "available");
+  assert.equal(panel._tracerouteGlobalStatus.reserved, false);
+  assert.equal(panel._tracerouteStatusReady, true);
+  assert.match(panel._tracerouteStatus.text, /cannot traceroute itself|remote node/i);
+  assert.doesNotMatch(panel._tracerouteStatus.text, /may have been sent/i);
 """
     )

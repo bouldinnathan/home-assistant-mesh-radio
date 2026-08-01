@@ -1,5 +1,30 @@
 # Upgrade Guide
 
+## From 0.9.0
+
+0.10.0 persists the main **Mesh** card order and bounded card sizes in this
+browser. The versioned record has an exact schema and can contain only the
+fixed card IDs plus integer width/height values. Messages, node and gateway
+data, settings drafts, credentials, and keys are never stored. A malformed or
+old record is deleted; denied or full browser storage falls back to an
+in-memory layout. **Reset** restores defaults and deletes the browser record.
+Home Assistant and the radio receive no layout write. If you want no
+browser-only residue after uninstall, press **Reset** before removing MeshNet;
+uninstalled panel code cannot clear browser storage later.
+
+The manual Meshtastic Bluetooth traceroute and NeighborInfo paths now copy the
+connected radio's configured LoRa hop limit instead of leaving the protobuf
+field at its direct-only default. The traceroute selector removes the selected
+gateway and cached-only nodes. Stable preflight errors occur before the durable
+cooldown reservation and explicitly indicate that no RF was sent; an unknown
+post-submission outcome remains cooldown-protected and is never retried.
+NeighborInfo keeps its firmware request marker and adds privacy-safe diagnostic
+counters for response, routing rejection, timeout, cancellation, send failure,
+and disconnect.
+
+Restart Home Assistant and hard-refresh the browser so the 0.10.0 panel module
+loads. No database or config-entry migration is required.
+
 ## From 0.8.0
 
 0.9.0 makes side cards on the main **Mesh** view reorderable and resizable with
