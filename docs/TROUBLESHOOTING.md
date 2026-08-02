@@ -616,10 +616,55 @@ The MeshNet sidebar panel is admin-only by design. Use an admin Home Assistant a
 
 ### Updated Sidebar Still Looks Old
 
-MeshNet 0.5.10 version-stamps the sidebar JavaScript URL. Restart Home Assistant
-after updating, then hard-refresh the browser once. The current panel has a
-separate **Delivery** selector, node sort selector, **Message** buttons, a Map
-link, and the heading **Cached evidence topology — no traceroutes sent automatically**.
+MeshNet 0.11.0 version-stamps the sidebar JavaScript URL. Restart Home Assistant
+after updating, then hard-refresh the browser once. The current graph has a
+**Layout** selector with **Geographic scale** and **Topology**, a 20/50/100 node
+limit, and the heading **Cached evidence topology — no traceroutes sent
+automatically**.
+
+### Geographic Graph Looks Empty, Compressed, or Keeps Changing Scale
+
+First select **Geographic scale**. **Topology** is an animated relationship
+diagram and its pixels are deliberately not map units. Geographic scale uses
+equal meters per pixel on both axes and shows a metric or imperial scale bar.
+It has no tile basemap, so compare positions and evidenced connections rather
+than expecting the Home Assistant Map view.
+
+The geographic plot includes up to 24 hours of validated positions when it
+chooses its extent. MeshNet keeps no more than one point per node per UTC hour
+and 25 points per node. This makes the scale sticky enough to show a node's
+movement over a rolling day instead of recentering only around the newest
+point. A distant current or trail point can legitimately compress a local
+cluster. Hover/select that node, reduce the node limit, or switch to Topology
+when relationship readability matters more than physical scale.
+
+Nodes in **Unlocated endpoints — not to scale** have no coordinate that the
+graph can safely plot. Common causes are missing GPS, `(0, 0)`, a non-finite
+value, or an explicitly coarse position below the precision threshold. Home
+Assistant's Home location may supply a clearly labeled fallback for the exact
+gateway only; it is not assigned to every unlocated radio and is never written
+back to a device.
+
+The 20/50/100 limit is evidence-aware: MeshNet tries to keep both endpoints of
+direct, fresh NeighborInfo, and cached-route evidence and prioritizes direct
+gateway observations. If a bounded gateway set or the selected limit cannot
+retain every direct relationship, the panel displays an omitted-direct warning.
+Increase the limit to 50 or 100 before treating an absent line as proof that no
+connection exists.
+
+A dotted **Passive NeighborInfo**, **Requested NeighborInfo**, or **Maintenance
+NeighborInfo** line is friend-of-friend evidence: one exact radio reported the
+other. It expires from the graph after one hour and is not proof of a direct
+gateway link. Physical proximity and GPS distance never manufacture an edge,
+and SNR/RSSI is never converted into location. Opening, refreshing, filtering,
+changing the graph layout or limit, and drawing trails cause no radio request
+and never run a traceroute. The disabled-by-default maintenance option is a
+separate NeighborInfo-only scheduler and is not controlled by the graph.
+
+Trail observations are stored locally in MeshNet's isolated SQLite table and
+hard-pruned after 24 hours. The browser does not persist node IDs, names,
+coordinates, trails, or force positions; its only persistent MeshNet data is
+the separately validated main-card layout.
 
 ### Manual Traceroute or NeighborInfo Fails
 

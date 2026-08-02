@@ -180,6 +180,58 @@ Avoid sending:
 - Sensitive medical or financial data
 - Precise home location unless intentionally shared
 
+## Automatic Network Maintenance Safety
+
+Automatic NeighborInfo maintenance is disabled by default and cannot be
+enabled by YAML, a service call, or a panel WebSocket command. A Home Assistant
+administrator must use the MeshNet **Configure → Automatic network
+maintenance** action and select one exact configured Meshtastic Bluetooth
+gateway. No automatic gateway fallback is permitted.
+
+The scheduler waits a full interval before its first cycle; the minimum and
+default are one hour. It requires 60–3,600 seconds of observable quiet time
+(120 seconds by default), submits at most one candidate per tick, and limits a
+cycle to the configured 1–60 attempts (ten by default). Manual traceroute,
+manual NeighborInfo, and maintenance NeighborInfo share a durable 60-second
+integration-wide metadata floor. NeighborInfo also has a durable 180-second
+same-target floor across gateways.
+
+Ordinary inbound traffic and node updates restart the quiet window. Foreground
+sends, outbox replay, startup/reconnect, gateway settings, remote administration,
+manual tools, BLE work, reload, and shutdown hold a separate busy gate. Those
+conditions defer maintenance indefinitely; missed time never increases its
+priority. Activity is rechecked immediately before provider submission. A
+candidate selected before a late race is excluded for that cycle, and a
+reservation made before an even later race is conservatively retained. Neither
+outcome is retried or caught up later.
+
+Only exact, unambiguous, online Meshtastic nodes observed through the selected
+gateway in its current BLE session are eligible. Cached-only, MQTT-only,
+other-gateway, self, malformed, and identity-collision records cannot become
+automatic targets. The scheduler never broadcasts discovery and never selects
+by display name, approximate identity, or location. It can request only
+NeighborInfo; automatic traceroute remains unsupported.
+
+These controls reduce MeshNet-generated contention but cannot detect a hidden
+transmitter the selected gateway did not hear. A NeighborInfo request and its
+relayed response are RF-visible protocol activity, and the resulting topology
+evidence is retained locally. Treat automatic collection as a privacy and
+airtime choice, not as passive observation.
+
+Scheduler diagnostics expose only fixed state names, booleans, durations, and
+aggregate counters. They omit the selected gateway ID, target IDs, node names,
+addresses, raw packets/results, and exception text. Diagnostic collection
+itself performs no radio operation. The database still retains cooldown rows,
+sanitized results, and attempt history, so protect `meshnet.sqlite3` and Home
+Assistant backups.
+
+Reload and unload fence, cancel, and drain the single scheduler owner. Resume
+requires the old owner to be gone and schedules a new full interval. Disable
+maintenance and save before uninstall for the clearest immediate no-RF path.
+HACS removal does not delete the SQLite history, change radio settings, or
+remove a Bluetooth bond. See [Automatic Network
+Maintenance](NETWORK_MAINTENANCE.md) for the complete operating contract.
+
 ## Bluetooth Pairing and Runtime Security (version 0.5)
 
 Meshtastic pairing is limited to a local BlueZ adapter and the exact canonical

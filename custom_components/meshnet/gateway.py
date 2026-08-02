@@ -105,10 +105,14 @@ class MeshGateway(ABC):
         raise GatewayError("This gateway does not support manual traceroute")
 
     async def async_manual_neighbor_info(
-        self, target_node: str
+        self,
+        target_node: str,
+        *,
+        provenance: str = "manual_request",
+        pre_submit_guard: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         """Run one explicitly requested NeighborInfo query when supported."""
-        del target_node
+        del target_node, provenance, pre_submit_guard
         raise GatewayError("This gateway does not support manual NeighborInfo")
 
     async def async_get_settings_snapshot(self) -> dict[str, Any]:

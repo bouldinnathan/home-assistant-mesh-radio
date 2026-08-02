@@ -6,7 +6,7 @@ from typing import Final
 
 DOMAIN: Final = "meshnet"
 NAME: Final = "MeshNet"
-VERSION: Final = "0.10.0"
+VERSION: Final = "0.11.0"
 DATA_BLUETOOTH_PAIRING: Final = f"{DOMAIN}_bluetooth_pairing"
 
 PLATFORMS: Final = ["sensor", "binary_sensor", "device_tracker"]
@@ -28,10 +28,19 @@ CONF_NODE_TIMEOUT: Final = "node_timeout"
 CONF_HISTORY_DAYS: Final = "history_days"
 CONF_PACKET_CAPTURE: Final = "packet_capture"
 CONF_SCAN_INTERVAL: Final = "scan_interval"
+CONF_MAINTENANCE_ENABLED: Final = "maintenance_enabled"
+CONF_MAINTENANCE_GATEWAY_ID: Final = "maintenance_gateway_id"
+CONF_MAINTENANCE_INTERVAL: Final = "maintenance_interval_seconds"
+CONF_MAINTENANCE_QUIET_TIME: Final = "maintenance_quiet_seconds"
+CONF_MAINTENANCE_MAX_REQUESTS: Final = "maintenance_max_requests"
 
 DEFAULT_NODE_TIMEOUT: Final = 900
 DEFAULT_HISTORY_DAYS: Final = 30
 DEFAULT_SCAN_INTERVAL: Final = 30
+DEFAULT_MAINTENANCE_ENABLED: Final = False
+DEFAULT_MAINTENANCE_INTERVAL: Final = 3600
+DEFAULT_MAINTENANCE_QUIET_TIME: Final = 120
+DEFAULT_MAINTENANCE_MAX_REQUESTS: Final = 10
 # Match Meshtastic's decoded JSON branch without subscribing to raw protobuf
 # topics under ``msh/<region>/2/e/...``.
 DEFAULT_MESHTASTIC_MQTT_TOPIC: Final = "msh/+/2/json/#"
@@ -46,8 +55,22 @@ MAX_PANEL_GATEWAYS: Final = 64
 # Traceroute has one integration-wide floor. NeighborInfo additionally honors
 # the firmware's three-minute per-target reply suppression across all gateways.
 MANUAL_TRACEROUTE_COOLDOWN_SECONDS: Final = 60
-MANUAL_NEIGHBOR_INFO_GLOBAL_COOLDOWN_SECONDS: Final = 180
+# Different NeighborInfo targets may be queried once per minute. Firmware's
+# reply suppression remains a stricter three-minute floor for the same target.
+MANUAL_NEIGHBOR_INFO_GLOBAL_COOLDOWN_SECONDS: Final = 60
 MANUAL_NEIGHBOR_INFO_TARGET_COOLDOWN_SECONDS: Final = 180
+
+# Automatic maintenance is deliberately less permissive than the manual tool.
+# It is opt-in, NeighborInfo-only, rolls no more often than hourly, and never
+# catches up with bursts after Home Assistant or the radio was offline.
+MAINTENANCE_MIN_INTERVAL_SECONDS: Final = 3600
+MAINTENANCE_MAX_INTERVAL_SECONDS: Final = 86400
+MAINTENANCE_REQUEST_SPACING_SECONDS: Final = 60
+MAINTENANCE_MIN_QUIET_SECONDS: Final = 60
+MAINTENANCE_MAX_QUIET_SECONDS: Final = 3600
+MAINTENANCE_MIN_REQUESTS: Final = 1
+MAINTENANCE_MAX_REQUESTS: Final = 60
+MAINTENANCE_SCHEDULER_TICK_SECONDS: Final = 15
 
 PROTOCOL_MESHTASTIC: Final = "meshtastic"
 PROTOCOL_MESHCORE: Final = "meshcore"

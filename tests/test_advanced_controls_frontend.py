@@ -107,7 +107,7 @@ def test_neighbor_info_loads_target_status_then_requires_two_clicks_for_one_rf_r
   });
   assert.equal(panel._neighborInfoResult.neighbors.length, 2);
   assert.equal(panel._neighborInfoResult.neighbors[0].snr, -2.25);
-  assert.equal(panel._neighborInfoStatusData.global_remaining_seconds, 180);
+  assert.equal(panel._neighborInfoStatusData.global_remaining_seconds, 60);
   assert.equal(panel._neighborInfoStatusData.target_remaining_seconds, 180);
   assert.equal(panel._neighborInfoCooldownActive(), true);
 
@@ -800,5 +800,38 @@ def test_traceroute_preflight_failure_does_not_invent_an_rf_cooldown() -> None:
   assert.equal(panel._tracerouteStatusReady, true);
   assert.match(panel._tracerouteStatus.text, /cannot traceroute itself|remote node/i);
   assert.doesNotMatch(panel._tracerouteStatus.text, /may have been sent/i);
+"""
+    )
+
+
+def test_shared_neighbor_info_airtime_blocks_traceroute_without_fake_identity() -> None:
+    """The traceroute panel accepts a shared cooldown with no invented target."""
+    _run_panel_script(
+        r"""
+  const status = panel._sanitizeTracerouteStatus({
+    schema_version: 1,
+    scope: "integration",
+    status: "cooldown",
+    reserved: true,
+    gateway_id: null,
+    target_node: null,
+    reserved_at: "2026-08-01T12:00:00+00:00",
+    next_allowed_at: "2026-08-01T12:01:00+00:00",
+    remaining_seconds: 59,
+    result_updated_at: null,
+    result: null,
+    airtime_operation: "neighbor_info",
+  });
+  assert.equal(status.airtime_operation, "neighbor_info");
+  assert.equal(status.gateway_id, null);
+  panel._tracerouteGlobalStatus = status;
+  assert.match(panel._tracerouteGlobalStatusPanel(), /Shared metadata cooldown active/);
+  assert.match(panel._tracerouteGlobalStatusPanel(), /NeighborInfo request/);
+
+  panel._snapshot = { panel_metadata: { maintenance: {
+    enabled: false,
+  } } };
+  assert.match(panel._maintenanceStatusPanel(), /Automatic maintenance is off/);
+  assert.match(panel._maintenanceStatusPanel(), /automatic retries remain disabled/i);
 """
     )

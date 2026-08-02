@@ -10,6 +10,7 @@ import asyncio
 import importlib
 import json
 import math
+import sqlite3
 import sys
 import types
 from collections.abc import Mapping
@@ -189,6 +190,279 @@ def test_traceroute_cooldown_is_atomic_persisted_and_exact_at_boundary(
     asyncio.run(run())
 
 
+def test_shared_metadata_airtime_race_allows_exactly_one_operation(
+    tmp_path,
+) -> None:
+    """Traceroute and NeighborInfo race for one integration-wide RF slot."""
+
+    async def run() -> None:
+        start = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
+        store = MeshStore(tmp_path / "meshnet.sqlite3")
+        await store.async_open()
+
+        async def reserve_traceroute(index: int):
+            return (
+                "traceroute",
+                await store.async_reserve_traceroute(
+                    f"trace-gateway-{index}",
+                    f"meshtastic:!1{index:07x}",
+                    now=start,
+                ),
+            )
+
+        async def reserve_neighbor_info(index: int):
+            return (
+                "neighbor_info",
+                await store.async_reserve_neighbor_info_request(
+                    f"neighbor-gateway-{index}",
+                    f"meshtastic:!2{index:07x}",
+                    now=start,
+                ),
+            )
+
+        racers = await asyncio.gather(
+            *(
+                operation(index)
+                for index in range(8)
+                for operation in (reserve_traceroute, reserve_neighbor_info)
+            )
+        )
+        winners = [
+            operation
+            for operation, result in racers
+            if _reservation_won(result)
+        ]
+        assert len(winners) == 1
+
+        airtime = await store._fetchone(  # noqa: SLF001 - verify atomic gate
+            """
+            SELECT scope, reserved_at, next_allowed_at, operation
+            FROM metadata_airtime
+            """
+        )
+        assert airtime is not None
+        assert dict(airtime) == {
+            "scope": "integration",
+            "reserved_at": "2026-07-30T12:00:00+00:00",
+            "next_allowed_at": "2026-07-30T12:01:00+00:00",
+            "operation": winners[0],
+        }
+        await store.async_close()
+
+    asyncio.run(run())
+
+
+def test_shared_metadata_airtime_is_exact_and_persists_across_reopen(
+    tmp_path,
+) -> None:
+    """The opposite metadata operation stays blocked until exactly 60 seconds."""
+
+    async def run() -> None:
+        path = tmp_path / "meshnet.sqlite3"
+        start = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
+        store = MeshStore(path)
+        await store.async_open()
+
+        assert _reservation_won(
+            await store.async_reserve_traceroute(
+                "trace-gateway",
+                "meshtastic:!11111111",
+                now=start,
+            )
+        )
+        await store.async_close()
+
+        reopened = MeshStore(path)
+        await reopened.async_open()
+        assert not _reservation_won(
+            await reopened.async_reserve_neighbor_info_request(
+                "neighbor-gateway",
+                "meshtastic:!22222222",
+                now=start + timedelta(seconds=59, microseconds=999999),
+            )
+        )
+        assert _reservation_won(
+            await reopened.async_reserve_neighbor_info_request(
+                "neighbor-gateway",
+                "meshtastic:!22222222",
+                now=start + timedelta(seconds=60),
+            )
+        )
+        assert not _reservation_won(
+            await reopened.async_reserve_traceroute(
+                "trace-gateway",
+                "meshtastic:!33333333",
+                now=start + timedelta(seconds=119, microseconds=999999),
+            )
+        )
+        assert _reservation_won(
+            await reopened.async_reserve_traceroute(
+                "trace-gateway",
+                "meshtastic:!33333333",
+                now=start + timedelta(seconds=120),
+            )
+        )
+        await reopened.async_close()
+
+    asyncio.run(run())
+
+
+def test_shared_airtime_status_explains_the_opposite_operation(tmp_path) -> None:
+    """Manual panels receive a useful cooldown even when the other tool owns it."""
+
+    async def run() -> None:
+        start = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
+        neighbor_store = MeshStore(tmp_path / "neighbor.sqlite3")
+        await neighbor_store.async_open()
+        await neighbor_store.async_reserve_neighbor_info_request(
+            "ble-gateway",
+            "meshtastic:!11111111",
+            now=start,
+        )
+        traceroute_status = (
+            await neighbor_store.async_get_global_traceroute_status(
+                now=start + timedelta(seconds=1)
+            )
+        )
+        assert traceroute_status["status"] == "cooldown"
+        assert traceroute_status["remaining_seconds"] == 59
+        assert traceroute_status["airtime_operation"] == "neighbor_info"
+        assert traceroute_status["reserved_at"] is not None
+        await neighbor_store.async_close()
+
+        traceroute_store = MeshStore(tmp_path / "traceroute.sqlite3")
+        await traceroute_store.async_open()
+        await traceroute_store.async_reserve_traceroute(
+            "ble-gateway",
+            "meshtastic:!22222222",
+            now=start,
+        )
+        neighbor_status = (
+            await traceroute_store.async_get_neighbor_info_request_status(
+                "meshtastic:!33333333",
+                now=start + timedelta(seconds=1),
+            )
+        )
+        assert neighbor_status["status"] == "cooldown"
+        assert neighbor_status["global_remaining_seconds"] == 59
+        assert neighbor_status["target_remaining_seconds"] == 0
+        assert neighbor_status["remaining_seconds"] == 59
+        assert neighbor_status["airtime_operation"] == "traceroute"
+        await traceroute_store.async_close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("legacy_operation", ["traceroute", "neighbor_info"])
+def test_shared_metadata_airtime_migrates_active_legacy_operation(
+    tmp_path,
+    legacy_operation: str,
+) -> None:
+    """Opening a pre-gate database must block the opposite metadata operation."""
+
+    async def run() -> None:
+        path = tmp_path / "meshnet.sqlite3"
+        start = datetime.now(UTC)
+        global_next = start + timedelta(seconds=60)
+        connection = sqlite3.connect(path)
+        if legacy_operation == "traceroute":
+            connection.execute(
+                """
+                CREATE TABLE traceroutes (
+                    gateway_id TEXT NOT NULL,
+                    target_node TEXT NOT NULL,
+                    reserved_at TEXT NOT NULL,
+                    next_allowed_at TEXT NOT NULL,
+                    result_updated_at TEXT,
+                    result_data TEXT,
+                    PRIMARY KEY(gateway_id, target_node)
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO traceroutes(
+                    gateway_id, target_node, reserved_at, next_allowed_at
+                )
+                VALUES(?, ?, ?, ?)
+                """,
+                (
+                    "legacy-trace-gateway",
+                    "meshtastic:!11111111",
+                    start.isoformat(),
+                    global_next.isoformat(),
+                ),
+            )
+        else:
+            connection.execute(
+                """
+                CREATE TABLE neighbor_info_requests (
+                    target_node TEXT PRIMARY KEY,
+                    gateway_id TEXT NOT NULL,
+                    reserved_at TEXT NOT NULL,
+                    global_next_allowed_at TEXT NOT NULL,
+                    target_next_allowed_at TEXT NOT NULL,
+                    result_updated_at TEXT,
+                    result_data TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO neighbor_info_requests(
+                    target_node,
+                    gateway_id,
+                    reserved_at,
+                    global_next_allowed_at,
+                    target_next_allowed_at
+                )
+                VALUES(?, ?, ?, ?, ?)
+                """,
+                (
+                    "meshtastic:!11111111",
+                    "legacy-neighbor-gateway",
+                    start.isoformat(),
+                    global_next.isoformat(),
+                    (start + timedelta(seconds=180)).isoformat(),
+                ),
+            )
+        connection.commit()
+        connection.close()
+
+        store = MeshStore(path)
+        await store.async_open()
+        airtime = await store._fetchone(  # noqa: SLF001 - verify migration
+            """
+            SELECT scope, reserved_at, next_allowed_at, operation
+            FROM metadata_airtime
+            """
+        )
+        assert airtime is not None
+        assert dict(airtime) == {
+            "scope": "integration",
+            "reserved_at": start.isoformat(),
+            "next_allowed_at": global_next.isoformat(),
+            "operation": legacy_operation,
+        }
+
+        if legacy_operation == "traceroute":
+            blocked = await store.async_reserve_neighbor_info_request(
+                "new-neighbor-gateway",
+                "meshtastic:!22222222",
+                now=start + timedelta(seconds=59, microseconds=999999),
+            )
+        else:
+            blocked = await store.async_reserve_traceroute(
+                "new-trace-gateway",
+                "meshtastic:!22222222",
+                now=start + timedelta(seconds=59, microseconds=999999),
+            )
+        assert not _reservation_won(blocked)
+        await store.async_close()
+
+    asyncio.run(run())
+
+
 def test_traceroute_status_is_integration_wide_and_result_is_allowlisted(
     tmp_path,
 ) -> None:
@@ -304,7 +578,7 @@ def test_traceroute_status_is_integration_wide_and_result_is_allowlisted(
 def test_neighbor_info_cooldowns_are_atomic_persisted_global_and_per_target(
     tmp_path,
 ) -> None:
-    """Neighbor requests have global and target 180s floors across reopen."""
+    """Neighbor requests keep a 60s global and 180s target floor across reopen."""
 
     async def run() -> None:
         path = tmp_path / "meshnet.sqlite3"
@@ -329,48 +603,42 @@ def test_neighbor_info_cooldowns_are_atomic_persisted_global_and_per_target(
         global_block = await store.async_reserve_neighbor_info_request(
             "second-gateway",
             "meshtastic:!22222222",
-            now=start + timedelta(seconds=179, microseconds=999999),
+            now=start + timedelta(seconds=59, microseconds=999999),
         )
         assert not _reservation_won(global_block)
         assert global_block["global_remaining_seconds"] == 1
 
-        target_block = await store.async_reserve_neighbor_info_request(
+        different_target = await store.async_reserve_neighbor_info_request(
+            "second-gateway",
+            "meshtastic:!22222222",
+            now=start + timedelta(seconds=60),
+        )
+        assert _reservation_won(different_target)
+        await store.async_close()
+
+        reopened = MeshStore(path)
+        await reopened.async_open()
+        target_block = await reopened.async_reserve_neighbor_info_request(
             "second-gateway",
             "meshtastic:!11111111",
             now=start + timedelta(seconds=179, microseconds=999999),
         )
         assert not _reservation_won(target_block)
         assert target_block["target_remaining_seconds"] == 1
-        await store.async_close()
-
-        reopened = MeshStore(path)
-        await reopened.async_open()
         status = await reopened.async_get_neighbor_info_request_status(
             "meshtastic:!11111111",
-            now=start + timedelta(seconds=179),
+            now=start + timedelta(seconds=179, microseconds=999999),
         )
         assert status["scope"] == "integration_and_target"
         assert status["status"] == "cooldown"
-        assert status["global_remaining_seconds"] == 1
+        assert status["global_remaining_seconds"] == 0
         assert status["target_remaining_seconds"] == 1
         assert status["next_allowed_at"] == "2026-07-30T12:03:00+00:00"
 
-        different_target = await reopened.async_reserve_neighbor_info_request(
-            "second-gateway",
-            "meshtastic:!22222222",
-            now=start + timedelta(seconds=180),
-        )
-        assert _reservation_won(different_target)
-        still_global = await reopened.async_reserve_neighbor_info_request(
-            "ble-gateway",
-            "meshtastic:!11111111",
-            now=start + timedelta(seconds=359, microseconds=999999),
-        )
-        assert not _reservation_won(still_global)
         target_available = await reopened.async_reserve_neighbor_info_request(
             "ble-gateway",
             "meshtastic:!11111111",
-            now=start + timedelta(seconds=360),
+            now=start + timedelta(seconds=180),
         )
         assert _reservation_won(target_available)
         await reopened.async_close()
@@ -754,6 +1022,166 @@ def test_manual_neighbor_info_reserves_before_one_exact_unicast_and_stores_resul
             {"node_id": "meshtastic:!22222222", "snr": 0.0},
         ]
         assert result["next_allowed_at"] == "2026-07-30T12:03:00+00:00"
+
+    asyncio.run(run())
+
+
+def test_maintenance_candidate_is_exact_current_ble_and_rotates_fairly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Automatic metadata never targets cached, MQTT, self, or wrong-gateway nodes."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+        gateway_config = GatewayConfig(
+            gateway_id="ble-gateway",
+            name="BLE gateway",
+            protocol=PROTOCOL_MESHTASTIC,
+            transport=TRANSPORT_BLUETOOTH,
+        )
+        gateway = SimpleNamespace(
+            config=gateway_config,
+            status=GatewayStatus(
+                gateway_id="ble-gateway",
+                name="BLE gateway",
+                protocol=PROTOCOL_MESHTASTIC,
+                transport=TRANSPORT_BLUETOOTH,
+                connected=True,
+            ),
+            local_node_id="!aaaaaaaa",
+            _ble_operation_tasks=set(),
+        )
+
+        def node(node_id: str, **updates: object) -> NodeState:
+            value = NodeState(
+                node_key=f"meshtastic:{node_id}",
+                protocol=PROTOCOL_MESHTASTIC,
+                node_id=node_id,
+                online=True,
+                last_gateway_id="ble-gateway",
+                gateway_ids={"ble-gateway"},
+                connectivity={"via_mqtt": False},
+            )
+            for key, update in updates.items():
+                setattr(value, key, update)
+            return value
+
+        old = node("!11111111")
+        never = node("!22222222")
+        mqtt = node("!33333333")
+        mqtt.connectivity["via_mqtt"] = True
+        cached = node("!44444444")
+        wrong_gateway = node("!55555555", last_gateway_id="other")
+        local = node("!aaaaaaaa")
+        nodes = {item.node_key: item for item in (old, never, mqtt, cached, wrong_gateway, local)}
+
+        coordinator = object.__new__(coordinator_class)
+        coordinator._maintenance_gateway_id = "ble-gateway"
+        coordinator._shutting_down = False
+        coordinator._reconnect_suspended = False
+        coordinator._radio_operations_accepting = True
+        coordinator._gateway_startup_task = None
+        coordinator._outbox_flush_owner = None
+        coordinator._send_tasks = set()
+        coordinator._traceroute_tasks = set()
+        coordinator._reconnect_tasks = {}
+        coordinator._unsafe_meshtastic_node_keys = set()
+        coordinator._session_observed_node_keys = {
+            old.node_key,
+            never.node_key,
+            mqtt.node_key,
+            wrong_gateway.node_key,
+            local.node_key,
+        }
+        coordinator._effective_observed_node_keys = set(
+            coordinator._session_observed_node_keys
+        )
+        coordinator.snapshot = MeshSnapshot(nodes=nodes)
+        coordinator.gateways = {"ble-gateway": gateway}
+        coordinator.gateway_settings = SimpleNamespace(_active_tasks={})
+        coordinator.remote_admin = SimpleNamespace(_active_tasks={})
+        coordinator.store = SimpleNamespace(
+            async_neighbor_info_attempt_history=AsyncMock(
+                return_value={
+                    old.node_key: datetime(2026, 7, 30, tzinfo=UTC)
+                }
+            )
+        )
+
+        assert await coordinator._async_next_maintenance_candidate(frozenset()) == (
+            "ble-gateway",
+            never.node_key,
+        )
+        assert await coordinator._async_next_maintenance_candidate(
+            frozenset({("ble-gateway", never.node_key)})
+        ) == ("ble-gateway", old.node_key)
+
+    asyncio.run(run())
+
+
+def test_maintenance_neighbor_info_uses_distinct_provenance_and_late_idle_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A foreground race after reservation consumes cooldown but sends no RF."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+        coordinator, gateway, _order = _neighbor_info_coordinator(
+            coordinator_class
+        )
+        maintenance = SimpleNamespace(
+            activity_generation=4,
+            accepting=True,
+        )
+        coordinator.maintenance = maintenance
+        coordinator._maintenance_foreground_busy = lambda: False
+        original_send = gateway.async_manual_neighbor_info
+        provenances: list[str] = []
+
+        async def send(
+            target_node: str,
+            *,
+            provenance: str,
+            pre_submit_guard,
+        ):
+            provenances.append(provenance)
+            assert pre_submit_guard() is True
+            return await original_send(target_node)
+
+        gateway.async_manual_neighbor_info = send
+        await coordinator._async_maintenance_neighbor_info(
+            ("ble-gateway", "meshtastic:!1234abcd")
+        )
+        assert gateway.calls == ["!1234abcd"]
+        assert provenances == ["maintenance_scan"]
+
+        coordinator, gateway, _order = _neighbor_info_coordinator(
+            coordinator_class
+        )
+        maintenance = SimpleNamespace(
+            activity_generation=9,
+            accepting=True,
+        )
+        coordinator.maintenance = maintenance
+        coordinator._maintenance_foreground_busy = lambda: False
+        reserve = coordinator.store.async_reserve_neighbor_info_request
+
+        async def racing_reserve(*args, **kwargs):
+            result = await reserve(*args, **kwargs)
+            maintenance.activity_generation += 1
+            return result
+
+        coordinator.store.async_reserve_neighbor_info_request = racing_reserve
+        error_type = coordinator_class.async_manual_neighbor_info.__globals__[
+            "NeighborInfoError"
+        ]
+        with pytest.raises(error_type) as raced:
+            await coordinator._async_maintenance_neighbor_info(
+                ("ble-gateway", "meshtastic:!1234abcd")
+            )
+        assert raced.value.code == "neighbor_info_unavailable"
+        assert coordinator.store.reservations == 1
+        assert gateway.calls == []
 
     asyncio.run(run())
 

@@ -30,6 +30,6 @@
     "meshcore==2.3.7"
   ],
   "single_config_entry": true,
-  "version": "0.10.0",
+  "version": "0.11.0",
   "issue_tracker": "https://github.com/bouldinnathan/home-assistant-mesh-radio/issues"
 }

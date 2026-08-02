@@ -1,5 +1,43 @@
 # Upgrade Guide
 
+## From 0.10.0
+
+0.11.0 adds two views over the cached graph evidence. **Geographic scale** is
+the default and uses equal meters per pixel on both axes, a metric/imperial
+1/2/5 scale bar, date-line-safe projection, and a separate not-to-scale rail
+for nodes without usable coordinates. **Topology** retains the animated,
+draggable force layout; its pixels are not map units. Both layouts label valid
+edge distance, but GPS proximity never creates an edge.
+
+Graph selection remains bounded to 20, 50, or 100 nodes and is now
+evidence-aware. It considers complete direct, fresh NeighborInfo, and cached
+route endpoint pairs before filling unused capacity by recency,
+prioritizes direct gateway observations, and warns when a bounded limit omits
+direct evidence. NeighborInfo is displayed only as one-hour-fresh
+friend-of-friend evidence, with separate **Passive**, **Requested**, or
+**Maintenance** provenance. It is never promoted to a direct gateway link.
+
+The existing local `meshnet.sqlite3` is extended idempotently with an isolated
+`graph_position_observations` table. MeshNet records at most one validated
+position per node per UTC hour and returns no more than 25 points per node for
+the rolling-day trail. Samples older than 24 hours are pruned even when
+`history_days` is longer. This trail keeps the geographic extent stable enough
+to account for a moving node over one day. Node identities, coordinates,
+trails, and force positions are never written to browser storage; the existing
+validated main-card layout record is unchanged.
+
+Opening, refreshing, filtering, changing layout or node limit, drawing trails,
+and dragging Topology nodes generate no RF traffic. They cannot invoke
+NeighborInfo, maintenance scheduling, or traceroute. 0.11.0 also adds a
+separate disabled-by-default maintenance option that can request only bounded
+NeighborInfo metadata after an administrator opts in and the configured
+low-traffic gate passes; it never runs traceroute or retries an unknown
+request.
+
+Restart Home Assistant after upgrading and hard-refresh the browser once so
+the 0.11.0 panel module loads. The SQLite migration and pruning are automatic;
+no config-entry recreation or radio setting change is required.
+
 ## From 0.9.0
 
 0.10.0 persists the main **Mesh** card order and bounded card sizes in this
@@ -51,13 +89,17 @@ traceroute cooldown to 60 seconds, and adds an experimental manual NeighborInfo
 request. Restart Home Assistant and hard-refresh the browser so the versioned
 panel JavaScript is replaced.
 
-NeighborInfo requests are administrator-only, Meshtastic-Bluetooth-only,
-unicast, and never automatic or retried by MeshNet. Global and same-target
-180-second reservations are persisted before submission. The feature is
-verified with firmware 2.7.26 and requires the target's Neighbor Info module;
-older firmware may reject or time out. A response is a cached zero-hop report
-of at most ten nodes, not a live scan, and a timeout does not mean zero
-neighbors.
+In 0.8.0, NeighborInfo requests were administrator-only,
+Meshtastic-Bluetooth-only, unicast, and never automatic or retried by MeshNet.
+That release persisted 180-second global and same-target reservations before
+submission. Starting with 0.11.0, the optional idle-maintenance mode described
+above may also request NeighborInfo after explicit opt-in; manual and
+maintenance requests share a 60-second integration-wide metadata floor while
+the 180-second same-target floor remains. Neither mode retries automatically.
+The feature is verified with firmware 2.7.26 and requires the target's Neighbor
+Info module; older firmware may reject or time out. A response is a cached
+zero-hop report of at most ten nodes, not a live scan, and a timeout does not
+mean zero neighbors.
 
 The existing SQLite file is extended in place with isolated NeighborInfo
 reservation/result state. No Home Assistant core configuration or radio

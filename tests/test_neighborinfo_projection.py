@@ -358,6 +358,64 @@ def test_manual_neighbor_info_request_is_one_correlated_exact_unicast() -> None:
     asyncio.run(run())
 
 
+def test_maintenance_neighbor_info_retains_distinct_report_provenance() -> None:
+    """An internally trusted maintenance request is not mislabeled manual."""
+
+    async def run() -> None:
+        client, connection = _active_neighbor_request_client()
+
+        await client.async_manual_neighbor_info(
+            "!50607080",
+            provenance="maintenance_scan",
+        )
+
+        assert len(connection.packets) == 1
+        snapshot = client.node_snapshot()[0x50607080]
+        assert snapshot["neighborInfoProvenance"] == "maintenance_scan"
+        projected = meshtastic_node_to_state(
+            snapshot,
+            gateway_id="ble-gateway",
+        )
+        assert projected is not None
+        assert (
+            projected.routing["neighbors_provenance"]
+            == "maintenance_scan"
+        )
+
+    asyncio.run(run())
+
+
+def test_maintenance_neighbor_info_rechecks_idle_guard_inside_send_lock() -> None:
+    """Foreground traffic that wins the send lock prevents maintenance RF."""
+
+    async def run() -> None:
+        client, connection = _active_neighbor_request_client()
+        submission_allowed = True
+
+        async with client._send_lock:
+            request = asyncio.create_task(
+                client.async_manual_neighbor_info(
+                    "!50607080",
+                    provenance="maintenance_scan",
+                    pre_submit_guard=lambda: submission_allowed,
+                )
+            )
+            await asyncio.sleep(0)
+            submission_allowed = False
+
+        with pytest.raises(MeshtasticNeighborInfoError) as blocked:
+            await request
+
+        assert blocked.value.code == "neighbor_info_lifecycle_changed"
+        assert connection.packets == []
+        assert client._pending_neighbor_info_responses == {}
+        diagnostics = client.diagnostic_snapshot()
+        assert diagnostics["neighbor_info_request_count"] == 0
+        assert diagnostics["last_neighbor_info_outcome"] == "preflight_blocked"
+
+    asyncio.run(run())
+
+
 def test_manual_neighbor_info_rejects_mqtt_response_and_inconsistent_target() -> None:
     """MQTT cannot satisfy a local request and cached identity must agree."""
 

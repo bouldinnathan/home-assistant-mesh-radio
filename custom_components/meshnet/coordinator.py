@@ -11,7 +11,7 @@ import re
 import time
 import unicodedata
 from collections import Counter
-from collections.abc import Collection, Coroutine, Iterable, Mapping
+from collections.abc import Callable, Collection, Coroutine, Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -35,10 +35,19 @@ from .const import (
     ATTR_TARGET_NODE,
     CONF_GATEWAYS,
     CONF_HISTORY_DAYS,
+    CONF_MAINTENANCE_ENABLED,
+    CONF_MAINTENANCE_GATEWAY_ID,
+    CONF_MAINTENANCE_INTERVAL,
+    CONF_MAINTENANCE_MAX_REQUESTS,
+    CONF_MAINTENANCE_QUIET_TIME,
     CONF_NODE_TIMEOUT,
     CONF_SCAN_INTERVAL,
     DEFAULT_DATABASE_NAME,
     DEFAULT_HISTORY_DAYS,
+    DEFAULT_MAINTENANCE_ENABLED,
+    DEFAULT_MAINTENANCE_INTERVAL,
+    DEFAULT_MAINTENANCE_MAX_REQUESTS,
+    DEFAULT_MAINTENANCE_QUIET_TIME,
     DEFAULT_NODE_TIMEOUT,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
@@ -47,6 +56,14 @@ from .const import (
     EVENT_MESSAGE_SENT,
     EVENT_MESSAGE_STATUS,
     EVENT_PACKET,
+    MAINTENANCE_MAX_INTERVAL_SECONDS,
+    MAINTENANCE_MAX_QUIET_SECONDS,
+    MAINTENANCE_MAX_REQUESTS,
+    MAINTENANCE_MIN_INTERVAL_SECONDS,
+    MAINTENANCE_MIN_QUIET_SECONDS,
+    MAINTENANCE_MIN_REQUESTS,
+    MAINTENANCE_REQUEST_SPACING_SECONDS,
+    MAINTENANCE_SCHEDULER_TICK_SECONDS,
     MANUAL_TRACEROUTE_COOLDOWN_SECONDS,
     MAX_PANEL_NODES,
     MESSAGE_TYPE_BROADCAST,
@@ -62,6 +79,7 @@ from .dedupe import PacketDeduplicator
 from .diagnostic_safety import safe_node_metadata
 from .gateway import MeshGateway
 from .gateway_settings import GatewaySettingsManager
+from .maintenance_scan import MaintenanceScanConfig, MaintenanceScanScheduler
 from .meshcore_client import MeshCoreClient
 from .meshtastic_client import MeshtasticClient
 from .models import (
@@ -159,6 +177,57 @@ LOCATION_PROVENANCE_WARNING = (
 
 _AGE_BUCKETS = ("<15m", "15m-1h", "1-6h", "6-24h", ">=1d", "unknown")
 _HOP_BUCKETS = ("0", "1", "2", "3", "4-7", ">=8", "unknown")
+
+
+def _same_utc_hour(value: str, bucket: datetime) -> bool:
+    """Return whether one bounded ISO timestamp belongs to a UTC hour bucket."""
+    if not isinstance(value, str) or len(value) > 64:
+        return False
+    try:
+        parsed = datetime.fromisoformat(
+            value[:-1] + "+00:00" if value.endswith("Z") else value
+        )
+    except ValueError:
+        return False
+    if parsed.tzinfo is None:
+        return False
+    return parsed.astimezone(UTC).replace(
+        minute=0,
+        second=0,
+        microsecond=0,
+    ) == bucket
+
+
+def _bounded_utc_timestamp(value: Any) -> datetime | None:
+    """Parse one bounded aware timestamp without accepting provider text."""
+    if not isinstance(value, str) or len(value) > 64:
+        return None
+    try:
+        parsed = datetime.fromisoformat(
+            value[:-1] + "+00:00" if value.endswith("Z") else value
+        )
+    except ValueError:
+        return None
+    return parsed.astimezone(UTC) if parsed.tzinfo is not None else None
+
+
+def _maintenance_option_int(
+    options: Mapping[str, Any],
+    key: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> tuple[int, bool]:
+    """Return one bounded option and whether the stored value was valid."""
+    value = options.get(key, default)
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and minimum <= value <= maximum
+    ):
+        return value, True
+    return default, False
+
 
 _TRACEROUTE_PUBLIC_MESSAGES = {
     "traceroute_unavailable": "Manual traceroute is temporarily unavailable",
@@ -688,6 +757,18 @@ def _packet_port_is_private(packet: MeshPacket) -> bool:
     return portnum in _PRIVATE_MESHTASTIC_PORTS or portnum.startswith("UNKNOWN")
 
 
+def _packet_is_maintenance_neighbor_info(packet: MeshPacket) -> bool:
+    """Identify only a response correlated to MeshNet's own maintenance call."""
+    if _known_protocol(packet.protocol) != PROTOCOL_MESHTASTIC:
+        return False
+    decoded = packet.raw.get("decoded")
+    return bool(
+        isinstance(decoded, Mapping)
+        and decoded.get("neighborInfoProvenance") == "maintenance_scan"
+        and str(packet.portnum or "").strip().upper() == "NEIGHBORINFO_APP"
+    )
+
+
 def node_age_bucket(
     last_heard: datetime | None,
     *,
@@ -909,12 +990,83 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         self._effective_observed_node_keys: set[str] = set()
         self._node_update_lock = asyncio.Lock()
         self._session_observed_node_keys: set[str] = set()
+        self._topology_history: dict[str, list[dict[str, Any]]] = {}
         self._connection_update_reload_options: dict[str, Any] | None = None
         self._connection_update_reload_waiter: asyncio.Future[bool] | None = None
         self._connection_update_lock = asyncio.Lock()
         self.panel_telemetry = PanelTelemetry(_LOGGER)
         self.gateway_settings = GatewaySettingsManager(self)
         self.remote_admin = RemoteAdminManager(self)
+        maintenance_options = dict(entry.options)
+        maintenance_enabled = (
+            maintenance_options.get(
+                CONF_MAINTENANCE_ENABLED,
+                DEFAULT_MAINTENANCE_ENABLED,
+            )
+            is True
+        )
+        interval, interval_valid = _maintenance_option_int(
+            maintenance_options,
+            CONF_MAINTENANCE_INTERVAL,
+            DEFAULT_MAINTENANCE_INTERVAL,
+            MAINTENANCE_MIN_INTERVAL_SECONDS,
+            MAINTENANCE_MAX_INTERVAL_SECONDS,
+        )
+        quiet_time, quiet_valid = _maintenance_option_int(
+            maintenance_options,
+            CONF_MAINTENANCE_QUIET_TIME,
+            DEFAULT_MAINTENANCE_QUIET_TIME,
+            MAINTENANCE_MIN_QUIET_SECONDS,
+            MAINTENANCE_MAX_QUIET_SECONDS,
+        )
+        max_requests, max_requests_valid = _maintenance_option_int(
+            maintenance_options,
+            CONF_MAINTENANCE_MAX_REQUESTS,
+            DEFAULT_MAINTENANCE_MAX_REQUESTS,
+            MAINTENANCE_MIN_REQUESTS,
+            MAINTENANCE_MAX_REQUESTS,
+        )
+        requested_gateway_id = maintenance_options.get(
+            CONF_MAINTENANCE_GATEWAY_ID
+        )
+        eligible_gateway_ids = {
+            config.gateway_id
+            for config in self._gateway_configs
+            if config.protocol == PROTOCOL_MESHTASTIC
+            and config.transport == TRANSPORT_BLUETOOTH
+        }
+        gateway_valid = (
+            isinstance(requested_gateway_id, str)
+            and requested_gateway_id in eligible_gateway_ids
+        )
+        self._maintenance_gateway_id = (
+            requested_gateway_id if gateway_valid else None
+        )
+        self._maintenance_configuration_valid = bool(
+            interval_valid
+            and quiet_valid
+            and max_requests_valid
+            and (not maintenance_enabled or gateway_valid)
+        )
+        self.maintenance = MaintenanceScanScheduler(
+            MaintenanceScanConfig(
+                enabled=(
+                    maintenance_enabled
+                    and self._maintenance_configuration_valid
+                ),
+                interval_seconds=interval,
+                quiet_seconds=quiet_time,
+                max_requests=max_requests,
+                request_spacing_seconds=MAINTENANCE_REQUEST_SPACING_SECONDS,
+                tick_seconds=MAINTENANCE_SCHEDULER_TICK_SECONDS,
+            ),
+            next_candidate=self._async_next_maintenance_candidate,
+            request_neighbor_info=self._async_maintenance_neighbor_info,
+            is_busy=self._maintenance_foreground_busy,
+            task_factory=lambda target, name: self._async_create_background_task(
+                target, name
+            ),
+        )
         super().__init__(
             hass,
             _LOGGER,
@@ -931,6 +1083,131 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         if callable(fire):
             fire(event_type, data)
 
+    def _record_network_activity(self) -> None:
+        """Tell optional maintenance that foreground or received traffic won."""
+        maintenance = getattr(self, "maintenance", None)
+        record = getattr(maintenance, "record_activity", None)
+        if callable(record):
+            record()
+
+    def _maintenance_foreground_busy(self) -> bool:
+        """Return whether any legitimate or lifecycle radio owner is active."""
+        if (
+            getattr(self, "_shutting_down", False)
+            or getattr(self, "_reconnect_suspended", False)
+            or not getattr(self, "_radio_operations_accepting", True)
+        ):
+            return True
+
+        def task_active(task: Any) -> bool:
+            return isinstance(task, asyncio.Task) and not task.done()
+
+        if task_active(getattr(self, "_gateway_startup_task", None)):
+            return True
+        if task_active(getattr(self, "_outbox_flush_owner", None)):
+            return True
+        for tasks in (
+            getattr(self, "_send_tasks", set()),
+            getattr(self, "_traceroute_tasks", set()),
+            getattr(self, "_reconnect_tasks", {}).values(),
+        ):
+            if any(task_active(task) for task in tasks):
+                return True
+        for manager_name in ("gateway_settings", "remote_admin"):
+            manager = getattr(self, manager_name, None)
+            active = getattr(manager, "_active_tasks", {})
+            tasks = active if not isinstance(active, Mapping) else active.keys()
+            if any(task_active(task) for task in tasks):
+                return True
+        for gateway in getattr(self, "gateways", {}).values():
+            if any(
+                task_active(task)
+                for task in getattr(gateway, "_ble_operation_tasks", set())
+            ):
+                return True
+        return False
+
+    async def _async_next_maintenance_candidate(
+        self,
+        excluded: frozenset[Any],
+    ) -> tuple[str, str] | None:
+        """Choose one exact, current-session BLE node using fair rotation."""
+        gateway_id = self._maintenance_gateway_id
+        if gateway_id is None or self._maintenance_foreground_busy():
+            return None
+        gateway = self.gateways.get(gateway_id)
+        if (
+            gateway is None
+            or gateway.config.protocol != PROTOCOL_MESHTASTIC
+            or gateway.config.transport != TRANSPORT_BLUETOOTH
+            or not gateway.status.connected
+        ):
+            return None
+        local_node_id = canonical_meshtastic_node_id(
+            getattr(gateway, "local_node_id", None)
+        )
+        candidates: list[NodeState] = []
+        for node in self.snapshot.nodes.values():
+            provider_id = canonical_meshtastic_node_id(node.node_id)
+            candidate = (gateway_id, node.node_key)
+            if (
+                candidate in excluded
+                or node.protocol != PROTOCOL_MESHTASTIC
+                or not node.online
+                or node.connectivity.get("via_mqtt") is True
+                or node.last_gateway_id != gateway_id
+                or gateway_id not in node.gateway_ids
+                or not self.node_observed_this_session(node.node_key)
+                or node.node_key in self._unsafe_meshtastic_node_keys
+                or not meshtastic_identity_is_valid(node.node_key, node)
+                or provider_id is None
+                or node.node_key != f"meshtastic:{provider_id}"
+                or provider_id == local_node_id
+            ):
+                continue
+            candidates.append(node)
+        if not candidates:
+            return None
+        attempts = await self.store.async_neighbor_info_attempt_history(
+            limit=1000
+        )
+        never = datetime.min.replace(tzinfo=UTC)
+        candidates.sort(
+            key=lambda node: (
+                attempts.get(node.node_key) is not None,
+                attempts.get(node.node_key, never),
+                node.last_heard or never,
+                node.node_key,
+            )
+        )
+        return gateway_id, candidates[0].node_key
+
+    async def _async_maintenance_neighbor_info(self, candidate: Any) -> None:
+        """Submit one guarded maintenance request through the validated path."""
+        if (
+            not isinstance(candidate, tuple)
+            or len(candidate) != 2
+            or not all(isinstance(value, str) for value in candidate)
+        ):
+            raise NeighborInfoError("neighbor_info_preflight_failed")
+        gateway_id, target_node = candidate
+        maintenance = self.maintenance
+        activity_generation = maintenance.activity_generation
+
+        def still_idle() -> bool:
+            return bool(
+                maintenance.accepting
+                and maintenance.activity_generation == activity_generation
+                and not self._maintenance_foreground_busy()
+            )
+
+        await self._async_manual_neighbor_info(
+            gateway_id=gateway_id,
+            target_node=target_node,
+            provenance="maintenance_scan",
+            pre_submit_guard=still_idle,
+        )
+
     async def _async_setup(self) -> None:
         self._legacy_issue_cleanup_count = self._delete_legacy_gateway_issues()
         await self.store.async_open()
@@ -938,6 +1215,17 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         self._raw_nodes = dict(cached.nodes)
         self._refresh_effective_node_projection()
         self.snapshot.recent_messages = cached.recent_messages
+        try:
+            self._topology_history = await self.store.async_graph_position_history()
+        except Exception as err:
+            # Position trails are presentation-only. A corrupt/locked optional
+            # history must never prevent Home Assistant or a radio from loading.
+            self._topology_history = {}
+            _LOGGER.warning(
+                "MeshNet could not load the optional graph position history "
+                "(error_type=%s)",
+                _safe_error_type(err),
+            )
         await self._rebuild_gateways()
 
     def _refresh_effective_node_projection(self, *, changed_raw_key: str | None = None) -> None:
@@ -990,6 +1278,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         await self._start_gateways()
         if not self._shutting_down:
             await self._flush_outbox()
+            self.maintenance.start()
             _LOGGER.debug("MeshNet background gateway startup pass completed")
 
     def async_start_gateways_background(self) -> None:
@@ -1023,6 +1312,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         self._last_update_attempt_at = utcnow()
         try:
             await self.store.async_prune(self.history_days)
+            self._prune_topology_history_cache()
             self._mark_stale_nodes()
             self.snapshot.recent_messages = await self.store.async_recent_messages(100)
             midnight = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -1141,6 +1431,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         gateway_id: str | None = None,
     ) -> dict[str, Any]:
         """Send or queue a mesh message."""
+        self._record_network_activity()
         task = asyncio.current_task()
         if task is not None:
             self._send_tasks.add(task)
@@ -1703,6 +1994,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
 
     async def async_gateway_refresh(self, gateway_id: str | None = None) -> None:
         """Refresh one or all gateways."""
+        self._record_network_activity()
         gateways: Iterable[MeshGateway]
         if gateway_id:
             gateway = self.gateways.get(gateway_id)
@@ -1721,6 +2013,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         target_node: str,
     ) -> dict[str, Any]:
         """Own one manual traceroute for bounded reload/unload cancellation."""
+        self._record_network_activity()
         if (
             not getattr(self, "_radio_operations_accepting", True)
             or getattr(self, "_shutting_down", False)
@@ -1985,6 +2278,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         target_node: str,
     ) -> dict[str, Any]:
         """Own one explicit NeighborInfo request for lifecycle cancellation."""
+        self._record_network_activity()
         if (
             not getattr(self, "_radio_operations_accepting", True)
             or getattr(self, "_shutting_down", False)
@@ -2024,8 +2318,12 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         *,
         gateway_id: str,
         target_node: str,
+        provenance: str = "manual_request",
+        pre_submit_guard: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         """Send one cooldown-protected BLE NeighborInfo request."""
+        if provenance not in {"manual_request", "maintenance_scan"}:
+            raise NeighborInfoError("neighbor_info_preflight_failed")
         if (
             not isinstance(gateway_id, str)
             or not gateway_id
@@ -2082,6 +2380,12 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                 telemetry_category="availability",
             )
 
+        if pre_submit_guard is not None and not pre_submit_guard():
+            raise NeighborInfoError(
+                "neighbor_info_unavailable",
+                telemetry_category="lifecycle",
+            )
+
         try:
             reservation = await self.store.async_reserve_neighbor_info_request(
                 gateway_id, target_node
@@ -2110,14 +2414,30 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             and isinstance(reservation.get("next_allowed_at"), str)
             else None
         )
-        try:
-            provider_result = await gateway.async_manual_neighbor_info(
-                provider_target
+        if pre_submit_guard is not None and not pre_submit_guard():
+            # The durable reservation is intentionally consumed. A foreground
+            # action that raced this maintenance attempt wins without an RF
+            # retry or catch-up burst.
+            raise NeighborInfoError(
+                "neighbor_info_unavailable",
+                telemetry_category="lifecycle",
             )
+        try:
+            if provenance == "manual_request":
+                provider_result = await gateway.async_manual_neighbor_info(
+                    provider_target
+                )
+            else:
+                provider_result = await gateway.async_manual_neighbor_info(
+                    provider_target,
+                    provenance=provenance,
+                    pre_submit_guard=pre_submit_guard,
+                )
         except asyncio.CancelledError:
             raise
         except MeshtasticNeighborInfoError as err:
             category = {
+                "neighbor_info_lifecycle_changed": "lifecycle",
                 "neighbor_info_timeout": "timeout",
                 "neighbor_info_disconnected": "connection",
                 "neighbor_info_send_failed": "connection",
@@ -2126,7 +2446,9 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             }.get(err.code, "internal")
             raise NeighborInfoError(
                 err.code,
-                rf_may_have_been_sent=True,
+                rf_may_have_been_sent=(
+                    err.code != "neighbor_info_lifecycle_changed"
+                ),
                 telemetry_category=category,
             ) from None
         except TimeoutError:
@@ -2273,6 +2595,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
 
     async def async_gateway_settings_get(self, gateway_id: str | None = None) -> dict[str, Any]:
         """Read one local gateway's bounded, privacy-safe settings schema."""
+        self._record_network_activity()
         return await self.gateway_settings.async_get(gateway_id)
 
     async def async_gateway_settings_preview(
@@ -2283,6 +2606,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         changes: dict[str, Any],
     ) -> dict[str, Any]:
         """Validate changes and retain a single-use in-memory diff."""
+        self._record_network_activity()
         return await self.gateway_settings.async_preview(
             gateway_id=gateway_id,
             revision=revision,
@@ -2298,6 +2622,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         confirm_critical: bool,
     ) -> dict[str, Any]:
         """Apply one unchanged server preview and verify live readback."""
+        self._record_network_activity()
         return await self.gateway_settings.async_apply(
             gateway_id=gateway_id,
             revision=revision,
@@ -2307,6 +2632,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
 
     async def async_remote_settings_get(self, *, gateway_id: str, target_node: str) -> dict[str, Any]:
         """Read the reviewed settings projection for one exact remote node."""
+        self._record_network_activity()
         return await self.remote_admin.async_get(gateway_id, target_node)
 
     async def async_remote_settings_preview(
@@ -2318,6 +2644,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         changes: Mapping[str, Any],
     ) -> dict[str, Any]:
         """Retain one short-lived, value-redacted remote write preview."""
+        self._record_network_activity()
         return await self.remote_admin.async_preview(
             gateway_id,
             target_node,
@@ -2335,6 +2662,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         confirm_remote: bool,
     ) -> dict[str, Any]:
         """Consume and apply one explicitly confirmed remote write preview."""
+        self._record_network_activity()
         return await self.remote_admin.async_apply(
             gateway_id,
             target_node,
@@ -2569,12 +2897,40 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         settings_diagnostics = (
             settings_manager.diagnostic_snapshot() if settings_manager is not None else {"available": False}
         )
+        entry_options = getattr(getattr(self, "entry", None), "options", {})
+        if not isinstance(entry_options, Mapping):
+            entry_options = {}
+        maintenance = getattr(self, "maintenance", None)
+        maintenance_snapshot = (
+            maintenance.diagnostic_snapshot()
+            if callable(getattr(maintenance, "diagnostic_snapshot", None))
+            else {"available": False}
+        )
+        topology_history = getattr(self, "_topology_history", {})
+        if not isinstance(topology_history, Mapping):
+            topology_history = {}
 
         return {
             "configuration": {
                 "node_timeout": self.node_timeout,
                 "history_days": self.history_days,
                 "gateway_count": len(self.gateways),
+                "maintenance_requested": entry_options.get(
+                    CONF_MAINTENANCE_ENABLED,
+                    DEFAULT_MAINTENANCE_ENABLED,
+                )
+                is True,
+                "maintenance_configuration_valid": getattr(
+                    self,
+                    "_maintenance_configuration_valid",
+                    False,
+                ),
+                "maintenance_gateway_configured": getattr(
+                    self,
+                    "_maintenance_gateway_id",
+                    None,
+                )
+                is not None,
                 "protocol_counts": dict(sorted(Counter(config.protocol for config in gateway_configs).items())),
                 "transport_counts": dict(sorted(Counter(config.transport for config in gateway_configs).items())),
             },
@@ -2599,6 +2955,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                 "send_count": len(send_tasks),
                 "send_states": dict(sorted(send_states.items())),
                 "active_send_count": len(getattr(self, "_active_send_message_ids", set())),
+                "maintenance": maintenance_snapshot,
             },
             "gateways": gateway_diagnostics,
             "dedupe": self.deduplicator.stats(),
@@ -2621,6 +2978,12 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                 "nodes_with_radio": sum(bool(node.radio) for node in nodes),
                 "nodes_with_routing": sum(bool(node.routing) for node in nodes),
                 "nodes_with_sensors": sum(bool(node.sensors) for node in nodes),
+                "graph_history_node_count": len(topology_history),
+                "graph_history_position_count": sum(
+                    len(positions)
+                    for positions in topology_history.values()
+                    if isinstance(positions, (list, tuple))
+                ),
                 "protocol_counts": dict(sorted(protocol_counts.items())),
                 "role_counts": dict(sorted(role_counts.items())),
                 "hardware_model_counts": dict(sorted(hardware_counts.items())),
@@ -2712,9 +3075,37 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             "identity_collision_node_count": identity_projection["unresolved_identity_record_count"],
         }
 
+    def maintenance_panel_status(self) -> dict[str, Any]:
+        """Return the scheduler's fixed identity-free status for the admin UI."""
+        status = self.maintenance.diagnostic_snapshot()
+        return {
+            "enabled": status["enabled"],
+            "accepting": status["accepting"],
+            "task_state": status["task_state"],
+            "cycle_active": status["cycle_active"],
+            "last_outcome": status["last_outcome"],
+            "interval_seconds": status["interval_seconds"],
+            "quiet_seconds": status["quiet_seconds"],
+            "request_spacing_seconds": status["request_spacing_seconds"],
+            "max_requests_per_cycle": status["max_requests_per_cycle"],
+            "next_cycle_in_seconds": status["next_cycle_in_seconds"],
+            "last_activity_age_seconds": status["last_activity_age_seconds"],
+            "request_attempt_count": status["request_attempt_count"],
+            "request_success_count": status["request_success_count"],
+            "request_failure_count": status["request_failure_count"],
+            "traffic_deferral_count": status["traffic_deferral_count"],
+            "busy_deferral_count": status["busy_deferral_count"],
+            "configuration_valid": self._maintenance_configuration_valid,
+            "gateway_configured": self._maintenance_gateway_id is not None,
+            "automatic_traceroute_supported": False,
+            "automatic_retry_supported": False,
+        }
+
     async def _handle_packet(self, packet: MeshPacket, *, gateway_generation: int | None = None) -> None:
         if not self._gateway_callback_is_current(gateway_generation):
             return
+        if not _packet_is_maintenance_neighbor_info(packet):
+            self._record_network_activity()
         if _packet_port_is_private(packet):
             return
         packet.text = _safe_inbound_text(packet.text)
@@ -2762,6 +3153,11 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
     async def _handle_node(self, node: NodeState, *, gateway_generation: int | None = None) -> None:
         if not self._gateway_callback_is_current(gateway_generation):
             return
+        if node.routing.get("neighbors_provenance") != "maintenance_scan":
+            self._record_network_activity()
+        await self._async_record_graph_position(node)
+        if not self._gateway_callback_is_current(gateway_generation):
+            return
         node_update_lock = getattr(self, "_node_update_lock", None)
         if node_update_lock is None:
             node_update_lock = self._node_update_lock = asyncio.Lock()
@@ -2787,6 +3183,121 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         if not self._gateway_callback_is_current(gateway_generation):
             return
         self.async_set_updated_data(self.snapshot)
+
+    async def _async_record_graph_position(self, node: NodeState) -> None:
+        """Best-effort retain one real node observation for a rolling-day trail."""
+        if not has_valid_location(
+            node.location,
+            zero_pair_is_missing=node.protocol == PROTOCOL_MESHTASTIC,
+        ):
+            return
+        latitude = float(node.location["latitude"])
+        longitude = float(node.location["longitude"])
+        precision = node.location.get("precision_bits")
+        if (
+            isinstance(precision, bool)
+            or not isinstance(precision, int)
+            or not 0 <= precision <= 32
+        ):
+            precision = None
+        observed_at = utcnow()
+        try:
+            await self.store.async_record_graph_position(
+                node.node_key,
+                latitude,
+                longitude,
+                observed_at=observed_at,
+                precision_bits=precision,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            _LOGGER.debug(
+                "Optional MeshNet graph position sample was not stored "
+                "(error_type=%s)",
+                _safe_error_type(err),
+            )
+            return
+        bucket = observed_at.replace(minute=0, second=0, microsecond=0)
+        sample: dict[str, Any] = {
+            "observed_at": timestamp_to_json(observed_at),
+            "latitude": latitude,
+            "longitude": longitude,
+        }
+        if precision is not None:
+            sample["precision_bits"] = precision
+        positions = self._topology_history.setdefault(node.node_key, [])
+        positions[:] = [
+            item
+            for item in positions
+            if not (
+                isinstance(item.get("observed_at"), str)
+                and _same_utc_hour(item["observed_at"], bucket)
+            )
+        ]
+        positions.append(sample)
+        positions.sort(key=lambda item: str(item.get("observed_at") or ""))
+        del positions[:-25]
+        if len(self._topology_history) > 100:
+            self._prune_topology_history_cache(now=observed_at)
+
+    def _prune_topology_history_cache(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        """Keep the optional in-memory graph cache to one day and 100 nodes."""
+        current = now or utcnow()
+        cutoff = current - timedelta(hours=24)
+        history = getattr(self, "_topology_history", {})
+        if not isinstance(history, dict):
+            self._topology_history = {}
+            return
+        newest: dict[str, datetime] = {}
+        for node_key in tuple(history):
+            raw_positions = history.get(node_key)
+            if not isinstance(raw_positions, list):
+                history.pop(node_key, None)
+                continue
+            retained = [
+                item
+                for item in raw_positions[-25:]
+                if isinstance(item, Mapping)
+                and (observed := _bounded_utc_timestamp(item.get("observed_at")))
+                is not None
+                and observed >= cutoff
+            ]
+            if not retained:
+                history.pop(node_key, None)
+                continue
+            retained.sort(key=lambda item: str(item.get("observed_at") or ""))
+            history[node_key] = retained
+            observed = _bounded_utc_timestamp(retained[-1].get("observed_at"))
+            if observed is not None:
+                newest[node_key] = observed
+        if len(history) <= 100:
+            return
+        keep = {
+            node_key
+            for node_key, _observed in sorted(
+                newest.items(),
+                key=lambda item: (item[1], item[0]),
+                reverse=True,
+            )[:100]
+        }
+        for node_key in tuple(history):
+            if node_key not in keep:
+                history.pop(node_key, None)
+
+    def topology_history_for_node(self, node_key: str) -> list[dict[str, Any]]:
+        """Return at most 25 detached samples across one effective node's aliases."""
+        combined: list[dict[str, Any]] = []
+        for alias in self.node_alias_keys(node_key):
+            for item in self._topology_history.get(alias, ()):  # local cache only
+                if isinstance(item, Mapping):
+                    combined.append(dict(item))
+        combined.sort(key=lambda item: str(item.get("observed_at") or ""))
+        return combined[-25:]
 
     @staticmethod
     def _node_identity_signature(node: NodeState) -> tuple[Any, ...]:
@@ -3000,6 +3511,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                     return
                 if not pending:
                     return None
+                self._record_network_activity()
                 updated_any = False
                 for record in pending:
                     if not self._gateway_callback_is_current(gateway_generation):
@@ -3378,11 +3890,20 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
     async def async_quiesce_radio_operations(self) -> bool:
         """Fence and drain manual RF work before reload or platform unload."""
         self._radio_operations_accepting = False
+        maintenance = getattr(self, "maintenance", None)
+        maintenance_quiesce = getattr(maintenance, "async_quiesce", None)
+        maintenance_drained = (
+            await maintenance_quiesce()
+            if callable(maintenance_quiesce)
+            else True
+        )
         remote_admin = getattr(self, "remote_admin", None)
         quiesce = getattr(remote_admin, "async_quiesce", None)
         remote_drained = await quiesce() if callable(quiesce) else True
         traceroutes_drained = await self._cancel_traceroute_tasks()
-        return bool(remote_drained and traceroutes_drained)
+        return bool(
+            maintenance_drained and remote_drained and traceroutes_drained
+        )
 
     def resume_radio_operations(self) -> bool:
         """Resume manual RF work only after every previous owner has drained."""
@@ -3401,6 +3922,11 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         if callable(resume) and resume() is not True:
             return False
         self._radio_operations_accepting = True
+        maintenance = getattr(self, "maintenance", None)
+        maintenance_resume = getattr(maintenance, "resume", None)
+        if callable(maintenance_resume) and maintenance_resume() is not True:
+            self._radio_operations_accepting = False
+            return False
         return True
 
     def _validate_requested_gateway_id(self, gateway_id: str | None) -> None:

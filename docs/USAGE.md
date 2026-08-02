@@ -22,9 +22,9 @@ The panel shows:
 - Gateway online state
 - Node online/last-seen state with favorites-aware sorting
 - Recent messages
-- A draggable, moving 20/50/100-node cached-evidence graph whose spring
-  lengths use valid GPS distance only after an edge has independent route
-  evidence, with the great-circle distance labeled in miles
+- A 20/50/100-node cached-evidence graph with **Geographic scale** and
+  draggable **Topology** layouts, bounded rolling-day position trails, and
+  labeled great-circle distances on independently evidenced edges
 - A link to Home Assistant's native Map
 - RF heat based on RSSI or SNR
 
@@ -90,12 +90,45 @@ yet**. Edges are explicitly labeled as last received, cached evidence rather
 than a live route; MeshNet does not currently expire a received MeshCore
 route/path on a guessed schedule.
 
-Locally received Meshtastic NeighborInfo may add a node-to-node edge when both
-identities resolve exactly and the report is no more than one hour old. MQTT,
+Use the graph's **Layout** selector to choose:
+
+- **Geographic scale** places every sufficiently precise located endpoint on
+  one local projection with equal meters per pixel horizontally and vertically.
+  Its 1/2/5 scale bar uses Home Assistant's metric or imperial unit system.
+  This is a coordinate plot, not a tile map or an RF coverage estimate.
+- **Topology** keeps the animated, draggable force view. Valid physical
+  distance changes its bounded spring length, but topology pixels are not
+  meters.
+
+MeshNet retains at most one validated position per node per UTC hour, up to 25
+samples, in the isolated `graph_position_observations` table inside local
+`meshnet.sqlite3`. Samples older than 24 hours are pruned even when the normal
+`history_days` option is longer. The rolling trail and its full-day extent keep
+a moving node on a stable geographic scale instead of refitting only around its
+newest point. A node with no usable position is still shown in the clearly
+separated **Unlocated endpoints — not to scale** rail. Meshtastic `(0, 0)`,
+non-finite coordinates, and explicitly coarse positions below the graph's
+precision threshold are not presented as precise map geometry.
+
+The 20/50/100 cap is evidence-aware. Complete direct, NeighborInfo, and route
+endpoint pairs are considered before the remaining recent nodes; MeshNet does
+not keep only half of a node-to-node edge. Direct gateway observations have the
+highest selection priority. If the selected node limit or bounded gateway cap
+cannot hold every direct relationship, the panel reports how many were omitted
+so the operator can increase the node limit instead of silently mistaking
+absence for no connection.
+
+Locally received Meshtastic NeighborInfo may add a friend-of-friend
+node-to-node edge when both identities resolve exactly and the report is no
+more than one hour old. It says that one node reported another in its cached
+NeighborInfo; it is not a direct gateway reception or a live route. MQTT,
 ambiguous, malformed, stale, and implausibly future-dated neighbor reports do
 not create graph edges. Unsolicited and legacy reports are marked `passive`.
 Reports returned by the explicit request below are marked `manual_request`, so
-the graph never describes solicited evidence as passive.
+the graph never describes solicited evidence as passive. A report obtained by
+the opt-in quiet-time maintenance scheduler is marked `maintenance_scan` and
+uses a distinct wider dotted line. All three labels retain the same one-hour
+freshness and exact-identity requirements.
 
 An edge label is the Haversine distance in miles, not an RF range estimate.
 For a gateway endpoint MeshNet uses the exact controller radio's cached GPS
@@ -105,8 +138,10 @@ controller should advertise a fixed GPS position, configure it deliberately
 with an official Meshtastic client; otherwise keep Home Assistant's Home
 location accurate for the clearly labeled fallback.
 
-MeshNet does not run traceroute automatically, on refresh, on startup, or to
-fill the graph. Administrators may explicitly request one unicast traceroute
+Opening, refreshing, filtering, changing layout, drawing trails, moving a
+topology node, or changing the graph limit performs no radio request. MeshNet
+does not run traceroute automatically, on refresh, on startup, or to fill the
+graph. Administrators may explicitly request one unicast traceroute
 from the MeshNet panel when using a connected Meshtastic Bluetooth gateway.
 The backend permits at most one manual traceroute across the entire MeshNet
 integration per minute, reserves that global cooldown before transmitting, never
@@ -119,9 +154,12 @@ LoRa hop limit rather than silently forcing a direct-only request.
 
 Administrators may explicitly request NeighborInfo from one exact known node
 through a connected Meshtastic Bluetooth gateway. MeshNet submits one unicast
-application packet, with no MeshNet retry, only after atomically reserving persisted 180-second integration-wide
-and same-target floors shared by every gateway. It never
-polls, batches, broadcasts, schedules, or retries this operation. This
+application packet, with no MeshNet retry, only after atomically reserving the
+persisted integration-wide and same-target floors shared by every gateway. The
+manual operation never batches, broadcasts, schedules, or retries. The separate
+maintenance scheduler can make bounded NeighborInfo requests only when an
+administrator explicitly enables it; graph rendering itself never invokes that
+scheduler. This
 experimental path is verified on Meshtastic firmware 2.7.26 and requires the
 target's Neighbor Info module to be enabled. Older firmware may reject it or
 time out. The response is a cached zero-hop report with at most ten neighbors,

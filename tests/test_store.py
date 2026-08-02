@@ -70,6 +70,64 @@ def test_pending_outbox(tmp_path) -> None:
     asyncio.run(_pending_outbox(tmp_path))
 
 
+def test_graph_position_history_is_hourly_bounded_persisted_and_pruned(
+    tmp_path,
+) -> None:
+    """Rolling-day trails replace a bucket and never become permanent history."""
+
+    async def run() -> None:
+        path = tmp_path / "meshnet.sqlite3"
+        now = datetime.now(UTC).replace(microsecond=0)
+        bucket = now.replace(minute=0, second=0)
+        store = MeshStore(path)
+        await store.async_open()
+        await store.async_record_graph_position(
+            "meshtastic:!11111111",
+            41.0,
+            -87.0,
+            observed_at=bucket - timedelta(hours=2) + timedelta(minutes=5),
+            precision_bits=12,
+        )
+        await store.async_record_graph_position(
+            "meshtastic:!11111111",
+            41.1,
+            -87.1,
+            observed_at=bucket - timedelta(hours=2) + timedelta(minutes=55),
+            precision_bits=14,
+        )
+        await store.async_record_graph_position(
+            "meshtastic:!11111111",
+            41.2,
+            -87.2,
+            observed_at=bucket - timedelta(hours=1),
+        )
+        await store.async_record_graph_position(
+            "meshtastic:!22222222",
+            42.0,
+            -88.0,
+            observed_at=now - timedelta(hours=25),
+        )
+        await store.async_close()
+
+        reopened = MeshStore(path)
+        await reopened.async_open()
+        history = await reopened.async_graph_position_history(now=now)
+        assert list(history) == ["meshtastic:!11111111"]
+        assert len(history["meshtastic:!11111111"]) == 2
+        assert history["meshtastic:!11111111"][0]["latitude"] == 41.1
+        assert history["meshtastic:!11111111"][0]["precision_bits"] == 14
+        assert history["meshtastic:!11111111"][1]["latitude"] == 41.2
+
+        await reopened.async_prune(history_days=30)
+        diagnostics = await reopened.async_diagnostics()
+        assert diagnostics["graph_position_observation_count"] == 2
+        assert diagnostics["metadata_airtime_reservation_count"] == 0
+        assert "meshtastic:!11111111" not in repr(diagnostics)
+        await reopened.async_close()
+
+    asyncio.run(run())
+
+
 async def _pending_outbox(tmp_path) -> None:
     store = MeshStore(tmp_path / "meshnet.sqlite3")
     await store.async_open()

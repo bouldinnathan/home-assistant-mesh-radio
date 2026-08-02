@@ -178,6 +178,23 @@
         "title": "History and timing",
         "data": { "node_timeout": "Mark nodes offline after (seconds)", "history_days": "Keep message history (days)", "scan_interval": "Bridge polling interval (seconds)" }
       },
+      "maintenance": {
+        "title": "Automatic network maintenance",
+        "description": "Automatic maintenance is disabled by default. {eligible_gateway_count} eligible Meshtastic Bluetooth gateway(s) are available. When enabled, MeshNet waits for legitimate radio traffic to become quiet, then requests bounded NeighborInfo metadata no more than once per minute. Traffic always defers maintenance and missed runs never create a catch-up burst.",
+        "data": {
+          "maintenance_enabled": "Enable automatic low-traffic maintenance",
+          "maintenance_gateway_id": "Meshtastic Bluetooth gateway",
+          "maintenance_interval_seconds": "Start a maintenance cycle every (seconds)",
+          "maintenance_quiet_seconds": "Require no legitimate traffic for (seconds)",
+          "maintenance_max_requests": "Maximum requests per cycle"
+        },
+        "data_description": {
+          "maintenance_gateway_id": "Only an exact configured Meshtastic Bluetooth gateway can transmit maintenance requests.",
+          "maintenance_interval_seconds": "Allowed range: 3600 to 86400 seconds.",
+          "maintenance_quiet_seconds": "Allowed range: 60 to 3600 seconds. Any legitimate traffic restarts this wait.",
+          "maintenance_max_requests": "Allowed range: 1 to 60. Requests remain at least 60 seconds apart."
+        }
+      },
       "advanced": {
         "title": "Advanced gateway JSON", "description": "This escape hatch is intended for custom bridge options. The guided Add and Edit forms are safer for normal use.",
         "data": { "gateways_json": "Gateway definitions" }
@@ -197,6 +214,8 @@
       "missing_dependency": "Configure the Home Assistant MQTT integration first.",
       "invalid_gateway": "The gateway settings are incomplete, duplicated, or invalid.",
       "invalid_gateways": "Gateway JSON must be a list of valid gateway objects with unique gateway IDs.",
+      "invalid_maintenance_settings": "Automatic maintenance settings must stay within the documented safety limits.",
+      "maintenance_gateway_required": "Select one exact configured Meshtastic Bluetooth gateway before enabling automatic maintenance.",
       "confirmation_required": "Check the confirmation box before removing the gateway.",
       "bluetooth_cleanup_failed": "MeshNet could not safely identify and verify removal of the current Bluetooth bond. The gateway was kept and no unattended cleanup will be attempted.",
       "bluetooth_requires_gui": "Add or replace a Meshtastic Bluetooth gateway with the guided Add/Edit form so its local bond is verified safely.",

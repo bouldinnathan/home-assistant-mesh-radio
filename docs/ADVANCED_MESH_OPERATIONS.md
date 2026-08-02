@@ -20,14 +20,16 @@ correlate, cancel, and verify every request without blocking Home Assistant.
 | Load remote settings | Yes | Never | Meshtastic Bluetooth | No settings or session keys |
 | Apply remote settings | Yes | Never | Meshtastic Bluetooth | Sanitized result only |
 | Run a traceroute | Yes | Never | Meshtastic Bluetooth | Cooldown and sanitized route |
-| Request NeighborInfo | Yes | Never | Meshtastic Bluetooth | Cooldowns and sanitized report |
+| Request NeighborInfo manually | Yes | Never | Meshtastic Bluetooth | Cooldowns and sanitized report |
+| Run NeighborInfo maintenance | Yes | Only after explicit opt-in and an idle-time gate | Meshtastic Bluetooth | Cooldowns, aggregate scheduler state, and sanitized reports |
 | Reorder or resize main Mesh cards | No | Never | Not applicable | Validated browser-only layout |
-| Move, filter, or sort the graph | No | Browser animation only | Not applicable | Current panel-instance memory only |
+| Change, move, filter, or sort the graph | No | Browser animation only | Not applicable | Force positions in panel memory; rolling-day GPS observations in local SQLite |
 
 The following rules are invariants, not UI suggestions:
 
-- Reading, refreshing, polling, filtering, sorting, mapping, and graph
-  animation never transmit a traceroute or remote-admin packet.
+- Reading, refreshing, polling, filtering, sorting, mapping, graph animation,
+  and changing graph layout or limit never transmit a traceroute,
+  NeighborInfo request, or remote-admin packet.
 - A manual traceroute is unicast to one exact Meshtastic node. Broadcast,
   self, ambiguous, malformed, and unknown targets are rejected.
 - A traceroute cooldown is reserved in SQLite before the radio write. A
@@ -39,9 +41,11 @@ The following rules are invariants, not UI suggestions:
 - Node numbers and cryptographic identity are routing facts. Names are display
   labels and are never used to merge or silently retarget nodes.
 - Graph distance never creates an edge. An edge exists only when MeshNet has
-  received route or NeighborInfo evidence. Solicited NeighborInfo is marked
-  `manual_request`; unsolicited and legacy evidence is marked `passive`.
-  Manual traceroute results stay separate and never mutate the graph.
+  received direct, route, or fresh NeighborInfo evidence. Solicited
+  NeighborInfo is marked `manual_request`, opt-in maintenance evidence is
+  marked `maintenance_scan`, and unsolicited and legacy evidence is marked
+  `passive`. Manual traceroute results stay separate and never mutate the
+  graph.
 - SNR and RSSI are signal observations, not physical-distance estimates.
 - Encrypted traffic that the connected radio cannot legitimately decrypt is
   not inspected, guessed, retained, or exposed.
@@ -290,16 +294,16 @@ retry. The request inherits the connected controller radio's configured LoRa
 hop limit. Those floors
 are shared by every gateway and browser and survive Home Assistant restarts.
 
-The request is never sent by graph rendering, refresh, startup, reconnection,
-diagnostics, services, automations, or polling. It has no broadcast, batch,
-schedule, or retry form. MeshNet accepts only a non-MQTT response whose request
-ID, source, destination, and channel match the submitted packet, caps the
-report at ten neighbors, and stores only the sanitized result. This experimental
-request is verified against firmware 2.7.26 and requires Neighbor Info to be
-enabled on the target. Older firmware may reject it or time out. The successful
-result is cached zero-hop evidence, not a live scan; an empty successful report
-means no cached neighbors, while a timeout is unknown. Every post-reservation
-outcome consumes both cooldowns.
+The manual request is never sent by graph rendering, refresh, startup,
+reconnection, diagnostics, services, automations, or polling. It has no
+broadcast, batch, schedule, or retry form. MeshNet accepts only a non-MQTT
+response whose request ID, source, destination, and channel match the submitted
+packet, caps the report at ten neighbors, and stores only the sanitized result.
+This experimental request is verified against firmware 2.7.26 and requires
+Neighbor Info to be enabled on the target. Older firmware may reject it or time
+out. The successful result is cached zero-hop evidence, not a live scan; an
+empty successful report means no cached neighbors, while a timeout is unknown.
+Every post-reservation outcome consumes both cooldowns.
 
 Privacy-safe Bluetooth diagnostics count response, routing rejection, timeout,
 cancellation, send failure, and disconnect separately. A correlated routing
@@ -307,6 +311,24 @@ NAK retains only its bounded protocol enum (for example `BAD_REQUEST`), never a
 node ID or raw packet. `BAD_REQUEST` can mean that the target firmware
 does not support the request or Neighbor Info is disabled; MeshNet still never
 retries it.
+
+### Opt-in maintenance NeighborInfo
+
+Automatic network maintenance is a separate, disabled-by-default option. When
+an administrator enables it, MeshNet can start a bounded NeighborInfo cycle no
+more often than once per hour through one exact Meshtastic Bluetooth gateway.
+The scheduler waits for the configured quiet period, defers immediately when
+legitimate radio or foreground work appears, and spaces requests by at least
+one minute. It never catches up with a burst after downtime, never broadcasts,
+never requests a traceroute, and never retries a failed or unknown request.
+Manual and maintenance requests share the same durable global and per-target
+NeighborInfo cooldowns.
+
+A maintenance response uses the same exact identity, correlation, size,
+non-MQTT, and one-hour graph-freshness checks as a manual response, but it keeps
+the distinct `maintenance_scan` provenance. The graph can display that cached
+friend-of-friend evidence; opening or manipulating the graph never starts or
+wakes the scheduler.
 
 ### Route interpretation
 
@@ -318,51 +340,93 @@ the same route will be used for the next packet.
 
 ## Moving, Distance-Aware Graph
 
-The graph is a force-directed view inspired by Home Assistant's Zigbee graph:
+The **Layout** selector offers two local views over the same cached evidence.
+Neither layout is a live route query, tile map, RF coverage model, or reason to
+transmit a packet.
+
+### Geographic scale
+
+**Geographic scale** is the default. Every sufficiently precise located node
+and rolling-day trail point is projected into one local coordinate plane with
+the same meters-per-pixel value on the horizontal and vertical axes. Longitude
+is unwrapped across the date line, and the projection uses the displayed
+latitude range so geometry remains finite. A 1/2/5 scale bar reports a readable
+distance in Home Assistant's metric or imperial unit system. Located direct
+connections therefore have an actual map scale, but the plot has no basemap and
+must not be interpreted as radio range.
+
+A located node's previous positions remain as a 24-hour trail. MeshNet records
+at most one validated observation per node per UTC hour, returns at most 25
+samples per node and 100 nodes, and prunes older observations regardless of the
+normal message-history setting. The full rolling-day trail participates in the
+extent, so a node that moves during the day does not make the scale refit only
+around its newest point. Nodes without valid, sufficiently precise coordinates
+remain visible in an **Unlocated endpoints — not to scale** rail outside the
+scaled plotting area.
+
+### Topology
+
+**Topology** is the force-directed view inspired by Home Assistant's Zigbee
+graph:
 
 - Nodes repel each other and evidence-backed edges act as springs.
 - The layout animates with `requestAnimationFrame` and can be dragged.
-- Positions live only in the current panel element; they are not written to
-  the database or configuration.
+- Force positions live only in the current panel element; they are not written
+  to SQLite, Home Assistant configuration, or radio firmware.
 - Reduced-motion preference disables continuous motion and uses a stable
   bounded layout.
 - Animation is stopped when the panel is detached or another view is selected.
 - Coordinates, velocities, iterations, and node counts are bounded so corrupt
   input cannot create an infinite loop or non-finite SVG values.
 
+### Evidence-aware node bounds
+
 The selector shows the 20, 50, or 100 most recently heard nodes, defaulting to
-50. Favorites may be retained as pinned candidates, but the displayed count
-never exceeds the selected limit. Changing the limit is a local UI operation
-and generates no radio traffic.
+50, but it does not simply truncate a flat node list. MeshNet considers complete
+direct, fresh NeighborInfo, and cached route endpoint pairs before filling
+remaining capacity by recency. Direct gateway observations have
+the highest edge-selection priority. The displayed count never exceeds the
+selected limit, an edge is never rendered with only one endpoint, and a bounded
+gateway cap prevents a large gateway set from consuming the whole view. When
+the cap cannot retain every direct observation, the panel reports the omitted
+count so the operator can select 50 or 100 rather than infer that no connection
+exists. Changing layout or limit is local browser work and generates no radio
+traffic.
 
 ### Edge sources
 
-Edges are visually distinguished:
+Edges are visually distinguished and exist only because of received evidence:
 
-- **Cached direct/neighbor evidence** came from packets the gateway already
-  received. NeighborInfo is labeled `Passive` or `Requested NeighborInfo`
-  according to its validated provenance.
-- A Meshtastic NeighborInfo edge requires an exact, unambiguous reporter and
-  endpoint, a direct non-MQTT observation no more than one hour old, and a
-  bounded timestamp. Five minutes of future clock skew is tolerated; older,
+- **Cached direct/neighbor evidence** means the selected gateway has an exact
+  cached direct observation for that node. It does not mean the node is still
+  one-hop reachable now.
+- **Friend-of-friend NeighborInfo** means one exact node reported another. It
+  is never promoted to a direct gateway link. The report must be non-MQTT, no
+  more than one hour old, timestamp-bounded, and exact and unambiguous at both
+  endpoints. Five minutes of future clock skew is tolerated; older,
   farther-future, malformed, ambiguous, or MQTT-sourced evidence is ignored.
+  Unsolicited or legacy reports are labeled **Passive NeighborInfo**, explicit
+  operator results are **Requested NeighborInfo**, and opt-in quiet-time
+  results are **Maintenance NeighborInfo** with separate line styling.
+- **Cached route/path evidence** uses exact endpoint pairs from a previously
+  received route record. Its label says cached evidence rather than a live
+  route.
 - **Manual traceroute results** are displayed separately with their age and
-  durable cooldown. The first graph release does not silently add those routes
-  to the passive layout, avoiding a stale active measurement being mistaken
-  for a current neighbor observation.
+  durable cooldown. MeshNet does not silently add those routes to the passive
+  layout, avoiding a stale active measurement being mistaken for a current
+  neighbor observation.
 - Missing, ambiguous, or invalid route identifiers do not create edges.
 - Physical proximity alone never creates an edge.
 
 ### Physical-distance spring length
 
 When both endpoints have valid locations, MeshNet computes great-circle
-distance with the Haversine formula and maps it monotonically to a bounded
-spring length. The displayed line can therefore settle shorter for nearby
-nodes and longer for distant nodes. The mapping is deliberately compressed;
-pixels are not meters and a graph must remain readable across neighborhood and
-regional meshes. Each located edge displays its great-circle distance in miles
-at the moving line midpoint; that label is not an estimate of RF range or route
-length.
+distance with the Haversine formula. Geographic scale uses equal
+meters-per-pixel geometry. Topology maps the distance monotonically to a
+bounded, deliberately compressed spring length so the force graph stays
+readable; topology pixels are not meters. Each located edge displays its
+great-circle distance in miles at the line midpoint. That label is not an
+estimate of RF range or route length.
 
 Fallback order for a gateway endpoint is:
 
@@ -373,9 +437,20 @@ Fallback order for a gateway endpoint is:
 
 The fallback is never copied into a radio node, packet, diagnostic file, event,
 or MeshNet database. Invalid, zero-pair, deliberately imprecise, or missing
-locations use the neutral spring. A cached position can be older than the
-node's last-heard time and is labeled as cached rather than presented as live.
-SNR/RSSI never substitutes for GPS.
+locations use the neutral spring in Topology and the not-to-scale rail in
+Geographic scale. A cached position can be older than the node's last-heard
+time and is labeled as cached rather than presented as live. SNR/RSSI never
+substitutes for GPS.
+
+### Local retention and browser privacy
+
+Validated trail samples live only in the isolated
+`graph_position_observations` table in local `meshnet.sqlite3`. The table is
+hard-pruned to the rolling 24-hour window; it does not follow a longer
+`history_days` option. The frontend receives only the bounded history needed to
+draw the selected local panel. It does not write node IDs, names, coordinates,
+trails, or graph positions to `localStorage`. The only persistent browser data
+used by MeshNet is the separately validated main-card layout described above.
 
 ## Home Assistant Automations and Network Failures
 
@@ -566,15 +641,25 @@ The implementation is complete only when automated tests prove all of these:
 
 ### Graph
 
-- Limits accept only 20, 50, or 100 and selection is deterministic by recent
-  valid `last_heard` data.
+- Limits accept only 20, 50, or 100 and evidence-aware selection preserves
+  complete endpoint pairs while prioritizing direct gateway observations.
+- Geographic scale uses equal finite meters-per-pixel axes, a bounded 1/2/5
+  scale bar, date-line-safe coordinates, and a separate not-to-scale rail.
+- Position history accepts only validated coordinates, retains no more than
+  one observation per UTC hour and 25 per node, and is hard-pruned after 24
+  hours in its isolated SQLite table.
 - Haversine distance is finite, monotonic, and clamped; invalid or missing GPS
-  uses the neutral spring.
+  uses the neutral spring or the unlocated rail.
 - Radio GPS wins over the labeled, browser-only Home Assistant fallback.
 - Proximity never creates an edge and SNR/RSSI is never converted to distance.
+- NeighborInfo creates only one-hour-fresh friend-of-friend edges with exact
+  identities and distinct passive, manual, or maintenance provenance.
 - The force step remains finite and bounded; animation and drag listeners stop
   on detach/view change; reduced motion has no continuous animation.
-- Changing graph limit or moving a node performs zero transport calls.
+- Changing layout or limit, drawing trails, or moving a node performs zero
+  transport calls and never invokes traceroute or maintenance scheduling.
+- Browser storage never receives node identity, coordinates, trails, or graph
+  positions.
 
 ### Telemetry and gateway health
 

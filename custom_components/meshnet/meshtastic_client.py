@@ -1306,7 +1306,11 @@ class MeshtasticClient(MeshGateway):
         return await self._async_run_bluetooth_operation(traceroute(target_node))
 
     async def async_manual_neighbor_info(
-        self, target_node: str
+        self,
+        target_node: str,
+        *,
+        provenance: str = "manual_request",
+        pre_submit_guard: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         """Delegate one explicit NeighborInfo request to the owned BLE client."""
         if self.config.transport != TRANSPORT_BLUETOOTH:
@@ -1318,7 +1322,13 @@ class MeshtasticClient(MeshGateway):
         request = getattr(client, "async_manual_neighbor_info", None)
         if not callable(request):
             raise RuntimeError("Manual NeighborInfo is unavailable")
-        return await self._async_run_bluetooth_operation(request(target_node))
+        return await self._async_run_bluetooth_operation(
+            request(
+                target_node,
+                provenance=provenance,
+                pre_submit_guard=pre_submit_guard,
+            )
+        )
 
     async def async_apply_remote_settings_plan(
         self,
@@ -1972,8 +1982,9 @@ def _meshtastic_neighbor_routing(
         "neighbor_count": len(neighbors),
         "neighbors_via_mqtt": via_mqtt,
         "neighbors_provenance": (
-            "manual_request"
-            if provenance == "manual_request" and not via_mqtt
+            provenance
+            if provenance in {"manual_request", "maintenance_scan"}
+            and not via_mqtt
             else "passive"
         ),
     }

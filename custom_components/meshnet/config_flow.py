@@ -68,8 +68,14 @@ from .const import (
     CONF_BLUETOOTH_ADAPTER,
     CONF_BLUETOOTH_ADAPTER_ADDRESS,
     CONF_BLUETOOTH_BOND_MANAGED,
+    CONF_GATEWAY_ID,
     CONF_GATEWAYS,
     CONF_HISTORY_DAYS,
+    CONF_MAINTENANCE_ENABLED,
+    CONF_MAINTENANCE_GATEWAY_ID,
+    CONF_MAINTENANCE_INTERVAL,
+    CONF_MAINTENANCE_MAX_REQUESTS,
+    CONF_MAINTENANCE_QUIET_TIME,
     CONF_MQTT_TOPIC,
     CONF_NODE_TIMEOUT,
     CONF_PROTOCOL,
@@ -78,9 +84,19 @@ from .const import (
     CONF_TRANSPORT,
     DATA_BLUETOOTH_PAIRING,
     DEFAULT_HISTORY_DAYS,
+    DEFAULT_MAINTENANCE_ENABLED,
+    DEFAULT_MAINTENANCE_INTERVAL,
+    DEFAULT_MAINTENANCE_MAX_REQUESTS,
+    DEFAULT_MAINTENANCE_QUIET_TIME,
     DEFAULT_NODE_TIMEOUT,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    MAINTENANCE_MAX_INTERVAL_SECONDS,
+    MAINTENANCE_MAX_QUIET_SECONDS,
+    MAINTENANCE_MAX_REQUESTS,
+    MAINTENANCE_MIN_INTERVAL_SECONDS,
+    MAINTENANCE_MIN_QUIET_SECONDS,
+    MAINTENANCE_MIN_REQUESTS,
     PROTOCOL_MESHCORE,
     PROTOCOL_MESHTASTIC,
     TRANSPORT_BLUETOOTH,
@@ -129,6 +145,7 @@ OPTIONS_ACTIONS = {
     "edit_gateway": "Edit a gateway",
     "remove_gateway": "Remove a gateway",
     "general": "History and timing",
+    "maintenance": "Automatic network maintenance",
     "advanced": "Advanced JSON editor",
 }
 
@@ -1077,6 +1094,128 @@ class MeshNetOptionsFlow(_MeshtasticPairingFlowMixin, config_entries.OptionsFlow
             ),
         )
 
+    async def async_step_maintenance(
+        self, user_input: dict[str, Any] | None = None
+    ):
+        """Configure opt-in, low-traffic Meshtastic network maintenance."""
+        options = dict(self.config_entry.options)
+        gateway_choices = _maintenance_gateway_choices(self._gateways())
+        configured_gateway = options.get(CONF_MAINTENANCE_GATEWAY_ID)
+        if (
+            not isinstance(configured_gateway, str)
+            or configured_gateway not in gateway_choices
+        ):
+            configured_gateway = None
+        defaults = {
+            CONF_MAINTENANCE_ENABLED: (
+                options.get(
+                    CONF_MAINTENANCE_ENABLED,
+                    DEFAULT_MAINTENANCE_ENABLED,
+                )
+                is True
+            ),
+            CONF_MAINTENANCE_GATEWAY_ID: configured_gateway,
+            CONF_MAINTENANCE_INTERVAL: _bounded_int_option(
+                options.get(CONF_MAINTENANCE_INTERVAL),
+                default=DEFAULT_MAINTENANCE_INTERVAL,
+                minimum=MAINTENANCE_MIN_INTERVAL_SECONDS,
+                maximum=MAINTENANCE_MAX_INTERVAL_SECONDS,
+            ),
+            CONF_MAINTENANCE_QUIET_TIME: _bounded_int_option(
+                options.get(CONF_MAINTENANCE_QUIET_TIME),
+                default=DEFAULT_MAINTENANCE_QUIET_TIME,
+                minimum=MAINTENANCE_MIN_QUIET_SECONDS,
+                maximum=MAINTENANCE_MAX_QUIET_SECONDS,
+            ),
+            CONF_MAINTENANCE_MAX_REQUESTS: _bounded_int_option(
+                options.get(CONF_MAINTENANCE_MAX_REQUESTS),
+                default=DEFAULT_MAINTENANCE_MAX_REQUESTS,
+                minimum=MAINTENANCE_MIN_REQUESTS,
+                maximum=MAINTENANCE_MAX_REQUESTS,
+            ),
+        }
+        errors: dict[str, str] = {}
+        schema = _maintenance_schema(
+            gateway_choices=gateway_choices,
+            defaults=defaults,
+        )
+        if user_input is not None:
+            validated: dict[str, Any] | None = None
+            try:
+                validated = schema(user_input)
+            except vol.Invalid:
+                requested_gateway = user_input.get(
+                    CONF_MAINTENANCE_GATEWAY_ID
+                )
+                if (
+                    user_input.get(CONF_MAINTENANCE_ENABLED) is True
+                    and requested_gateway not in gateway_choices
+                ):
+                    errors[
+                        CONF_MAINTENANCE_GATEWAY_ID
+                        if gateway_choices
+                        else "base"
+                    ] = "maintenance_gateway_required"
+                else:
+                    errors["base"] = "invalid_maintenance_settings"
+            else:
+                selected_gateway = validated.get(
+                    CONF_MAINTENANCE_GATEWAY_ID
+                )
+                if (
+                    validated[CONF_MAINTENANCE_ENABLED]
+                    and selected_gateway not in gateway_choices
+                ):
+                    errors[
+                        CONF_MAINTENANCE_GATEWAY_ID
+                        if gateway_choices
+                        else "base"
+                    ] = "maintenance_gateway_required"
+                else:
+                    saved = {
+                        CONF_MAINTENANCE_ENABLED: validated[
+                            CONF_MAINTENANCE_ENABLED
+                        ],
+                        CONF_MAINTENANCE_INTERVAL: validated[
+                            CONF_MAINTENANCE_INTERVAL
+                        ],
+                        CONF_MAINTENANCE_QUIET_TIME: validated[
+                            CONF_MAINTENANCE_QUIET_TIME
+                        ],
+                        CONF_MAINTENANCE_MAX_REQUESTS: validated[
+                            CONF_MAINTENANCE_MAX_REQUESTS
+                        ],
+                    }
+                    if selected_gateway in gateway_choices:
+                        saved[
+                            CONF_MAINTENANCE_GATEWAY_ID
+                        ] = selected_gateway
+                    options.update(saved)
+                    if selected_gateway not in gateway_choices:
+                        options.pop(CONF_MAINTENANCE_GATEWAY_ID, None)
+                    return self.async_create_entry(title="", data=options)
+            # Keep only schema-validated values visible after a semantic error.
+            if validated is not None:
+                defaults.update(
+                    {
+                        key: value
+                        for key, value in validated.items()
+                        if key in defaults
+                    }
+                )
+            schema = _maintenance_schema(
+                gateway_choices=gateway_choices,
+                defaults=defaults,
+            )
+        return self.async_show_form(
+            step_id="maintenance",
+            data_schema=schema,
+            errors=errors,
+            description_placeholders={
+                "eligible_gateway_count": str(len(gateway_choices))
+            },
+        )
+
     async def async_step_advanced(
         self, user_input: dict[str, Any] | None = None
     ):
@@ -1134,6 +1273,35 @@ def _is_meshtastic_bluetooth(gateway: dict[str, Any]) -> bool:
         gateway.get(CONF_PROTOCOL) == PROTOCOL_MESHTASTIC
         and gateway.get(CONF_TRANSPORT) == TRANSPORT_BLUETOOTH
     )
+
+
+def _maintenance_gateway_choices(
+    gateways: list[dict[str, Any]],
+) -> dict[str, str]:
+    """Return exact, unique Meshtastic Bluetooth gateway choices."""
+    choices: dict[str, str] = {}
+    for gateway in gateways:
+        if not isinstance(gateway, dict) or not _is_meshtastic_bluetooth(
+            gateway
+        ):
+            continue
+        gateway_id = gateway.get(CONF_GATEWAY_ID)
+        if (
+            not isinstance(gateway_id, str)
+            or not gateway_id
+            or gateway_id != gateway_id.strip()
+            or len(gateway_id) > 128
+            or gateway_id in choices
+        ):
+            continue
+        name = gateway.get(CONF_NAME)
+        label = (
+            name.strip()
+            if isinstance(name, str) and name.strip()
+            else "Meshtastic Bluetooth gateway"
+        )
+        choices[gateway_id] = f"{label} ({gateway_id})"
+    return choices
 
 
 def _has_meshnet_owned_bond(gateway: dict[str, Any]) -> bool:
@@ -1473,6 +1641,93 @@ def _settings_schema(
             vol.Required(CONF_SCAN_INTERVAL, default=scan_interval)
         ] = vol.All(vol.Coerce(int), vol.Range(min=5, max=3600))
     return vol.Schema(fields)
+
+
+def _maintenance_schema(
+    *,
+    gateway_choices: dict[str, str],
+    defaults: dict[str, Any],
+) -> vol.Schema:
+    """Build the bounded automatic-maintenance options form."""
+    fields: dict[Any, Any] = {
+        vol.Required(
+            CONF_MAINTENANCE_ENABLED,
+            default=defaults[CONF_MAINTENANCE_ENABLED],
+        ): cv.boolean,
+        vol.Required(
+            CONF_MAINTENANCE_INTERVAL,
+            default=defaults[CONF_MAINTENANCE_INTERVAL],
+        ): _bounded_int_validator(
+            minimum=MAINTENANCE_MIN_INTERVAL_SECONDS,
+            maximum=MAINTENANCE_MAX_INTERVAL_SECONDS,
+        ),
+        vol.Required(
+            CONF_MAINTENANCE_QUIET_TIME,
+            default=defaults[CONF_MAINTENANCE_QUIET_TIME],
+        ): _bounded_int_validator(
+            minimum=MAINTENANCE_MIN_QUIET_SECONDS,
+            maximum=MAINTENANCE_MAX_QUIET_SECONDS,
+        ),
+        vol.Required(
+            CONF_MAINTENANCE_MAX_REQUESTS,
+            default=defaults[CONF_MAINTENANCE_MAX_REQUESTS],
+        ): _bounded_int_validator(
+            minimum=MAINTENANCE_MIN_REQUESTS,
+            maximum=MAINTENANCE_MAX_REQUESTS,
+        ),
+    }
+    if gateway_choices:
+        configured_gateway = defaults.get(CONF_MAINTENANCE_GATEWAY_ID)
+        marker = (
+            vol.Optional(
+                CONF_MAINTENANCE_GATEWAY_ID,
+                default=configured_gateway,
+            )
+            if configured_gateway in gateway_choices
+            else vol.Optional(CONF_MAINTENANCE_GATEWAY_ID)
+        )
+        fields[marker] = vol.In(gateway_choices)
+    return vol.Schema(fields)
+
+
+def _bounded_int_validator(*, minimum: int, maximum: int):
+    """Reject booleans and fractional values before applying integer bounds."""
+
+    def validate(value: Any) -> int:
+        if isinstance(value, bool):
+            raise vol.Invalid("value must be an integer")
+        if isinstance(value, float) and not value.is_integer():
+            raise vol.Invalid("value must be an integer")
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError, OverflowError) as err:
+            raise vol.Invalid("value must be an integer") from err
+        if not minimum <= parsed <= maximum:
+            raise vol.Invalid(
+                f"value must be at least {minimum} and at most {maximum}"
+            )
+        return parsed
+
+    return validate
+
+
+def _bounded_int_option(
+    value: Any,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    """Return one persisted integer only when it remains inside its bounds."""
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if isinstance(value, float) and not value.is_integer():
+        return default
+    return parsed if minimum <= parsed <= maximum else default
 
 
 async def _async_serial_field(

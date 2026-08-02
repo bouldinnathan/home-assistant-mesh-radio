@@ -8,7 +8,7 @@ import math
 import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from itertools import islice
 from typing import Any
 
@@ -912,6 +912,20 @@ def _snapshot_with_panel_metadata(hass: HomeAssistant, coordinator: MeshNetCoord
                 )
             else:
                 panel_metadata.update(safe_provenance)
+    maintenance_provider = getattr(
+        coordinator,
+        "maintenance_panel_status",
+        None,
+    )
+    if callable(maintenance_provider):
+        try:
+            maintenance_status = _safe_maintenance_status(
+                maintenance_provider()
+            )
+        except Exception:
+            maintenance_status = None
+        if maintenance_status is not None:
+            panel_metadata["maintenance"] = maintenance_status
     panel_metadata["telemetry"] = telemetry.snapshot()
     snapshot["panel_metadata"] = panel_metadata
     return snapshot
@@ -926,6 +940,20 @@ def _panel_snapshot(coordinator: MeshNetCoordinator) -> dict[str, Any]:
     if unsafe_node_keys is None:
         unsafe_node_keys = meshtastic_unsafe_identity_keys(dict(node_items))
     gateway_items = islice(source.gateways.items(), MAX_PANEL_GATEWAYS)
+    topology_history: dict[str, list[dict[str, Any]]] = {}
+    history_provider = getattr(coordinator, "topology_history_for_node", None)
+    if callable(history_provider):
+        for node_key, _node in node_items:
+            if len(topology_history) >= 100:
+                break
+            try:
+                positions = _panel_topology_positions(
+                    history_provider(node_key)
+                )
+            except Exception:
+                positions = []
+            if positions:
+                topology_history[node_key] = positions
     return {
         "nodes": {
             node_key: _panel_node(
@@ -959,7 +987,61 @@ def _panel_snapshot(coordinator: MeshNetCoordinator) -> dict[str, Any]:
         ],
         "mesh_health_score": source.mesh_health_score,
         "messages_today": source.messages_today,
+        "topology_history": topology_history,
     }
+
+
+def _panel_topology_positions(value: Any) -> list[dict[str, Any]]:
+    """Validate one bounded rolling-day graph trail for the admin panel."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    positions: list[dict[str, Any]] = []
+    cutoff = datetime.now(UTC) - timedelta(hours=24, minutes=5)
+    for item in value[-25:]:
+        if not isinstance(item, Mapping):
+            continue
+        observed_at = item.get("observed_at")
+        if not isinstance(observed_at, str) or len(observed_at) > 64:
+            continue
+        try:
+            parsed = datetime.fromisoformat(
+                observed_at[:-1] + "+00:00"
+                if observed_at.endswith("Z")
+                else observed_at
+            )
+        except ValueError:
+            continue
+        if parsed.tzinfo is None or parsed.astimezone(UTC) < cutoff:
+            continue
+        output: dict[str, Any] = {
+            "observed_at": parsed.astimezone(UTC).isoformat(),
+        }
+        valid = True
+        for key, minimum, maximum in (
+            ("latitude", -90.0, 90.0),
+            ("longitude", -180.0, 180.0),
+        ):
+            coordinate = item.get(key)
+            if (
+                isinstance(coordinate, bool)
+                or not isinstance(coordinate, (int, float))
+                or not math.isfinite(float(coordinate))
+                or not minimum <= float(coordinate) <= maximum
+            ):
+                valid = False
+                break
+            output[key] = float(coordinate)
+        if not valid:
+            continue
+        precision = item.get("precision_bits")
+        if (
+            isinstance(precision, int)
+            and not isinstance(precision, bool)
+            and 0 <= precision <= 32
+        ):
+            output["precision_bits"] = precision
+        positions.append(output)
+    return positions
 
 
 def _panel_gateway(coordinator: MeshNetCoordinator, gateway_id: str, status: Any) -> dict[str, Any]:
@@ -1046,7 +1128,11 @@ def _panel_node(
     if isinstance(neighbors_via_mqtt, bool):
         routing["neighbors_via_mqtt"] = neighbors_via_mqtt
     neighbors_provenance = node.routing.get("neighbors_provenance")
-    if neighbors_provenance in {"passive", "manual_request"}:
+    if neighbors_provenance in {
+        "passive",
+        "manual_request",
+        "maintenance_scan",
+    }:
         routing["neighbors_provenance"] = neighbors_provenance
     return {
         "node_key": node.node_key,
@@ -1090,6 +1176,78 @@ def _safe_panel_provenance(value: Any) -> dict[str, int] | None:
         if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= _MAX_REPORTED_COUNT:
             return None
         projected[key] = count
+    return projected
+
+
+def _safe_maintenance_status(value: Any) -> dict[str, Any] | None:
+    """Project only fixed, identity-free maintenance scheduler fields."""
+    if not isinstance(value, Mapping):
+        return None
+    boolean_keys = (
+        "enabled",
+        "accepting",
+        "cycle_active",
+        "configuration_valid",
+        "gateway_configured",
+        "automatic_traceroute_supported",
+        "automatic_retry_supported",
+    )
+    projected: dict[str, Any] = {}
+    for key in boolean_keys:
+        item = value.get(key)
+        if not isinstance(item, bool):
+            return None
+        projected[key] = item
+    task_state = value.get("task_state")
+    if task_state not in {
+        "not_created",
+        "pending",
+        "cancelling",
+        "cancelled",
+        "finished",
+        "failed",
+    }:
+        return None
+    outcome = value.get("last_outcome")
+    if not isinstance(outcome, str) or not re.fullmatch(
+        r"[a-z_]{1,32}", outcome
+    ):
+        return None
+    projected["task_state"] = task_state
+    projected["last_outcome"] = outcome
+    for key in (
+        "interval_seconds",
+        "quiet_seconds",
+        "request_spacing_seconds",
+        "max_requests_per_cycle",
+        "request_attempt_count",
+        "request_success_count",
+        "request_failure_count",
+        "traffic_deferral_count",
+        "busy_deferral_count",
+    ):
+        item = value.get(key)
+        if (
+            isinstance(item, bool)
+            or not isinstance(item, (int, float))
+            or not math.isfinite(float(item))
+            or not 0 <= float(item) <= 1_000_000_000
+        ):
+            return None
+        projected[key] = item
+    for key in ("next_cycle_in_seconds", "last_activity_age_seconds"):
+        item = value.get(key)
+        if item is None:
+            projected[key] = None
+            continue
+        if (
+            isinstance(item, bool)
+            or not isinstance(item, (int, float))
+            or not math.isfinite(float(item))
+            or not 0 <= float(item) <= 1_000_000_000
+        ):
+            return None
+        projected[key] = item
     return projected
 
 

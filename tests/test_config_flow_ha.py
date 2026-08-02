@@ -32,6 +32,7 @@ from custom_components.meshnet.bluetooth_pairing import (  # noqa: E402
     ProvisionalBond,
 )
 from custom_components.meshnet.config_flow import (  # noqa: E402
+    CONF_ACTION,
     CONF_CONFIRM,
     CONF_GATEWAY,
     CONF_GATEWAYS_JSON,
@@ -65,9 +66,17 @@ from custom_components.meshnet.const import (  # noqa: E402
     CONF_BLUETOOTH_ADAPTER_ADDRESS,
     CONF_BLUETOOTH_BOND_MANAGED,
     CONF_GATEWAYS,
+    CONF_MAINTENANCE_ENABLED,
+    CONF_MAINTENANCE_GATEWAY_ID,
+    CONF_MAINTENANCE_INTERVAL,
+    CONF_MAINTENANCE_MAX_REQUESTS,
+    CONF_MAINTENANCE_QUIET_TIME,
     CONF_MQTT_TOPIC,
     CONF_SERIAL_PATH,
     CONF_TRANSPORT,
+    DEFAULT_MAINTENANCE_INTERVAL,
+    DEFAULT_MAINTENANCE_MAX_REQUESTS,
+    DEFAULT_MAINTENANCE_QUIET_TIME,
     DOMAIN,
     MESSAGE_TYPE_DIRECT,
     PROTOCOL_MESHCORE,
@@ -224,6 +233,264 @@ def test_options_flow_uses_modern_home_assistant_owned_config_entry() -> None:
     # HA 2024.11+ injects config_entry after construction. Passing it manually
     # became invalid on newer releases, so this constructor must stay argument-free.
     assert isinstance(MeshNetOptionsFlow(), MeshNetOptionsFlow)
+
+
+def _maintenance_options_flow(
+    gateways: list[dict],
+    *,
+    options: dict | None = None,
+) -> MeshNetOptionsFlow:
+    """Attach the config entry using the supported HA-owned flow shape."""
+    flow = MeshNetOptionsFlow()
+    entry = SimpleNamespace(
+        data={CONF_GATEWAYS: gateways},
+        options=dict(options or {}),
+    )
+    try:
+        flow.config_entry = entry
+    except AttributeError:
+        flow._config_entry = entry
+    return flow
+
+
+def _maintenance_gateway(
+    gateway_id: str,
+    *,
+    protocol: str = PROTOCOL_MESHTASTIC,
+    transport: str = TRANSPORT_BLUETOOTH,
+) -> dict:
+    return {
+        "gateway_id": gateway_id,
+        "name": f"Gateway {gateway_id}",
+        "protocol": protocol,
+        "transport": transport,
+    }
+
+
+def test_maintenance_options_are_opt_in_bounded_and_ble_only() -> None:
+    async def run() -> None:
+        flow = _maintenance_options_flow(
+            [
+                _maintenance_gateway("eligible-ble"),
+                _maintenance_gateway(
+                    "meshtastic-tcp", transport=TRANSPORT_TCP
+                ),
+                _maintenance_gateway(
+                    "meshcore-ble", protocol=PROTOCOL_MESHCORE
+                ),
+            ]
+        )
+
+        form = await flow.async_step_init({CONF_ACTION: "maintenance"})
+
+        assert form["type"] == "form"
+        assert form["step_id"] == "maintenance"
+        schema = form["data_schema"]
+        assert _keys(schema) == {
+            CONF_MAINTENANCE_ENABLED,
+            CONF_MAINTENANCE_GATEWAY_ID,
+            CONF_MAINTENANCE_INTERVAL,
+            CONF_MAINTENANCE_QUIET_TIME,
+            CONF_MAINTENANCE_MAX_REQUESTS,
+        }
+        enabled_marker, _enabled_validator = _field(
+            schema, CONF_MAINTENANCE_ENABLED
+        )
+        assert enabled_marker.default() is False
+
+        _gateway_marker, gateway_validator = _field(
+            schema, CONF_MAINTENANCE_GATEWAY_ID
+        )
+        assert gateway_validator("eligible-ble") == "eligible-ble"
+        for rejected in (
+            "meshtastic-tcp",
+            "meshcore-ble",
+            "eligible-ble ",
+            "ELIGIBLE-BLE",
+        ):
+            with pytest.raises(vol.Invalid):
+                gateway_validator(rejected)
+
+        for key, minimum, maximum in (
+            (CONF_MAINTENANCE_INTERVAL, 3600, 86400),
+            (CONF_MAINTENANCE_QUIET_TIME, 60, 3600),
+            (CONF_MAINTENANCE_MAX_REQUESTS, 1, 60),
+        ):
+            _marker, validator = _field(schema, key)
+            assert validator(minimum) == minimum
+            assert validator(str(maximum)) == maximum
+            for rejected in (minimum - 1, maximum + 1, True, 1.5):
+                with pytest.raises(vol.Invalid):
+                    validator(rejected)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "gateway_id",
+    [None, "", "meshtastic-tcp", "unknown", " eligible-ble"],
+)
+def test_enabled_maintenance_requires_one_exact_eligible_gateway(
+    gateway_id: str | None,
+) -> None:
+    async def run() -> None:
+        flow = _maintenance_options_flow(
+            [
+                _maintenance_gateway("eligible-ble"),
+                _maintenance_gateway(
+                    "meshtastic-tcp", transport=TRANSPORT_TCP
+                ),
+            ]
+        )
+        user_input = {
+            CONF_MAINTENANCE_ENABLED: True,
+            CONF_MAINTENANCE_INTERVAL: 3600,
+            CONF_MAINTENANCE_QUIET_TIME: 60,
+            CONF_MAINTENANCE_MAX_REQUESTS: 1,
+        }
+        if gateway_id is not None:
+            user_input[CONF_MAINTENANCE_GATEWAY_ID] = gateway_id
+
+        result = await flow.async_step_maintenance(user_input)
+
+        assert result["type"] == "form"
+        assert result["errors"] == {
+            CONF_MAINTENANCE_GATEWAY_ID: "maintenance_gateway_required"
+        }
+
+    asyncio.run(run())
+
+
+def test_enabled_maintenance_without_ble_gateway_fails_visibly() -> None:
+    async def run() -> None:
+        flow = _maintenance_options_flow(
+            [
+                _maintenance_gateway(
+                    "meshtastic-tcp", transport=TRANSPORT_TCP
+                ),
+                _maintenance_gateway(
+                    "meshcore-ble", protocol=PROTOCOL_MESHCORE
+                ),
+            ]
+        )
+
+        result = await flow.async_step_maintenance(
+            {
+                CONF_MAINTENANCE_ENABLED: True,
+                CONF_MAINTENANCE_INTERVAL: 3600,
+                CONF_MAINTENANCE_QUIET_TIME: 60,
+                CONF_MAINTENANCE_MAX_REQUESTS: 1,
+            }
+        )
+
+        assert result["type"] == "form"
+        assert CONF_MAINTENANCE_GATEWAY_ID not in _keys(
+            result["data_schema"]
+        )
+        assert result["errors"] == {
+            "base": "maintenance_gateway_required"
+        }
+
+    asyncio.run(run())
+
+
+def test_maintenance_options_save_exact_values_and_preserve_other_options() -> None:
+    async def run() -> None:
+        gateways = [_maintenance_gateway("eligible-ble")]
+        flow = _maintenance_options_flow(
+            gateways,
+            options={
+                CONF_GATEWAYS: gateways,
+                "unrelated_option": "keep-me",
+                "node_timeout": 321,
+            },
+        )
+
+        result = await flow.async_step_maintenance(
+            {
+                CONF_MAINTENANCE_ENABLED: True,
+                CONF_MAINTENANCE_GATEWAY_ID: "eligible-ble",
+                CONF_MAINTENANCE_INTERVAL: "86400",
+                CONF_MAINTENANCE_QUIET_TIME: "3600",
+                CONF_MAINTENANCE_MAX_REQUESTS: "60",
+            }
+        )
+
+        assert result["type"] == "create_entry"
+        assert result["data"] == {
+            CONF_GATEWAYS: gateways,
+            "unrelated_option": "keep-me",
+            "node_timeout": 321,
+            CONF_MAINTENANCE_ENABLED: True,
+            CONF_MAINTENANCE_GATEWAY_ID: "eligible-ble",
+            CONF_MAINTENANCE_INTERVAL: 86400,
+            CONF_MAINTENANCE_QUIET_TIME: 3600,
+            CONF_MAINTENANCE_MAX_REQUESTS: 60,
+        }
+
+    asyncio.run(run())
+
+
+def test_maintenance_options_restore_safe_persisted_defaults() -> None:
+    async def run() -> None:
+        gateways = [_maintenance_gateway("eligible-ble")]
+        flow = _maintenance_options_flow(
+            gateways,
+            options={
+                CONF_MAINTENANCE_ENABLED: True,
+                CONF_MAINTENANCE_GATEWAY_ID: "eligible-ble",
+                CONF_MAINTENANCE_INTERVAL: 7200,
+                CONF_MAINTENANCE_QUIET_TIME: 300,
+                CONF_MAINTENANCE_MAX_REQUESTS: 20,
+            },
+        )
+
+        form = await flow.async_step_maintenance()
+        schema = form["data_schema"]
+
+        assert _field(schema, CONF_MAINTENANCE_ENABLED)[0].default() is True
+        assert (
+            _field(schema, CONF_MAINTENANCE_GATEWAY_ID)[0].default()
+            == "eligible-ble"
+        )
+        assert _field(schema, CONF_MAINTENANCE_INTERVAL)[0].default() == 7200
+        assert _field(schema, CONF_MAINTENANCE_QUIET_TIME)[0].default() == 300
+        assert (
+            _field(schema, CONF_MAINTENANCE_MAX_REQUESTS)[0].default()
+            == 20
+        )
+
+        corrupted = _maintenance_options_flow(
+            gateways,
+            options={
+                CONF_MAINTENANCE_ENABLED: "yes",
+                CONF_MAINTENANCE_GATEWAY_ID: "not-eligible",
+                CONF_MAINTENANCE_INTERVAL: 10,
+                CONF_MAINTENANCE_QUIET_TIME: 99999,
+                CONF_MAINTENANCE_MAX_REQUESTS: True,
+            },
+        )
+        safe_form = await corrupted.async_step_maintenance()
+        safe_schema = safe_form["data_schema"]
+        assert (
+            _field(safe_schema, CONF_MAINTENANCE_ENABLED)[0].default()
+            is False
+        )
+        assert CONF_MAINTENANCE_GATEWAY_ID in _keys(safe_schema)
+        assert (
+            _field(safe_schema, CONF_MAINTENANCE_INTERVAL)[0].default()
+            == DEFAULT_MAINTENANCE_INTERVAL
+        )
+        assert (
+            _field(safe_schema, CONF_MAINTENANCE_QUIET_TIME)[0].default()
+            == DEFAULT_MAINTENANCE_QUIET_TIME
+        )
+        assert (
+            _field(safe_schema, CONF_MAINTENANCE_MAX_REQUESTS)[0].default()
+            == DEFAULT_MAINTENANCE_MAX_REQUESTS
+        )
+
+    asyncio.run(run())
 
 
 def test_serial_picker_lists_devices_and_accepts_advanced_path() -> None:

@@ -81,8 +81,8 @@ def test_future_manual_traceroute_cooldown_is_documented() -> None:
     )
 
 
-def test_manual_neighbor_info_is_admin_websocket_only_without_polling() -> None:
-    """NeighborInfo RF requests exist only on the explicit bounded admin path."""
+def test_neighbor_info_has_only_admin_manual_and_narrow_maintenance_entrypoints() -> None:
+    """Manual RF stays admin-only; opt-in maintenance has one narrow seam."""
     websocket_path = Path("custom_components/meshnet/websocket_api.py")
     tree = ast.parse(websocket_path.read_text(encoding="utf-8"))
     handlers = [
@@ -137,3 +137,29 @@ def test_manual_neighbor_info_is_admin_websocket_only_without_polling() -> None:
                 )
                 if called_name == "async_manual_neighbor_info":
                     assert owner.name in allowed_call_owners, (path, owner.name)
+
+    coordinator = ast.parse(
+        Path("custom_components/meshnet/coordinator.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    maintenance_owners = [
+        node
+        for node in ast.walk(coordinator)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_async_maintenance_neighbor_info"
+    ]
+    assert len(maintenance_owners) == 1
+    assert any(
+        isinstance(call.func, ast.Attribute)
+        and call.func.attr == "_async_manual_neighbor_info"
+        for call in ast.walk(maintenance_owners[0])
+        if isinstance(call, ast.Call)
+    )
+
+    maintenance_source = Path(
+        "custom_components/meshnet/maintenance_scan.py"
+    ).read_text(encoding="utf-8")
+    assert "async_manual_traceroute" not in maintenance_source
+    assert '"automatic_traceroute_supported": False' in maintenance_source
+    assert '"automatic_retry_supported": False' in maintenance_source

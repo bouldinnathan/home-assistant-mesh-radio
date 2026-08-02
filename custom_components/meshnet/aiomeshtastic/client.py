@@ -215,6 +215,16 @@ class _PendingTracerouteResponse:
 
 
 @dataclass(slots=True)
+class _PendingNeighborInfoResponse:
+    """One exact NeighborInfo request with trusted local provenance."""
+
+    future: asyncio.Future[Any] = field(repr=False)
+    source: int = 0
+    channel: int = 0
+    provenance: str = "manual_request"
+
+
+@dataclass(slots=True)
 class _RemoteAdminSession:
     """One target's short-lived passkey, retained in process memory only."""
 
@@ -313,9 +323,9 @@ class MeshtasticBluetoothClient:
         self._pending_admin_responses: dict[int, _PendingAdminResponse] = {}
         self._pending_traceroute_responses: dict[int, _PendingTracerouteResponse] = {}
         self._pending_neighbor_info_responses: dict[
-            int, _PendingTracerouteResponse
+            int, _PendingNeighborInfoResponse
         ] = {}
-        self._manual_neighbor_info_response_packets: set[tuple[int, int]] = set()
+        self._neighbor_info_response_provenance: dict[tuple[int, int], str] = {}
         self._internal_admin_request_ids: deque[int] = deque(maxlen=128)
         self._remote_admin_sessions: dict[int, _RemoteAdminSession] = {}
         self._remote_settings: dict[int, MeshtasticSettingsState] = {}
@@ -700,8 +710,22 @@ class MeshtasticBluetoothClient:
             "snr_back": [float(value) / 4.0 for value in list(route.snr_back)[:64]],
         }
 
-    async def async_manual_neighbor_info(self, target_node: str) -> dict[str, Any]:
+    async def async_manual_neighbor_info(
+        self,
+        target_node: str,
+        *,
+        provenance: str = "manual_request",
+        pre_submit_guard: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
         """Request one exact node's NeighborInfo once, without retrying."""
+        if provenance not in {"manual_request", "maintenance_scan"}:
+            raise MeshtasticConfigurationError(
+                "NeighborInfo provenance is invalid"
+            )
+        if pre_submit_guard is not None and not callable(pre_submit_guard):
+            raise MeshtasticConfigurationError(
+                "NeighborInfo pre-submit guard is invalid"
+            )
         if not isinstance(target_node, str):
             raise MeshtasticConfigurationError(
                 "NeighborInfo requires one exact Meshtastic node ID"
@@ -739,13 +763,23 @@ class MeshtasticBluetoothClient:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Any] = loop.create_future()
         request_id: int | None = None
-        pending: _PendingTracerouteResponse | None = None
+        pending: _PendingNeighborInfoResponse | None = None
         async with self._send_lock:
             connection = self._connection
             if not self.connected or connection is None:
                 raise MeshtasticNotConnectedError(
                     "Meshtastic Bluetooth is not active"
                 )
+            if pre_submit_guard is not None:
+                try:
+                    submission_allowed = pre_submit_guard() is True
+                except Exception:
+                    submission_allowed = False
+                if not submission_allowed:
+                    self._last_neighbor_info_outcome = "preflight_blocked"
+                    raise MeshtasticNeighborInfoError(
+                        "neighbor_info_lifecycle_changed"
+                    )
             request = mesh_pb2.NeighborInfo()
             # Current firmware recognizes this exact dummy as a request and
             # deliberately avoids ingesting it into the neighbor database.
@@ -765,10 +799,11 @@ class MeshtasticBluetoothClient:
             packet.decoded.want_response = True
             packet.decoded.payload = request.SerializeToString()
             request_id = int(packet.id)
-            pending = _PendingTracerouteResponse(
+            pending = _PendingNeighborInfoResponse(
                 future=future,
                 source=destination,
                 channel=0,
+                provenance=provenance,
             )
             self._pending_neighbor_info_responses[request_id] = pending
             to_radio = mesh_pb2.ToRadio()
@@ -1761,9 +1796,9 @@ class MeshtasticBluetoothClient:
                 return True
             if int(neighbor_info.node_id) != pending_neighbor.source:
                 return True
-            self._manual_neighbor_info_response_packets.add(
+            self._neighbor_info_response_provenance[
                 (int(getattr(packet, "from")), int(packet.id))
-            )
+            ] = pending_neighbor.provenance
             pending_neighbor.future.set_result(neighbor_info)
             # NeighborInfo contains no credentials. Continue through the normal
             # decoder while retaining explicit manual-request provenance.
@@ -1957,10 +1992,11 @@ class MeshtasticBluetoothClient:
             packet_key = (source, int(packet.id))
             if (
                 packet.decoded.portnum == portnums_pb2.NEIGHBORINFO_APP
-                and packet_key in self._manual_neighbor_info_response_packets
+                and packet_key in self._neighbor_info_response_provenance
             ):
-                self._manual_neighbor_info_response_packets.discard(packet_key)
-                decoded["neighborInfoProvenance"] = "manual_request"
+                decoded["neighborInfoProvenance"] = (
+                    self._neighbor_info_response_provenance.pop(packet_key)
+                )
             result["decoded"] = decoded
         self._packet_count += 1
         return result
@@ -2024,8 +2060,8 @@ class MeshtasticBluetoothClient:
                 update["neighborInfoUpdatedAt"] = int(packet.rx_time)
                 provenance = decoded.get("neighborInfoProvenance")
                 update["neighborInfoProvenance"] = (
-                    "manual_request"
-                    if provenance == "manual_request"
+                    provenance
+                    if provenance in {"manual_request", "maintenance_scan"}
                     else "passive"
                 )
         self._merge_node(source, update)
@@ -2213,7 +2249,7 @@ class MeshtasticBluetoothClient:
             self._neighbor_info_disconnect_count += 1
             self._last_neighbor_info_outcome = "disconnected"
         self._pending_neighbor_info_responses.clear()
-        self._manual_neighbor_info_response_packets.clear()
+        self._neighbor_info_response_provenance.clear()
         self._internal_admin_request_ids.clear()
         self._remote_admin_sessions.clear()
         self._remote_settings.clear()

@@ -16,6 +16,10 @@ const MESH_CARD_MAX_HEIGHT = 1200;
 const MESH_LAYOUT_SCHEMA_VERSION = 1;
 const MESH_LAYOUT_STORAGE_KEY = "meshnet.frontend.mesh-workspace-layout.v1";
 const MESH_LAYOUT_STORAGE_MAX_LENGTH = 4096;
+const GRAPH_MODES = Object.freeze(["geographic", "topology"]);
+const GRAPH_HISTORY_MAX_NODES = 100;
+const GRAPH_HISTORY_MAX_POSITIONS_PER_NODE = 25;
+const GRAPH_HISTORY_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 class MeshNetPanel extends HTMLElement {
   constructor() {
@@ -58,7 +62,9 @@ class MeshNetPanel extends HTMLElement {
     this._messageLoading = false;
     this._messageError = null;
     this._graphLimit = 50;
+    this._graphMode = "geographic";
     this._graphPositions = new Map();
+    this._geographicGraphLayout = null;
     this._graphAnimationFrame = null;
     this._graphAnimationTopology = null;
     this._graphAnimationIterations = 0;
@@ -152,6 +158,7 @@ class MeshNetPanel extends HTMLElement {
     if (this._meshLayoutInteraction) this._persistMeshCardLayout();
     this._cancelMeshLayoutInteraction();
     this._graphPositions.clear();
+    this._geographicGraphLayout = null;
     this._messages = [];
     this._messageConversation = "broadcast:0";
     this._messageLoading = false;
@@ -889,7 +896,12 @@ class MeshNetPanel extends HTMLElement {
     const hintedNodeCount = nodes.filter((node) => node._name_hint_exact_node_id === true).length;
     const favoriteLabelConfigured = snapshot.panel_metadata
       && snapshot.panel_metadata.favorite_label_configured === true;
-    const topology = this._passiveTopology(nodes, gateways, this._graphLimit);
+    const topology = this._passiveTopology(
+      nodes,
+      gateways,
+      this._graphLimit,
+      snapshot.topology_history,
+    );
     this.innerHTML = `
       <style>
         :host {
@@ -979,6 +991,8 @@ class MeshNetPanel extends HTMLElement {
         .topology-heading {
           display: flex;
           justify-content: space-between;
+          align-items: flex-start;
+          flex-wrap: wrap;
           gap: 8px;
           padding: 10px 12px;
           border-bottom: 1px solid var(--divider-color);
@@ -1005,6 +1019,9 @@ class MeshNetPanel extends HTMLElement {
         }
         .topology [data-graph-key]:active {
           cursor: grabbing;
+        }
+        .topology svg.geographic [data-graph-key] {
+          cursor: default;
         }
         .side {
           display: grid;
@@ -1319,6 +1336,30 @@ class MeshNetPanel extends HTMLElement {
         line.link { stroke: var(--divider-color); stroke-width: 1.4; }
         line.direct-link { stroke: var(--success-color, #168047); stroke-width: 2; }
         line.route-link { stroke: var(--primary-color); stroke-dasharray: 6 4; }
+        line.neighbor-link { stroke: var(--accent-color, #8e5bd9); stroke-dasharray: 3 3; }
+        line.maintenance-link { stroke-width: 2.2; stroke-dasharray: 2 5; }
+        line.unlocated-link { opacity: 0.68; }
+        polyline.location-trail {
+          fill: none;
+          stroke: var(--primary-color);
+          stroke-width: 1.5;
+          stroke-dasharray: 2 3;
+          opacity: 0.55;
+          pointer-events: none;
+        }
+        .geographic-divider {
+          stroke: var(--divider-color);
+          stroke-dasharray: 5 4;
+        }
+        .geographic-scale-line {
+          stroke: var(--primary-text-color);
+          stroke-width: 2;
+        }
+        .geographic-scale-text,
+        .geographic-rail-label {
+          fill: var(--secondary-text-color);
+          font-size: 11px;
+        }
         text.edge-distance {
           fill: var(--primary-text-color);
           stroke: var(--card-background-color);
@@ -1828,6 +1869,15 @@ class MeshNetPanel extends HTMLElement {
     if (status.status !== "cooldown") {
       return '<div class="field-help good">No persisted global traceroute cooldown is active.</div>';
     }
+    if (status.airtime_operation === "neighbor_info") {
+      return `
+        <div class="operator-card">
+          <strong>Shared metadata cooldown active</strong>
+          <div class="field-help">A NeighborInfo request currently owns the integration-wide metadata airtime slot.</div>
+          <div class="field-help">Next permitted metadata request: ${this._escape(this._timestampDisplay(status.next_allowed_at))}</div>
+        </div>
+      `;
+    }
     return `
       <div class="operator-card">
         <strong>Global cooldown active</strong>
@@ -1878,7 +1928,8 @@ class MeshNetPanel extends HTMLElement {
       <section class="panel" id="meshnet-neighbor-info-panel" data-mesh-card="neighbor-info">
         <h2>NeighborInfo request</h2>
         <div class="field-help warn"><strong>Experimental / newer firmware only.</strong> Verified on firmware 2.7.26 when Neighbor Info is enabled. Older firmware may reject or time out; the official Android app temporarily disabled this control because it was not working as expected.</div>
-        <div class="field-help">This submits one application request with no MeshNet retry. Firmware may relay or retransmit reliable traffic. MeshNet never runs it during polling, startup, or graph animation. The server enforces 180-second global and same-target cooldowns.</div>
+        <div class="field-help">This manual control submits one application request with no MeshNet retry. Firmware may relay or retransmit reliable traffic. All metadata tools share a 60-second integration-wide airtime floor; NeighborInfo also keeps the firmware's 180-second same-target floor.</div>
+        ${this._maintenanceStatusPanel()}
         <div class="operator-controls">
           <label>Bluetooth gateway
             <select id="meshnet-neighbor-info-gateway"${compatibleGateways.length && !this._neighborInfoBusy && !this._neighborInfoStatusLoading ? "" : " disabled"}>
@@ -1909,6 +1960,33 @@ class MeshNetPanel extends HTMLElement {
           <div class="operator-status ${this._neighborInfoStatusClass()}" id="meshnet-neighbor-info-status" role="status" aria-live="polite">${this._escape(this._neighborInfoStatus ? this._neighborInfoStatus.text : "")}</div>
         </div>
       </section>
+    `;
+  }
+
+  _maintenanceStatusPanel() {
+    const metadata = this._snapshot && this._snapshot.panel_metadata;
+    const status = metadata && metadata.maintenance;
+    const configure = '<a href="/config/integrations/integration/meshnet">Configure automatic maintenance</a>';
+    if (!status || typeof status !== "object" || Array.isArray(status)) {
+      return `<div class="operator-card"><strong>Automatic maintenance status unavailable</strong><div class="field-help">Automatic traceroute is never supported. ${configure} from the MeshNet integration options.</div></div>`;
+    }
+    if (status.enabled !== true) {
+      return `<div class="operator-card"><strong>Automatic maintenance is off</strong><div class="field-help">This is the default. ${configure} to opt into idle-only NeighborInfo requests. Automatic traceroute and automatic retries remain disabled.</div></div>`;
+    }
+    const next = Number.isFinite(Number(status.next_cycle_in_seconds))
+      ? this._durationDisplay(Number(status.next_cycle_in_seconds))
+      : "unknown";
+    const successes = Number.isInteger(status.request_success_count) ? status.request_success_count : 0;
+    const failures = Number.isInteger(status.request_failure_count) ? status.request_failure_count : 0;
+    const deferrals = (Number.isInteger(status.traffic_deferral_count) ? status.traffic_deferral_count : 0)
+      + (Number.isInteger(status.busy_deferral_count) ? status.busy_deferral_count : 0);
+    return `
+      <div class="operator-card">
+        <strong>Automatic idle NeighborInfo enabled</strong>
+        <div class="field-help">State: ${this._escape(String(status.last_outcome || "unknown"))}. Next cycle in ${this._escape(next)}. Requests stay at least 60 seconds apart and legitimate traffic always wins.</div>
+        <div class="field-help">Completed ${successes}; failed ${failures}; traffic/busy deferrals ${deferrals}. Automatic traceroute and automatic retries are disabled.</div>
+        <div class="field-help">${configure}</div>
+      </div>
     `;
   }
 
@@ -1961,6 +2039,7 @@ class MeshNetPanel extends HTMLElement {
       "meshnet-priority",
       "meshnet-node-sort",
       "meshnet-message-conversation",
+      "meshnet-graph-mode",
       "meshnet-graph-limit",
       "meshnet-remote-gateway",
       "meshnet-remote-target",
@@ -4878,7 +4957,7 @@ class MeshNetPanel extends HTMLElement {
       || (response.status === "cooldown" && (
         response.reserved !== true
         || response.remaining_seconds < 1
-        || gatewayId == null
+        || (gatewayId == null && response.airtime_operation !== "neighbor_info")
       ))
       || (response.status === "available" && (
         response.reserved !== false
@@ -4913,6 +4992,9 @@ class MeshNetPanel extends HTMLElement {
       remaining_seconds: response.remaining_seconds,
       result_updated_at: resultUpdatedAt,
       result,
+      airtime_operation: ["traceroute", "neighbor_info"].includes(response.airtime_operation)
+        ? response.airtime_operation
+        : null,
       loaded_at_ms: Date.now(),
     };
   }
@@ -5353,7 +5435,7 @@ class MeshNetPanel extends HTMLElement {
         scope: "integration_and_target",
         target_node: targetNode,
         status: "cooldown",
-        global_remaining_seconds: 180,
+        global_remaining_seconds: 60,
         target_remaining_seconds: 180,
         remaining_seconds: 180,
         next_allowed_at: result.next_allowed_at,
@@ -6530,6 +6612,14 @@ class MeshNetPanel extends HTMLElement {
     return `${Math.floor(seconds / 3600)}h ago`;
   }
 
+  _durationDisplay(value) {
+    const seconds = Math.max(0, Math.ceil(Number(value)));
+    if (!Number.isFinite(seconds)) return "unknown";
+    if (seconds < 60) return `${seconds}s`;
+    if (seconds < 3600) return `${Math.ceil(seconds / 60)}m`;
+    return `${Math.ceil(seconds / 3600)}h`;
+  }
+
   _selected(value, expected) {
     return String(value) === String(expected) ? " selected" : "";
   }
@@ -6896,7 +6986,7 @@ class MeshNetPanel extends HTMLElement {
     if (!routing || routing.neighbors_via_mqtt !== false) return null;
     const provenance = routing.neighbors_provenance == null
       ? "passive"
-      : ["passive", "manual_request"].includes(routing.neighbors_provenance)
+      : ["passive", "manual_request", "maintenance_scan"].includes(routing.neighbors_provenance)
         ? routing.neighbors_provenance
         : null;
     if (!provenance) return null;
@@ -6928,7 +7018,12 @@ class MeshNetPanel extends HTMLElement {
       const canonical = this._parseMeshtasticNodeId(value);
       return Boolean(canonical && value === canonical);
     }))];
-    return { source, neighbors, provenance };
+    return {
+      source,
+      neighbors,
+      provenance,
+      observed_at: new Date(observedAt).toISOString(),
+    };
   }
 
   _hopsGatewayId(node) {
@@ -6966,6 +7061,12 @@ class MeshNetPanel extends HTMLElement {
     return [20, 50, 100].includes(parsed) ? parsed : 50;
   }
 
+  _normalizeGraphMode(value) {
+    return typeof value === "string" && GRAPH_MODES.includes(value)
+      ? value
+      : "geographic";
+  }
+
   _recentGraphNodes(nodes, limit = this._graphLimit) {
     const boundedLimit = this._normalizeGraphLimit(limit);
     return (Array.isArray(nodes) ? nodes : [])
@@ -6976,6 +7077,87 @@ class MeshNetPanel extends HTMLElement {
         || left.index - right.index)
       .slice(0, boundedLimit)
       .map((item) => item.node);
+  }
+
+  _selectGraphNodes(nodes, limit, evidencePairs) {
+    const boundedLimit = this._normalizeGraphLimit(limit);
+    const ordered = (Array.isArray(nodes) ? nodes : [])
+      .filter((node) => node && node.node_key != null && String(node.node_key))
+      .map((node, index) => ({ node, index }))
+      .sort((left, right) => this._compareLastSeen(left.node, right.node)
+        || this._compareText(left.node.node_key, right.node.node_key)
+        || left.index - right.index)
+      .map((item) => item.node);
+    const byKey = new Map(ordered.map((node) => [String(node.node_key), node]));
+    const pairs = (Array.isArray(evidencePairs) ? evidencePairs : [])
+      .filter((pair) => pair && Array.isArray(pair.node_keys))
+      .map((pair, index) => ({
+        ...pair,
+        index,
+        node_keys: [...new Set(pair.node_keys.map(String))]
+          .filter((key) => byKey.has(key))
+          .slice(0, 2),
+      }))
+      .filter((pair) => pair.node_keys.length)
+      .sort((left, right) => {
+        const priority = { direct: 0, neighbor: 1, route: 2 };
+        const typeDifference = (priority[left.type] ?? 3) - (priority[right.type] ?? 3);
+        if (typeDifference) return typeDifference;
+        const timeDifference = (this._timestampMs(right.observed_at) || 0)
+          - (this._timestampMs(left.observed_at) || 0);
+        return timeDifference
+          || this._compareText(left.node_keys.join("\u0000"), right.node_keys.join("\u0000"))
+          || left.index - right.index;
+      });
+    const selected = new Set();
+    pairs.forEach((pair) => {
+      const additions = pair.node_keys.filter((key) => !selected.has(key));
+      // Never admit half of a node-to-node evidence edge. A direct edge needs
+      // only its node because the gateway has a separate bounded projection.
+      if (selected.size + additions.length > boundedLimit) return;
+      additions.forEach((key) => selected.add(key));
+    });
+    ordered.forEach((node) => {
+      if (selected.size < boundedLimit) selected.add(String(node.node_key));
+    });
+    return ordered.filter((node) => selected.has(String(node.node_key)));
+  }
+
+  _topologyLocationHistory(value, nodes, nowMs = Date.now()) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return new Map();
+    const allowedNodeKeys = new Set(
+      (Array.isArray(nodes) ? nodes : [])
+        .filter((node) => node && node.node_key != null && String(node.node_key))
+        .map((node) => String(node.node_key)),
+    );
+    const result = new Map();
+    Object.entries(value).slice(0, GRAPH_HISTORY_MAX_NODES).forEach(([nodeKey, samples]) => {
+      if (!allowedNodeKeys.has(nodeKey) || !Array.isArray(samples)) return;
+      const accepted = samples
+        .slice(-GRAPH_HISTORY_MAX_POSITIONS_PER_NODE)
+        .map((sample) => {
+          if (!sample || typeof sample !== "object" || Array.isArray(sample)) return null;
+          const observedAt = typeof sample.observed_at === "string"
+            && sample.observed_at.length <= 64
+            ? this._timestampMs(sample.observed_at)
+            : null;
+          if (observedAt == null
+            || !Number.isFinite(nowMs)
+            || nowMs - observedAt > GRAPH_HISTORY_WINDOW_MS
+            || observedAt - nowMs > 5 * 60 * 1000) return null;
+          const location = this._graphLocation(sample, {
+            zeroPairIsMissing: String(nodeKey).startsWith("meshtastic:"),
+          });
+          return location ? {
+            ...location,
+            observed_at: new Date(observedAt).toISOString(),
+          } : null;
+        })
+        .filter(Boolean)
+        .sort((left, right) => this._timestampMs(left.observed_at) - this._timestampMs(right.observed_at));
+      if (accepted.length) result.set(nodeKey, accepted);
+    });
+    return result;
   }
 
   _graphLocation(value, { zeroPairIsMissing = false } = {}) {
@@ -6997,9 +7179,12 @@ class MeshNetPanel extends HTMLElement {
   }
 
   _nodeGraphLocation(node) {
-    return this._graphLocation(node && node.location, {
+    const current = this._graphLocation(node && node.location, {
       zeroPairIsMissing: String(node && node.protocol || "").trim().toLowerCase() === "meshtastic",
     });
+    if (current) return current;
+    const trail = Array.isArray(node && node._graph_trail) ? node._graph_trail : [];
+    return trail.length ? this._graphLocation(trail[trail.length - 1]) : null;
   }
 
   _gatewayGraphLocation(gateway, nodes) {
@@ -7069,7 +7254,7 @@ class MeshNetPanel extends HTMLElement {
     return `${miles < 10 ? miles.toFixed(1) : Math.round(miles)} mi`;
   }
 
-  _passiveTopology(nodes, gateways, limit) {
+  _passiveTopology(nodes, gateways, limit, topologyHistory = null) {
     const allNodes = nodes.filter(
       (node) => node && node.node_key != null && String(node.node_key),
     );
@@ -7079,6 +7264,9 @@ class MeshNetPanel extends HTMLElement {
     const allAliases = this._aliasIndex(allNodes);
     const evidenceNodes = new Set();
     const evidenceGateways = new Set();
+    const gatewayEvidenceTimes = new Map();
+    const evidencePairs = [];
+    const locationHistory = this._topologyLocationHistory(topologyHistory, allNodes);
 
     allNodes.forEach((node) => {
       const hops = node.connectivity && node.connectivity.hops;
@@ -7086,6 +7274,17 @@ class MeshNetPanel extends HTMLElement {
       if (typeof hops === "number" && Number.isFinite(hops) && hops === 0 && gatewayId) {
         evidenceNodes.add(String(node.node_key));
         evidenceGateways.add(gatewayId);
+        const directObservedAt = this._timestampMs(node.last_heard) || 0;
+        gatewayEvidenceTimes.set(
+          gatewayId,
+          Math.max(gatewayEvidenceTimes.get(gatewayId) || 0, directObservedAt),
+        );
+        evidencePairs.push({
+          node_keys: [String(node.node_key)],
+          type: "direct",
+          observed_at: node.last_heard,
+          gateway_id: gatewayId,
+        });
       }
       const route = this._routeIdentifiers(node);
       if (route) {
@@ -7095,6 +7294,11 @@ class MeshNetPanel extends HTMLElement {
           if (left && right && left !== right) {
             evidenceNodes.add(left);
             evidenceNodes.add(right);
+            evidencePairs.push({
+              node_keys: [left, right],
+              type: "route",
+              observed_at: node.last_heard,
+            });
           }
         }
       }
@@ -7106,13 +7310,35 @@ class MeshNetPanel extends HTMLElement {
         if (source && target && source !== target) {
           evidenceNodes.add(source);
           evidenceNodes.add(target);
+          evidencePairs.push({
+            node_keys: [source, target],
+            type: "neighbor",
+            observed_at: neighborEvidence.observed_at,
+          });
         }
       });
     });
 
+    const orderedGateways = [...allGateways].sort((left, right) => {
+      const leftGatewayId = String(left.gateway_id);
+      const rightGatewayId = String(right.gateway_id);
+      const evidenceDifference = Number(evidenceGateways.has(rightGatewayId))
+        - Number(evidenceGateways.has(leftGatewayId));
+      return evidenceDifference
+        || (gatewayEvidenceTimes.get(rightGatewayId) || 0)
+          - (gatewayEvidenceTimes.get(leftGatewayId) || 0)
+        || this._compareText(left.name || left.gateway_id, right.name || right.gateway_id)
+        || this._compareText(left.gateway_id, right.gateway_id);
+    });
+    const visibleGatewayIds = new Set(
+      orderedGateways.slice(0, 8).map((gateway) => String(gateway.gateway_id)),
+    );
+    const selectableEvidencePairs = evidencePairs.filter((pair) => (
+      pair.type !== "direct" || visibleGatewayIds.has(String(pair.gateway_id || ""))
+    ));
     const explicitLimit = arguments.length >= 3;
     const orderedNodes = explicitLimit
-      ? this._recentGraphNodes(allNodes, limit)
+      ? this._selectGraphNodes(allNodes, limit, selectableEvidencePairs)
       : this._sortNodes(allNodes, "favorites_recent").sort((left, right) => {
         const evidenceDifference = Number(evidenceNodes.has(String(right.node_key)))
           - Number(evidenceNodes.has(String(left.node_key)));
@@ -7121,14 +7347,11 @@ class MeshNetPanel extends HTMLElement {
     // Calls from older extensions omitted the limit and retain the historical
     // 36-node projection. The built-in panel always supplies its 20/50/100
     // selector value.
-    const visibleNodes = explicitLimit ? orderedNodes : orderedNodes.slice(0, 36);
-    const orderedGateways = [...allGateways].sort((left, right) => {
-      const evidenceDifference = Number(evidenceGateways.has(String(right.gateway_id)))
-        - Number(evidenceGateways.has(String(left.gateway_id)));
-      return evidenceDifference
-        || this._compareText(left.name || left.gateway_id, right.name || right.gateway_id)
-        || this._compareText(left.gateway_id, right.gateway_id);
-    });
+    const visibleNodes = (explicitLimit ? orderedNodes : orderedNodes.slice(0, 36))
+      .map((node) => ({
+        ...node,
+        _graph_trail: locationHistory.get(String(node.node_key)) || [],
+      }));
     const visibleGateways = orderedGateways.slice(0, 8).map((gateway) => ({
       ...gateway,
       _graph_location: this._gatewayGraphLocation(gateway, allNodes),
@@ -7147,14 +7370,17 @@ class MeshNetPanel extends HTMLElement {
     const edges = [];
     const edgeKeys = new Set();
     const edgeByKey = new Map();
+    const provenancePriority = { passive: 0, maintenance_scan: 1, manual_request: 2 };
     const addEdge = (from, to, type, { provenance = null } = {}) => {
       if (!from || !to || from === to) return;
       const endpoints = [from, to].sort();
       const key = `${type}:${endpoints[0]}:${endpoints[1]}`;
       if (edgeKeys.has(key)) {
         const existing = edgeByKey.get(key);
-        if (existing && provenance === "manual_request") {
-          existing.provenance = "manual_request";
+        if (existing
+          && (provenancePriority[provenance] ?? -1)
+            > (provenancePriority[existing.provenance] ?? -1)) {
+          existing.provenance = provenance;
         }
         return;
       }
@@ -7210,13 +7436,180 @@ class MeshNetPanel extends HTMLElement {
       edges,
       totalNodes: allNodes.length,
       totalGateways: allGateways.length,
+      omittedDirectConnections: evidencePairs.filter((pair) => (
+        pair.type === "direct"
+        && (
+          pair.node_keys.some((key) => !visibleAliases.has(key))
+          || !gatewayKeys.has(String(pair.gateway_id || ""))
+        )
+      )).length,
+    };
+  }
+
+  _niceGraphScale(metersPerPixel, maximumPixels = 150) {
+    if (typeof metersPerPixel !== "number"
+      || !Number.isFinite(metersPerPixel)
+      || metersPerPixel <= 0
+      || typeof maximumPixels !== "number"
+      || !Number.isFinite(maximumPixels)
+      || maximumPixels < 20) return null;
+    const targetMeters = metersPerPixel * maximumPixels;
+    const magnitude = 10 ** Math.floor(Math.log10(targetMeters));
+    const multiplier = [5, 2, 1].find((candidate) => candidate * magnitude <= targetMeters) || 1;
+    const meters = multiplier * magnitude;
+    const metric = this._hass
+      && this._hass.config
+      && this._hass.config.unit_system
+      && this._hass.config.unit_system.length === "km";
+    let label;
+    if (metric) {
+      label = meters >= 1000
+        ? `${Number((meters / 1000).toPrecision(3))} km`
+        : `${Math.round(meters)} m`;
+    } else {
+      const miles = meters / 1609.344;
+      label = miles >= 0.1
+        ? `${Number(miles.toPrecision(2))} mi`
+        : `${Math.max(1, Math.round(meters * 3.28084))} ft`;
+    }
+    return { meters, pixels: meters / metersPerPixel, label };
+  }
+
+  _geographicGraphPositions(topology, width = 1000, height = 640) {
+    const safeWidth = Math.max(320, this._finiteGraphNumber(width, 1000));
+    const safeHeight = Math.max(240, this._finiteGraphNumber(height, 640));
+    const endpointLocations = new Map();
+    const trails = new Map();
+    (Array.isArray(topology && topology.nodes) ? topology.nodes : []).forEach((node) => {
+      const key = `node:${node.node_key}`;
+      const trail = (Array.isArray(node._graph_trail) ? node._graph_trail : [])
+        .map((sample) => this._graphLocation(sample))
+        .filter(Boolean);
+      const current = this._graphLocation(node && node.location, {
+        zeroPairIsMissing: String(node && node.protocol || "").trim().toLowerCase() === "meshtastic",
+      });
+      if (current && (!trail.length
+        || current.latitude !== trail[trail.length - 1].latitude
+        || current.longitude !== trail[trail.length - 1].longitude)) {
+        trail.push(current);
+      }
+      endpointLocations.set(key, current || (trail.length ? trail[trail.length - 1] : null));
+      if (trail.length) trails.set(key, trail);
+    });
+    (Array.isArray(topology && topology.gateways) ? topology.gateways : []).forEach((gateway) => {
+      endpointLocations.set(`gateway:${gateway.gateway_id}`, gateway._graph_location || null);
+    });
+    const keys = [...endpointLocations.keys()];
+    const locatedKeys = new Set(keys.filter((key) => endpointLocations.get(key)));
+    const unlocatedKeys = keys.filter((key) => !locatedKeys.has(key)).sort(this._compareText.bind(this));
+    const railHeight = unlocatedKeys.length ? Math.min(148, Math.max(92, safeHeight * 0.2)) : 0;
+    const padding = 52;
+    const mapHeight = Math.max(100, safeHeight - railHeight - padding * 2);
+    const mapWidth = Math.max(100, safeWidth - padding * 2);
+    const samples = [];
+    endpointLocations.forEach((location) => { if (location) samples.push(location); });
+    trails.forEach((trail) => trail.forEach((location) => samples.push(location)));
+
+    const radians = (degrees) => degrees * Math.PI / 180;
+    const longitudeReference = samples.length
+      ? Math.atan2(
+        samples.reduce((sum, sample) => sum + Math.sin(radians(sample.longitude)), 0),
+        samples.reduce((sum, sample) => sum + Math.cos(radians(sample.longitude)), 0),
+      ) * 180 / Math.PI
+      : 0;
+    const latitudeReference = samples.length
+      ? samples.reduce((sum, sample) => sum + sample.latitude, 0) / samples.length
+      : 0;
+    const cosine = Math.max(0.01, Math.abs(Math.cos(radians(latitudeReference))));
+    const longitudeDelta = (longitude) => {
+      let delta = longitude - longitudeReference;
+      while (delta > 180) delta -= 360;
+      while (delta < -180) delta += 360;
+      return delta;
+    };
+    const projectMeters = (location) => ({
+      x: 6371008.8 * radians(longitudeDelta(location.longitude)) * cosine,
+      y: 6371008.8 * radians(location.latitude - latitudeReference),
+    });
+    const worldSamples = samples.map(projectMeters);
+    const xs = worldSamples.map((point) => point.x);
+    const ys = worldSamples.map((point) => point.y);
+    const minimumX = xs.length ? Math.min(...xs) : -804.672;
+    const maximumX = xs.length ? Math.max(...xs) : 804.672;
+    const minimumY = ys.length ? Math.min(...ys) : -804.672;
+    const maximumY = ys.length ? Math.max(...ys) : 804.672;
+    // A minimum one-mile square keeps one/coincident fixes readable while x
+    // and y always retain the same physical scale.
+    const spanX = Math.max(1609.344, maximumX - minimumX);
+    const spanY = Math.max(1609.344, maximumY - minimumY);
+    const metersPerPixel = Math.max(1, spanX * 1.12 / mapWidth, spanY * 1.12 / mapHeight);
+    const centerX = (minimumX + maximumX) / 2;
+    const centerY = (minimumY + maximumY) / 2;
+    const toCanvas = (location) => {
+      const point = projectMeters(location);
+      return {
+        x: safeWidth / 2 + (point.x - centerX) / metersPerPixel,
+        y: padding + mapHeight / 2 - (point.y - centerY) / metersPerPixel,
+        vx: 0,
+        vy: 0,
+        fixed: true,
+        geographic: true,
+      };
+    };
+    const positions = new Map();
+    endpointLocations.forEach((location, key) => {
+      if (location) positions.set(key, toCanvas(location));
+    });
+    const trailPoints = new Map();
+    trails.forEach((trail, key) => {
+      const points = trail.map(toCanvas);
+      if (points.length >= 2) trailPoints.set(key, points);
+    });
+    if (unlocatedKeys.length) {
+      const columns = Math.max(1, Math.min(10, unlocatedKeys.length));
+      const rows = Math.ceil(unlocatedKeys.length / columns);
+      const railTop = safeHeight - railHeight;
+      unlocatedKeys.forEach((key, index) => {
+        const column = index % columns;
+        const row = Math.floor(index / columns);
+        positions.set(key, {
+          x: padding + (column + 0.5) * mapWidth / columns,
+          y: railTop + 24 + (row + 0.5) * Math.max(1, (railHeight - 48) / rows),
+          vx: 0,
+          vy: 0,
+          fixed: true,
+          geographic: false,
+        });
+      });
+    }
+    return {
+      positions,
+      trailPoints,
+      locatedKeys,
+      unlocatedKeys: new Set(unlocatedKeys),
+      railTop: unlocatedKeys.length ? safeHeight - railHeight : null,
+      scale: samples.length ? this._niceGraphScale(metersPerPixel) : null,
+      metersPerPixel,
+      hasLocations: samples.length > 0,
     };
   }
 
   _graph(topology) {
     const width = 1000;
     const height = 640;
-    const points = this._ensureGraphPositions(topology, width, height);
+    const mode = this._normalizeGraphMode(this._graphMode);
+    let geographic = null;
+    let points;
+    if (mode === "geographic") {
+      geographic = this._geographicGraphPositions(topology, width, height);
+      this._geographicGraphLayout = geographic;
+      this._graphPositions = geographic.positions;
+      points = geographic.positions;
+    } else {
+      if (this._geographicGraphLayout) this._graphPositions.clear();
+      this._geographicGraphLayout = null;
+      points = this._ensureGraphPositions(topology, width, height);
+    }
     const shown = topology.totalNodes > topology.nodes.length
       ? `Showing ${topology.nodes.length} of ${topology.totalNodes} nodes`
       : `${topology.nodes.length} nodes`;
@@ -7224,14 +7617,48 @@ class MeshNetPanel extends HTMLElement {
       (gateway) => gateway._graph_location
         && gateway._graph_location.source === "home_assistant_fallback",
     ).length;
+    const geographicNote = geographic
+      ? geographic.hasLocations
+        ? "Located nodes and trails use one equal local map scale. The unlocated rail is explicitly not to scale."
+        : "No precise cached locations are available; all endpoints are in the unlocated, not-to-scale rail."
+      : "Physical distance changes bounded spring length only; pixels are not meters.";
+    const omittedDirect = Number.isSafeInteger(topology.omittedDirectConnections)
+      ? topology.omittedDirectConnections
+      : 0;
+    const geographicDecoration = geographic ? `
+      ${[...geographic.trailPoints.entries()].map(([key, trail]) => (
+        `<polyline class="location-trail" data-graph-trail="${this._escape(key)}" points="${trail.map((point) => `${point.x},${point.y}`).join(" ")}"><title>Validated cached positions from the last 24 hours</title></polyline>`
+      )).join("")}
+      ${geographic.railTop == null ? "" : `
+        <line class="geographic-divider" x1="24" y1="${geographic.railTop}" x2="${width - 24}" y2="${geographic.railTop}"></line>
+        <text class="geographic-rail-label" x="32" y="${geographic.railTop + 17}">Unlocated endpoints — not to scale</text>
+      `}
+      ${geographic.scale ? `
+        <g class="geographic-scale" aria-label="Map scale ${this._escape(geographic.scale.label)}">
+          <line class="geographic-scale-line" x1="52" y1="${geographic.railTop == null ? height - 30 : geographic.railTop - 22}" x2="${52 + geographic.scale.pixels}" y2="${geographic.railTop == null ? height - 30 : geographic.railTop - 22}"></line>
+          <line class="geographic-scale-line" x1="52" y1="${geographic.railTop == null ? height - 35 : geographic.railTop - 27}" x2="52" y2="${geographic.railTop == null ? height - 25 : geographic.railTop - 17}"></line>
+          <line class="geographic-scale-line" x1="${52 + geographic.scale.pixels}" y1="${geographic.railTop == null ? height - 35 : geographic.railTop - 27}" x2="${52 + geographic.scale.pixels}" y2="${geographic.railTop == null ? height - 25 : geographic.railTop - 17}"></line>
+          <text class="geographic-scale-text" x="52" y="${geographic.railTop == null ? height - 39 : geographic.railTop - 31}">${this._escape(geographic.scale.label)}</text>
+        </g>
+      ` : ""}
+    ` : "";
     return `
       <section class="topology">
         <div class="topology-heading">
           <strong class="topology-copy">
             <span>Cached evidence topology — no traceroutes sent automatically</span>
-            <span class="topology-note">Edges are last received evidence, not a live route. NeighborInfo evidence expires after one hour; explicitly requested evidence is labeled. Distance changes spring length only.</span>
+            <span class="topology-note">Edges are last received evidence, not a live route. NeighborInfo evidence expires after one hour; manual and low-traffic maintenance reports are labeled.</span>
+            <span class="topology-note">Solid green: direct local RF · dotted purple: reported NeighborInfo · dashed blue: cached route. Maintenance NeighborInfo uses the wider dotted line.</span>
+            <span class="topology-note">${this._escape(geographicNote)}</span>
             ${fallbackCount ? `<span class="topology-note">${fallbackCount} gateway${fallbackCount === 1 ? " uses" : "s use"} Home Assistant location fallback.</span>` : ""}
+            ${omittedDirect ? `<span class="topology-note bad">${omittedDirect} direct connection${omittedDirect === 1 ? " was" : "s were"} omitted by this node limit; increase it to preserve those endpoints.</span>` : ""}
           </strong>
+          <label class="sort-control">Layout
+            <select id="meshnet-graph-mode">
+              <option value="geographic"${this._selected(mode, "geographic")}>Geographic scale</option>
+              <option value="topology"${this._selected(mode, "topology")}>Topology</option>
+            </select>
+          </label>
           <label class="sort-control">Most recent
             <select id="meshnet-graph-limit">
               ${[20, 50, 100].map((limit) => `<option value="${limit}"${this._selected(this._graphLimit, limit)}>${limit}</option>`).join("")}
@@ -7239,7 +7666,8 @@ class MeshNetPanel extends HTMLElement {
           </label>
           <span class="label">${shown} · ${topology.gateways.length} gateways</span>
         </div>
-        <svg id="meshnet-topology-graph" viewBox="0 0 ${width} ${height}" role="img" aria-label="Cached mesh evidence topology; no traceroutes sent automatically">
+        <svg class="${mode}" id="meshnet-topology-graph" viewBox="0 0 ${width} ${height}" role="img" aria-label="Cached mesh evidence ${mode === "geographic" ? "at a geographic scale" : "topology"}; no traceroutes sent automatically">
+        ${geographicDecoration}
         ${topology.edges.map((edge) => {
           const a = points.get(edge.from);
           const b = points.get(edge.to);
@@ -7251,9 +7679,19 @@ class MeshNetPanel extends HTMLElement {
           const evidence = edge.type === "neighbor"
             ? edge.provenance === "manual_request"
               ? "Requested NeighborInfo"
-              : "Fresh local-RF NeighborInfo"
+              : edge.provenance === "maintenance_scan"
+                ? "Friend-of-friend NeighborInfo reported during a low-traffic maintenance scan"
+                : "Passive friend-of-friend NeighborInfo report"
             : edge.type === "direct" ? "Direct local-RF observation" : "Cached route evidence";
-          const line = `<line class="link ${edge.type === "direct" ? "direct-link" : "route-link"}" data-graph-from="${this._escape(edge.from)}" data-graph-to="${this._escape(edge.to)}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"><title>${this._escape(`${evidence}; ${distance}`)}</title></line>`;
+          const edgeClass = edge.type === "direct"
+            ? "direct-link"
+            : edge.type === "neighbor" ? "neighbor-link" : "route-link";
+          const maintenanceClass = edge.provenance === "maintenance_scan" ? " maintenance-link" : "";
+          const unlocatedClass = geographic
+            && (!geographic.locatedKeys.has(edge.from) || !geographic.locatedKeys.has(edge.to))
+            ? " unlocated-link"
+            : "";
+          const line = `<line class="link ${edgeClass}${maintenanceClass}${unlocatedClass}" data-graph-from="${this._escape(edge.from)}" data-graph-to="${this._escape(edge.to)}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"><title>${this._escape(`${evidence}; ${distance}${unlocatedClass ? "; line crosses the not-to-scale rail" : ""}`)}</title></line>`;
           const label = miles == null ? "" : `<text class="edge-distance" aria-hidden="true" data-graph-distance-from="${this._escape(edge.from)}" data-graph-distance-to="${this._escape(edge.to)}" x="${(a.x + b.x) / 2}" y="${(a.y + b.y) / 2 - 4}">${this._escape(miles)}</text>`;
           return `${line}${label}`;
         }).join("")}
@@ -7478,6 +7916,17 @@ class MeshNetPanel extends HTMLElement {
 
   _bindGraphControls(topology) {
     if (typeof this.querySelector !== "function") return;
+    const mode = this.querySelector("#meshnet-graph-mode");
+    if (mode) {
+      mode.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
+      mode.addEventListener("change", () => {
+        this._graphMode = this._normalizeGraphMode(mode.value);
+        this._stopGraphAnimation();
+        this._graphPositions.clear();
+        this._geographicGraphLayout = null;
+        this._safeRender("render");
+      });
+    }
     const limit = this.querySelector("#meshnet-graph-limit");
     if (limit) {
       limit.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
@@ -7488,6 +7937,10 @@ class MeshNetPanel extends HTMLElement {
     }
     const svg = this.querySelector("#meshnet-topology-graph");
     if (!svg) return;
+    if (this._normalizeGraphMode(this._graphMode) === "geographic") {
+      this._stopGraphAnimation();
+      return;
+    }
     this._startGraphAnimation(topology);
     this._graphDragCleanup = this._bindGraphDrag(svg);
   }

@@ -126,12 +126,15 @@ no target and cannot reserve airtime or reach a radio.
 
 This administrator-only command submits one Meshtastic Bluetooth unicast
 application packet using the protocol's NeighborInfo request marker and the
-connected radio's configured LoRa hop limit, with no MeshNet retry. The server reserves
-persisted 180-second integration-wide and same-target cooldowns before RF.
-There is no service, automatic caller, broadcast, batch,
-or retry path. No response is a bounded unknown outcome and still consumes both
-reservations. The selected gateway itself and nodes not observed in the active
-radio session are rejected before reservation.
+connected radio's configured LoRa hop limit, with no MeshNet retry. Before RF,
+the server atomically reserves the persisted integration-wide 60-second metadata
+airtime floor shared with traceroute and a 180-second floor for the same exact
+NeighborInfo target. There is no Home Assistant service, broadcast, generic
+batch, scheduled-message form, or manual retry path. No response is a bounded
+unknown outcome and still consumes the applicable reservations. The selected
+gateway itself and nodes not observed in the active radio session are rejected
+before reservation. A separately configured opt-in maintenance scheduler is the
+only non-manual caller and uses this same validated request boundary.
 
 This request path is experimental and verified against Meshtastic firmware
 2.7.26. The target must have the Neighbor Info module enabled; older firmware
@@ -166,8 +169,77 @@ without sending RF:
 
 The result includes global, target, and effective next-allowed timestamps and
 remaining seconds, plus at most ten neighbors from the last bounded response.
-That response is tagged `manual_request`; unsolicited and legacy NeighborInfo
-evidence remains `passive`.
+Responses are tagged `manual_request` or `maintenance_scan` according to the
+validated caller; unsolicited and legacy NeighborInfo evidence remains
+`passive`.
+
+## Automatic Idle NeighborInfo Maintenance
+
+Automatic maintenance has no direct WebSocket command or Home Assistant
+service. It is off by default and can be enabled only through **Settings →
+Devices & services → MeshNet → Configure → Automatic network maintenance**.
+The operator must select one exact configured Meshtastic Bluetooth gateway.
+
+The accepted options are bounded as follows:
+
+| Option | Default | Accepted values |
+| --- | ---: | --- |
+| Enabled | `false` | Boolean |
+| Cycle interval | `3600` | `3600`–`86400` seconds |
+| Quiet time | `120` | `60`–`3600` seconds |
+| Maximum requests per cycle | `10` | `1`–`60` |
+
+The first cycle and every post-resume cycle wait one full interval. A scheduler
+tick invokes at most one exact-target request; requests remain at least 60
+seconds apart and also pass the durable shared-metadata and 180-second
+same-target reservations described above. Inbound traffic and foreground,
+outbox, reconnect, gateway-settings, remote-admin, manual-tool, BLE-operation,
+reload, and shutdown owners defer a cycle without a deadline. Missed intervals
+do not accumulate, and a selected target is not retried in the same cycle after
+failure, timeout, cooldown, or a late zero-RF idle rejection.
+
+Targets must be exact, unambiguous, online Meshtastic identities observed
+through the selected connected BLE gateway in the current radio session.
+Cached-only, MQTT-only, self, other-gateway, and ambiguous records are excluded.
+The scheduler can invoke NeighborInfo only; automatic traceroute and automatic
+retry are fixed as unsupported.
+
+The existing `meshnet/snapshot` response may contain this identity-free object
+under `panel_metadata.maintenance`:
+
+```json
+{
+  "enabled": true,
+  "accepting": true,
+  "task_state": "pending",
+  "cycle_active": false,
+  "last_outcome": "not_due",
+  "interval_seconds": 3600,
+  "quiet_seconds": 120,
+  "request_spacing_seconds": 60,
+  "max_requests_per_cycle": 10,
+  "next_cycle_in_seconds": 2400,
+  "last_activity_age_seconds": 30,
+  "request_attempt_count": 0,
+  "request_success_count": 0,
+  "request_failure_count": 0,
+  "traffic_deferral_count": 0,
+  "busy_deferral_count": 0,
+  "configuration_valid": true,
+  "gateway_configured": true,
+  "automatic_traceroute_supported": false,
+  "automatic_retry_supported": false
+}
+```
+
+This projection intentionally contains no selected gateway or target identity,
+node/name/address, raw result, or exception string. Reading the snapshot or a
+downloaded diagnostic report performs no RF operation. The per-target
+`meshnet/neighbor_info/status` command remains administrator-only and can show
+the exact target and its last sanitized result without transmitting.
+
+See [Automatic Network Maintenance](NETWORK_MAINTENANCE.md) for target rotation,
+traffic gates, lifecycle, privacy, and uninstall behavior.
 
 ## Remote Node Settings
 

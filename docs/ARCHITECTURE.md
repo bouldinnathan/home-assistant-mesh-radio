@@ -386,17 +386,78 @@ Its admin-only status command reads the persisted cooldown and bounded last
 result without sending RF. No service, poller, reconnect task, or automatic
 graph path can invoke traceroute.
 
-The NeighborInfo command is similarly manual and administrator-only. Its
-SQLite reservation combines 180-second integration-wide and same-target floors
-shared across gateways. The BLE client sends one exact unicast request marker
-using the radio's configured LoRa hop limit, accepts only a local non-MQTT
-source/to/channel/request-ID correlated response, caps it at ten neighbors, and
-never retries. Its status endpoint reads the
-persisted cooldown and sanitized result without reaching a radio. Firmware
+The manual NeighborInfo command is administrator-only. Its SQLite transaction
+uses the integration-wide 60-second metadata airtime floor shared with
+traceroute plus a 180-second same-target floor shared across gateways. The BLE
+client sends one exact unicast request marker using the radio's configured LoRa
+hop limit, accepts only a local non-MQTT source/to/channel/request-ID correlated
+response, caps it at ten neighbors, and never retries. Its status endpoint reads
+the persisted cooldown and sanitized result without reaching a radio. Firmware
 2.7.26 is the verified request implementation and the target module must be
 enabled; older firmware may reject or time out. A response is cached zero-hop
 evidence rather than a live scan, and a timeout is never projected as zero
-neighbors. Every post-reservation outcome consumes both reservations.
+neighbors. Every post-reservation outcome consumes the applicable reservations.
+The only non-manual caller is the separately opt-in idle scheduler below; there
+is still no NeighborInfo Home Assistant service, broadcast, or generic batch
+API.
+
+## Idle NeighborInfo Maintenance Scheduler
+
+Files:
+
+```text
+custom_components/meshnet/maintenance_scan.py
+custom_components/meshnet/coordinator.py
+custom_components/meshnet/store.py
+```
+
+`MaintenanceScanScheduler` is coordinator-agnostic. Its owner injects a
+candidate selector, one NeighborInfo request callback, a foreground-busy gate,
+a monotonic clock, and the config-entry task factory. The selector receives an
+immutable set of candidates already seen in the active cycle. The scheduler
+owns one recurring task, one serialized tick lock, one wake event, and no child
+request/retry task.
+
+Maintenance is disabled by default. The config flow accepts only one exact
+configured Meshtastic Bluetooth gateway and bounds interval, quiet time, and
+cycle budget to 3,600–86,400 seconds, 60–3,600 seconds, and 1–60 requests. The
+defaults are one hour, 120 seconds, and ten requests. The first due time and
+every resume due time are one full configured interval in the future. Each tick
+can cross the request boundary once at most, and request attempts are spaced by
+the fixed 60-second floor. Completing or abandoning a cycle schedules the next
+one from that completion time; elapsed intervals are never replayed.
+
+The coordinator records a monotonic activity generation for inbound packets,
+ordinary node updates, sends, refreshes, manual metadata tools, gateway settings,
+remote administration, and outbox replay. Gateway startup/reconnect, pending
+sends, outbox flush, manual traceroute, gateway/remote settings, BLE operations,
+reload, and shutdown also hold the busy gate. Traffic may therefore defer a
+cycle indefinitely. The scheduler checks generation, quiet time, and busy state
+before and after asynchronous candidate selection. The provider callback takes
+a final generation/busy guard before RF submission; a late race after SQLite
+reservation consumes that reservation and sends no retry.
+
+Candidates are exact canonical, unambiguous, online Meshtastic nodes observed
+through the selected connected BLE gateway in the current session. MQTT-only,
+cached-only, other-gateway, self, malformed, and identity-collision records are
+excluded. Fair rotation orders never-attempted nodes before the oldest retained
+NeighborInfo attempt. A candidate becomes excluded as soon as it is selected
+and remains excluded for that cycle after a timeout, failure, late busy race,
+cooldown, or zero-RF rejection. No result can trigger a same-cycle retry or a
+catch-up cycle.
+
+Automatic requests reuse `_async_manual_neighbor_info` with
+`maintenance_scan` provenance and the same durable 60-second shared metadata
+and 180-second same-target reservations as the manual path. They cannot call
+traceroute. The graph distinguishes `maintenance_scan`, `manual_request`, and
+`passive` NeighborInfo evidence.
+
+Reload/unload fences new radio work and cancels and drains the scheduler before
+resume. Resume is rejected while an old owner remains and re-arms a full
+interval. Diagnostics and panel metadata project only fixed booleans, timing,
+task/outcome values, and aggregate counters—never gateway IDs, target IDs,
+provider exceptions, or response content. See [Automatic Network
+Maintenance](NETWORK_MAINTENANCE.md) for the operator contract.
 
 ## Setup Tools
 
@@ -434,12 +495,15 @@ Purpose:
   preview/confirmation/readback boundary.
 - Treat a settings-write timeout as an unknown outcome and never retry it
   automatically.
-- Treat topology as cached evidence with explicit `passive` or
-  `manual_request` provenance: never infer node-to-node links from a shared
-  gateway observation.
+- Treat topology as cached evidence with explicit `passive`, `manual_request`,
+  or `maintenance_scan` provenance: never infer node-to-node links from a
+  shared gateway observation.
 - Do not expose automatic traceroute. The admin-only manual WebSocket command
   uses a backend-persisted integration-wide floor of 60 seconds, with no
   startup, polling, refresh, graph-fill, service, or retry trigger.
+- Keep automatic NeighborInfo off by default, BLE-only, exact-target-only,
+  hourly or slower, idle-gated, bounded per cycle, and subject to the shared
+  metadata and same-target floors. It must have no catch-up or retry path.
 
 ## Isolation Boundary
 

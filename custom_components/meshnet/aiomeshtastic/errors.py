@@ -29,6 +29,7 @@ class MeshtasticNeighborInfoError(MeshtasticConfigurationError):
     _CODES = frozenset(
         {
             "neighbor_info_disconnected",
+            "neighbor_info_lifecycle_changed",
             "neighbor_info_rejected",
             "neighbor_info_send_failed",
             "neighbor_info_timeout",

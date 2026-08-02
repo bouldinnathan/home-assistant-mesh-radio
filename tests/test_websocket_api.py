@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
 
@@ -27,6 +27,7 @@ from custom_components.meshnet.websocket_api import (  # noqa: E402
     _FAVORITE_LABEL_NAME,
     _async_panel_operation,
     _panel_node,
+    _safe_maintenance_status,
     _snapshot_with_panel_metadata,
     websocket_messages,
     websocket_panel_log,
@@ -652,6 +653,83 @@ def test_panel_snapshot_omits_raw_provider_state_and_unused_telemetry(
         "raw-provider-secret",
     ):
         assert secret not in serialized
+
+
+def test_panel_snapshot_bounds_day_trails_and_maintenance_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only recent validated coordinates and identity-free scheduler state cross WS."""
+    monkeypatch.setattr(
+        lr,
+        "async_get",
+        lambda _hass: SimpleNamespace(async_get_label_by_name=lambda _name: None),
+    )
+    coordinator = _coordinator()
+    now = datetime.now(UTC)
+    coordinator.topology_history_for_node = MagicMock(
+        return_value=[
+            {
+                "observed_at": (now - timedelta(hours=25)).isoformat(),
+                "latitude": 40.0,
+                "longitude": -86.0,
+            },
+            {
+                "observed_at": (now - timedelta(hours=1)).isoformat(),
+                "latitude": 41.1,
+                "longitude": -87.1,
+                "precision_bits": 14,
+                "private": "must-not-cross",
+            },
+            {
+                "observed_at": now.isoformat(),
+                "latitude": float("nan"),
+                "longitude": -87.2,
+            },
+        ]
+    )
+    coordinator.maintenance_panel_status = MagicMock(
+        return_value={
+            "enabled": True,
+            "accepting": True,
+            "task_state": "pending",
+            "cycle_active": False,
+            "last_outcome": "not_due",
+            "interval_seconds": 3600.0,
+            "quiet_seconds": 120.0,
+            "request_spacing_seconds": 60.0,
+            "max_requests_per_cycle": 10,
+            "next_cycle_in_seconds": 3000.0,
+            "last_activity_age_seconds": 600.0,
+            "request_attempt_count": 2,
+            "request_success_count": 1,
+            "request_failure_count": 1,
+            "traffic_deferral_count": 4,
+            "busy_deferral_count": 3,
+            "configuration_valid": True,
+            "gateway_configured": True,
+            "automatic_traceroute_supported": False,
+            "automatic_retry_supported": False,
+        }
+    )
+
+    result = _snapshot_with_panel_metadata(object(), coordinator)
+
+    assert result["topology_history"][FAVORITE_NODE] == [
+        {
+            "observed_at": (now - timedelta(hours=1)).isoformat(),
+            "latitude": 41.1,
+            "longitude": -87.1,
+            "precision_bits": 14,
+        }
+    ]
+    maintenance = result["panel_metadata"]["maintenance"]
+    assert maintenance["enabled"] is True
+    assert maintenance["automatic_traceroute_supported"] is False
+    assert "private" not in json.dumps(result)
+
+    poisoned = dict(maintenance)
+    poisoned["target_node"] = "private-node"
+    assert _safe_maintenance_status(poisoned) == maintenance
 
 
 def test_panel_snapshot_caps_recurring_projection_without_mutating_source(

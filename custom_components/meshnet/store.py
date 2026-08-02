@@ -6,7 +6,7 @@ import asyncio
 import json
 import math
 import sqlite3
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -155,6 +155,56 @@ class MeshStore:
         )
         await self._execute(
             """
+            CREATE TABLE IF NOT EXISTS metadata_airtime (
+                scope TEXT PRIMARY KEY,
+                reserved_at TEXT NOT NULL,
+                next_allowed_at TEXT NOT NULL,
+                operation TEXT NOT NULL
+            )
+            """
+        )
+        # Upgrade an existing database without opening a one-time gap between
+        # the previously separate traceroute and NeighborInfo cooldowns.  The
+        # most conservative legacy reservation wins; an expired row is
+        # harmless and will be replaced by the next successful reservation.
+        await self._execute(
+            """
+            INSERT OR IGNORE INTO metadata_airtime(
+                scope, reserved_at, next_allowed_at, operation
+            )
+            SELECT 'integration', reserved_at, next_allowed_at, operation
+            FROM (
+                SELECT
+                    reserved_at,
+                    next_allowed_at,
+                    'traceroute' AS operation
+                FROM traceroutes
+                UNION ALL
+                SELECT
+                    reserved_at,
+                    global_next_allowed_at AS next_allowed_at,
+                    'neighbor_info' AS operation
+                FROM neighbor_info_requests
+            )
+            ORDER BY next_allowed_at DESC, reserved_at DESC
+            LIMIT 1
+            """
+        )
+        await self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS graph_position_observations (
+                node_key TEXT NOT NULL,
+                bucket_start TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                latitude REAL NOT NULL,
+                longitude REAL NOT NULL,
+                precision_bits INTEGER,
+                PRIMARY KEY(node_key, bucket_start)
+            )
+            """
+        )
+        await self._execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_messages_timestamp
             ON messages(timestamp)
             """
@@ -163,6 +213,12 @@ class MeshStore:
             """
             CREATE INDEX IF NOT EXISTS idx_packets_timestamp
             ON packets(timestamp)
+            """
+        )
+        await self._execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_graph_positions_observed_at
+            ON graph_position_observations(observed_at)
             """
         )
 
@@ -631,7 +687,7 @@ class MeshStore:
         reserved_at_text = timestamp_to_json(reserved_at)
         next_allowed_text = timestamp_to_json(next_allowed)
 
-        def reserve(conn: sqlite3.Connection) -> bool:
+        def reserve_body(conn: sqlite3.Connection) -> bool:
             # Traceroute is intentionally integration-wide, not per target.
             # One recent transmission blocks every gateway and destination so a
             # user cannot walk a node list and create rude network traffic.
@@ -644,8 +700,43 @@ class MeshStore:
                 """,
                 (reserved_at_text,),
             ).fetchone()
-            if active is not None:
+            legacy_neighbor_active = conn.execute(
+                """
+                SELECT 1
+                FROM neighbor_info_requests
+                WHERE global_next_allowed_at > ?
+                LIMIT 1
+                """,
+                (reserved_at_text,),
+            ).fetchone()
+            metadata_active = conn.execute(
+                """
+                SELECT 1
+                FROM metadata_airtime
+                WHERE scope = 'integration' AND next_allowed_at > ?
+                LIMIT 1
+                """,
+                (reserved_at_text,),
+            ).fetchone()
+            if (
+                active is not None
+                or legacy_neighbor_active is not None
+                or metadata_active is not None
+            ):
                 return False
+            conn.execute(
+                """
+                INSERT INTO metadata_airtime(
+                    scope, reserved_at, next_allowed_at, operation
+                )
+                VALUES('integration', ?, ?, 'traceroute')
+                ON CONFLICT(scope) DO UPDATE SET
+                    reserved_at=excluded.reserved_at,
+                    next_allowed_at=excluded.next_allowed_at,
+                    operation=excluded.operation
+                """,
+                (reserved_at_text, next_allowed_text),
+            )
             cursor = conn.execute(
                 """
                 INSERT INTO traceroutes(
@@ -666,6 +757,12 @@ class MeshStore:
                 ),
             )
             return cursor.rowcount == 1
+
+        def reserve(conn: sqlite3.Connection) -> bool:
+            return self._run_immediate_transaction(
+                conn,
+                lambda: reserve_body(conn),
+            )
 
         reserved = bool(await self._run_serialized(reserve))
         status = await self.async_get_traceroute_status(
@@ -723,6 +820,7 @@ class MeshStore:
         """Return one active, or otherwise latest, sanitized reservation."""
         current = self._traceroute_now(now)
         current_text = timestamp_to_json(current)
+        shared_airtime = await self.async_metadata_airtime_status(now=current)
         row = await self._fetchone(
             """
             SELECT
@@ -744,7 +842,7 @@ class MeshStore:
             (current_text, current_text),
         )
         if row is None:
-            return {
+            return self._with_shared_airtime({
                 "schema_version": 1,
                 "scope": "integration",
                 "reserved": False,
@@ -756,7 +854,7 @@ class MeshStore:
                 "remaining_seconds": 0,
                 "result_updated_at": None,
                 "result": None,
-            }
+            }, shared_airtime)
         next_allowed = parse_timestamp(row["next_allowed_at"])
         remaining = (
             max(0, math.ceil((next_allowed - current).total_seconds()))
@@ -772,7 +870,7 @@ class MeshStore:
                 decoded = None
             if isinstance(decoded, dict):
                 result = self._safe_traceroute_result(decoded)
-        return {
+        return self._with_shared_airtime({
             "schema_version": 1,
             "scope": "integration",
             "reserved": remaining > 0,
@@ -784,7 +882,80 @@ class MeshStore:
             "remaining_seconds": remaining,
             "result_updated_at": row["result_updated_at"],
             "result": result,
+        }, shared_airtime)
+
+    async def async_metadata_airtime_status(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Return the identity-free shared metadata request cooldown."""
+        current = self._traceroute_now(now)
+        row = await self._fetchone(
+            """
+            SELECT reserved_at, next_allowed_at, operation
+            FROM metadata_airtime
+            WHERE scope = 'integration'
+            LIMIT 1
+            """
+        )
+        next_allowed = (
+            parse_timestamp(row["next_allowed_at"])
+            if row is not None
+            else None
+        )
+        remaining = (
+            max(0, math.ceil((next_allowed - current).total_seconds()))
+            if next_allowed is not None
+            else 0
+        )
+        operation = row["operation"] if row is not None else None
+        if operation not in {"traceroute", "neighbor_info"}:
+            operation = None
+        return {
+            "reserved": remaining > 0,
+            "status": "cooldown" if remaining > 0 else "available",
+            "reserved_at": row["reserved_at"] if row is not None else None,
+            "next_allowed_at": (
+                row["next_allowed_at"] if row is not None else None
+            ),
+            "remaining_seconds": remaining,
+            "operation": operation,
         }
+
+    @staticmethod
+    def _with_shared_airtime(
+        status: dict[str, Any],
+        shared: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Overlay a stricter cross-operation cooldown onto public status."""
+        shared_remaining = shared.get("remaining_seconds")
+        current_remaining = status.get("remaining_seconds")
+        if (
+            isinstance(shared_remaining, int)
+            and not isinstance(shared_remaining, bool)
+            and shared_remaining > 0
+            and (
+                not isinstance(current_remaining, int)
+                or isinstance(current_remaining, bool)
+                or shared_remaining > current_remaining
+            )
+        ):
+            status["reserved"] = True
+            status["status"] = "cooldown"
+            status["remaining_seconds"] = shared_remaining
+            status["reserved_at"] = shared.get("reserved_at")
+            status["next_allowed_at"] = shared.get("next_allowed_at")
+            status["airtime_operation"] = shared.get("operation")
+            if "global_remaining_seconds" in status:
+                status["global_remaining_seconds"] = max(
+                    int(status.get("global_remaining_seconds") or 0),
+                    shared_remaining,
+                )
+                status["global_next_allowed_at"] = shared.get(
+                    "next_allowed_at"
+                )
+        return status
 
     async def async_reserve_neighbor_info_request(
         self,
@@ -823,12 +994,21 @@ class MeshStore:
             reserved_at + timedelta(seconds=target_cooldown_seconds)
         )
 
-        def reserve(conn: sqlite3.Connection) -> bool:
+        def reserve_body(conn: sqlite3.Connection) -> bool:
             global_active = conn.execute(
                 """
                 SELECT 1
                 FROM neighbor_info_requests
                 WHERE global_next_allowed_at > ?
+                LIMIT 1
+                """,
+                (reserved_at_text,),
+            ).fetchone()
+            legacy_traceroute_active = conn.execute(
+                """
+                SELECT 1
+                FROM traceroutes
+                WHERE next_allowed_at > ?
                 LIMIT 1
                 """,
                 (reserved_at_text,),
@@ -842,8 +1022,35 @@ class MeshStore:
                 """,
                 (target_node, reserved_at_text),
             ).fetchone()
-            if global_active is not None or target_active is not None:
+            metadata_active = conn.execute(
+                """
+                SELECT 1
+                FROM metadata_airtime
+                WHERE scope = 'integration' AND next_allowed_at > ?
+                LIMIT 1
+                """,
+                (reserved_at_text,),
+            ).fetchone()
+            if (
+                global_active is not None
+                or target_active is not None
+                or legacy_traceroute_active is not None
+                or metadata_active is not None
+            ):
                 return False
+            conn.execute(
+                """
+                INSERT INTO metadata_airtime(
+                    scope, reserved_at, next_allowed_at, operation
+                )
+                VALUES('integration', ?, ?, 'neighbor_info')
+                ON CONFLICT(scope) DO UPDATE SET
+                    reserved_at=excluded.reserved_at,
+                    next_allowed_at=excluded.next_allowed_at,
+                    operation=excluded.operation
+                """,
+                (reserved_at_text, global_next_text),
+            )
             cursor = conn.execute(
                 """
                 INSERT INTO neighbor_info_requests(
@@ -872,6 +1079,12 @@ class MeshStore:
             )
             return cursor.rowcount == 1
 
+        def reserve(conn: sqlite3.Connection) -> bool:
+            return self._run_immediate_transaction(
+                conn,
+                lambda: reserve_body(conn),
+            )
+
         reserved = bool(await self._run_serialized(reserve))
         status = await self.async_get_neighbor_info_request_status(
             target_node, now=reserved_at
@@ -881,6 +1094,158 @@ class MeshStore:
             "reserved": reserved,
             "status": "reserved" if reserved else "cooldown",
         }
+
+    async def async_neighbor_info_attempt_history(
+        self,
+        *,
+        limit: int = 1000,
+    ) -> dict[str, datetime]:
+        """Return bounded internal attempt times for fair maintenance rotation."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise ValueError("NeighborInfo history limit must be from 1 to 1000")
+        rows = await self._fetchall(
+            """
+            SELECT target_node, reserved_at
+            FROM neighbor_info_requests
+            ORDER BY reserved_at ASC, target_node ASC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        attempts: dict[str, datetime] = {}
+        for row in rows:
+            target_node = row["target_node"]
+            attempted_at = parse_timestamp(row["reserved_at"])
+            if (
+                isinstance(target_node, str)
+                and target_node
+                and attempted_at is not None
+            ):
+                attempts[target_node] = attempted_at
+        return attempts
+
+    async def async_record_graph_position(
+        self,
+        node_key: str,
+        latitude: float,
+        longitude: float,
+        *,
+        observed_at: datetime | None = None,
+        precision_bits: int | None = None,
+    ) -> None:
+        """Retain one privacy-local hourly position sample for 24-hour trails."""
+        if (
+            not isinstance(node_key, str)
+            or node_key != node_key.strip()
+            or not 1 <= len(node_key.encode("utf-8")) <= 256
+        ):
+            raise ValueError("graph position node key is invalid")
+        for value, minimum, maximum in (
+            (latitude, -90.0, 90.0),
+            (longitude, -180.0, 180.0),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or not minimum <= float(value) <= maximum
+            ):
+                raise ValueError("graph position coordinate is invalid")
+        if precision_bits is not None and (
+            isinstance(precision_bits, bool)
+            or not isinstance(precision_bits, int)
+            or not 0 <= precision_bits <= 32
+        ):
+            raise ValueError("graph position precision is invalid")
+        observed = self._traceroute_now(observed_at)
+        bucket = observed.replace(minute=0, second=0, microsecond=0)
+        await self._execute(
+            """
+            INSERT INTO graph_position_observations(
+                node_key,
+                bucket_start,
+                observed_at,
+                latitude,
+                longitude,
+                precision_bits
+            )
+            VALUES(?, ?, ?, ?, ?, ?)
+            ON CONFLICT(node_key, bucket_start) DO UPDATE SET
+                observed_at=excluded.observed_at,
+                latitude=excluded.latitude,
+                longitude=excluded.longitude,
+                precision_bits=excluded.precision_bits
+            WHERE excluded.observed_at >= graph_position_observations.observed_at
+            """,
+            (
+                node_key,
+                timestamp_to_json(bucket),
+                timestamp_to_json(observed),
+                float(latitude),
+                float(longitude),
+                precision_bits,
+            ),
+        )
+
+    async def async_graph_position_history(
+        self,
+        *,
+        now: datetime | None = None,
+        max_nodes: int = 100,
+        max_positions_per_node: int = 25,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Load a bounded rolling-day position history for the admin panel."""
+        for value, maximum, name in (
+            (max_nodes, 100, "node"),
+            (max_positions_per_node, 25, "position"),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 1 <= value <= maximum
+            ):
+                raise ValueError(f"graph {name} limit is invalid")
+        current = self._traceroute_now(now)
+        cutoff = timestamp_to_json(current - timedelta(hours=24))
+        rows = await self._fetchall(
+            """
+            SELECT
+                node_key,
+                observed_at,
+                latitude,
+                longitude,
+                precision_bits
+            FROM graph_position_observations
+            WHERE observed_at >= ?
+            ORDER BY observed_at DESC, node_key ASC
+            LIMIT ?
+            """,
+            (cutoff, max_nodes * max_positions_per_node),
+        )
+        history: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            node_key = row["node_key"]
+            if not isinstance(node_key, str):
+                continue
+            positions = history.get(node_key)
+            if positions is None:
+                if len(history) >= max_nodes:
+                    continue
+                positions = history[node_key] = []
+            if len(positions) >= max_positions_per_node:
+                continue
+            item: dict[str, Any] = {
+                "observed_at": row["observed_at"],
+                "latitude": float(row["latitude"]),
+                "longitude": float(row["longitude"]),
+            }
+            precision = row["precision_bits"]
+            if isinstance(precision, int) and 0 <= precision <= 32:
+                item["precision_bits"] = precision
+            positions.append(item)
+        for positions in history.values():
+            positions.reverse()
+        return history
 
     async def async_store_neighbor_info_result(
         self,
@@ -918,6 +1283,7 @@ class MeshStore:
         """Return persisted global and selected-target NeighborInfo status."""
         self._validated_traceroute_key("status", target_node)
         current = self._traceroute_now(now)
+        shared_airtime = await self.async_metadata_airtime_status(now=current)
         global_row = await self._fetchone(
             """
             SELECT gateway_id, target_node, reserved_at, global_next_allowed_at
@@ -975,7 +1341,7 @@ class MeshStore:
             if isinstance(decoded, dict):
                 result = self._safe_neighbor_info_result(decoded)
         remaining = max(global_remaining, target_remaining)
-        return {
+        return self._with_shared_airtime({
             "schema_version": 1,
             "scope": "integration_and_target",
             "reserved": remaining > 0,
@@ -1014,7 +1380,7 @@ class MeshStore:
                 else None
             ),
             "result": result,
-        }
+        }, shared_airtime)
 
     @staticmethod
     def _validated_traceroute_key(
@@ -1034,6 +1400,22 @@ class MeshStore:
         ):
             raise ValueError("invalid traceroute target")
         return gateway_id, target_node
+
+    @staticmethod
+    def _run_immediate_transaction(
+        conn: sqlite3.Connection,
+        target: Callable[[], Any],
+    ) -> Any:
+        """Commit a reservation atomically before its caller can transmit RF."""
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            result = target()
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        return result
 
     @staticmethod
     def _traceroute_now(now: datetime | None) -> datetime:
@@ -1204,6 +1586,13 @@ class MeshStore:
             """,
             (cutoff_text, current_text, current_text),
         )
+        await self._execute(
+            """
+            DELETE FROM graph_position_observations
+            WHERE observed_at < ?
+            """,
+            (timestamp_to_json(current - timedelta(hours=24)),),
+        )
 
     async def async_diagnostics(self) -> dict[str, Any]:
         """Return store health and aggregate metadata without stored content."""
@@ -1231,6 +1620,11 @@ class MeshStore:
             UNION ALL
             SELECT 'neighbor_info_requests', COUNT(*)
             FROM neighbor_info_requests
+            UNION ALL
+            SELECT 'metadata_airtime', COUNT(*) FROM metadata_airtime
+            UNION ALL
+            SELECT 'graph_position_observations', COUNT(*)
+            FROM graph_position_observations
             """
         )
         table_counts = {
@@ -1301,6 +1695,12 @@ class MeshStore:
                 "traceroute_count": table_counts.get("traceroutes", 0),
                 "neighbor_info_request_count": table_counts.get(
                     "neighbor_info_requests", 0
+                ),
+                "metadata_airtime_reservation_count": table_counts.get(
+                    "metadata_airtime", 0
+                ),
+                "graph_position_observation_count": table_counts.get(
+                    "graph_position_observations", 0
                 ),
                 "table_counts": table_counts,
                 "message_direction_counts": {

@@ -309,6 +309,16 @@ excluded destructive operations.
 
 ### Advanced local mesh tools
 
+Version 0.11.0 adds **Geographic scale** and **Topology** graph layouts. The
+geographic view uses one real map scale, labels edge distance, keeps a rolling
+24-hour hourly position trail for moving nodes, and places unlocated nodes on
+an explicit not-to-scale rail. Fresh, local NeighborInfo reports can add
+dotted **friend-of-friend** edges between the reporting node and the exact
+neighbors it named. Those edges expire after one hour and are labeled as
+passive, manually requested, or low-traffic maintenance evidence; they are not
+promoted to direct links. GPS proximity and a shared gateway never invent a
+connection, and opening or moving the graph sends no RF traffic.
+
 Version 0.10.0 keeps each browser's main **Mesh** card order and bounded card
 sizes across navigation and reloads. The versioned browser record accepts only
 the fixed card-ID set and integer geometry; it cannot contain messages, node or
@@ -317,6 +327,22 @@ only, and **Reset** deletes the record. It is never written to Home Assistant or
 a radio. Because uninstalling HACS code cannot run JavaScript afterward, press
 **Reset** before uninstall if you also want this harmless browser-only layout
 record removed.
+
+Automatic network maintenance is **off by default**. To opt in, open
+**Settings → Devices & services → MeshNet → Configure → Automatic network
+maintenance**, select one exact configured Meshtastic Bluetooth gateway, and
+review the bounded settings. The first cycle waits a full configured interval
+(default and minimum: one hour); the quiet window defaults to 120 seconds and
+can be set from 60 to 3,600 seconds. A cycle defaults to at most ten requests
+and can be bounded from 1 to 60. Requests share a durable 60-second metadata
+floor with manual tools, and NeighborInfo retains its 180-second same-target
+floor. Inbound traffic, foreground sends, outbox work, reconnects, settings and
+admin operations, and manual radio tools defer maintenance for as long as
+necessary. There is no catch-up burst, automatic retry, or automatic
+traceroute. Only exact, unambiguous nodes observed through that BLE gateway in
+the current session are eligible. See [Automatic Network
+Maintenance](docs/NETWORK_MAINTENANCE.md) for the complete traffic, lifecycle,
+privacy, and uninstall contract.
 
 Manual Meshtastic Bluetooth traceroute and NeighborInfo packets now inherit the
 connected radio's configured LoRa hop limit. Traceroute choices exclude the
@@ -348,8 +374,10 @@ AdminMessage. A target must already authorize that public key. Remote writes
 are Bluetooth-only, previewed, confirmed, single-use, sent once, and verified
 by readback; the initial allowlist is owner names and reviewed display options.
 An administrator can also explicitly request one node's NeighborInfo over BLE.
-That operation is never polled or retried and uses persisted 180-second global
-and same-target cooldowns.
+The manual control is never retried: it shares the integration-wide 60-second
+metadata floor and retains a 180-second floor for the same target. Separately,
+the explicitly enabled idle-maintenance scheduler may call that same validated
+NeighborInfo path under the stricter limits above.
 See [Advanced Mesh Operations](docs/ADVANCED_MESH_OPERATIONS.md) for setup,
 airtime, recovery, automation, telemetry, and privacy details.
 
@@ -397,9 +425,10 @@ Useful documentation:
 3. [Usage](docs/USAGE.md)
 4. [Gateway Settings](docs/GATEWAY_SETTINGS.md)
 5. [Advanced Mesh Operations](docs/ADVANCED_MESH_OPERATIONS.md)
-6. [Troubleshooting](docs/TROUBLESHOOTING.md)
-7. [Security](docs/SECURITY.md)
-8. [Architecture](docs/ARCHITECTURE.md)
+6. [Automatic Network Maintenance](docs/NETWORK_MAINTENANCE.md)
+7. [Troubleshooting](docs/TROUBLESHOOTING.md)
+8. [Security](docs/SECURITY.md)
+9. [Architecture](docs/ARCHITECTURE.md)
 
 ## Development check
 

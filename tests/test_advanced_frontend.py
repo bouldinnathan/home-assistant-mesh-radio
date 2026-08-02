@@ -1268,3 +1268,248 @@ def test_graph_filter_animation_and_drag_make_zero_transport_calls() -> None:
   assert.equal(serviceCalls, 0);
 """
     )
+
+
+def test_geographic_graph_uses_one_scale_trails_and_an_unlocated_rail() -> None:
+    """Geographic mode is deterministic map geometry, not another force layout."""
+    _run_panel_script(
+        r"""
+  assert.equal(panel._graphMode, "geographic");
+  assert.equal(panel._normalizeGraphMode("geographic"), "geographic");
+  assert.equal(panel._normalizeGraphMode("topology"), "topology");
+  assert.equal(panel._normalizeGraphMode("force"), "geographic");
+  panel._hass = { config: { unit_system: { length: "mi" } } };
+  const topology = {
+    nodes: [
+      {
+        node_key: "origin",
+        protocol: "meshcore",
+        location: { latitude: 0.1, longitude: 0.1 },
+        _graph_trail: [
+          { latitude: 0.09, longitude: 0.09 },
+          { latitude: 0.095, longitude: 0.095 },
+        ],
+      },
+      {
+        node_key: "north",
+        protocol: "meshcore",
+        location: { latitude: 0.114473, longitude: 0.1 },
+        _graph_trail: [],
+      },
+      {
+        node_key: "east",
+        protocol: "meshcore",
+        location: { latitude: 0.1, longitude: 0.114473 },
+        _graph_trail: [],
+      },
+      { node_key: "unknown", protocol: "meshcore", location: {}, _graph_trail: [] },
+    ],
+    gateways: [],
+    edges: [{ from: "node:origin", to: "node:unknown", type: "route", distance_meters: null }],
+    totalNodes: 4,
+    totalGateways: 0,
+    omittedDirectConnections: 0,
+  };
+  const layout = panel._geographicGraphPositions(topology, 1000, 640);
+  assert.equal(layout.hasLocations, true);
+  assert.ok(layout.scale && layout.scale.pixels > 0 && layout.scale.pixels <= 150);
+  assert.match(layout.scale.label, /(mi|ft)$/);
+  assert.ok(layout.trailPoints.get("node:origin").length >= 2);
+  assert.equal(layout.locatedKeys.has("node:origin"), true);
+  assert.equal(layout.unlocatedKeys.has("node:unknown"), true);
+  assert.equal(layout.positions.get("node:origin").geographic, true);
+  assert.equal(layout.positions.get("node:unknown").geographic, false);
+  assert.ok(layout.positions.get("node:unknown").y > layout.railTop);
+
+  const origin = layout.positions.get("node:origin");
+  const north = layout.positions.get("node:north");
+  const east = layout.positions.get("node:east");
+  const northPixels = Math.hypot(north.x - origin.x, north.y - origin.y);
+  const eastPixels = Math.hypot(east.x - origin.x, east.y - origin.y);
+  assert.ok(Math.abs(northPixels - eastPixels) / northPixels < 0.02,
+    "equal physical distances must share one x/y scale");
+  const northMeters = panel._haversineMeters(
+    topology.nodes[0].location,
+    topology.nodes[1].location,
+  );
+  assert.ok(Math.abs(northPixels * layout.metersPerPixel - northMeters) / northMeters < 0.01,
+    "map pixels times the displayed scale must recover physical distance");
+
+  const html = panel._graph(topology);
+  assert.match(html, /Geographic scale/);
+  assert.match(html, />Topology</);
+  assert.match(html, /one equal local map scale/);
+  assert.match(html, /Unlocated endpoints — not to scale/);
+  assert.match(html, /class="location-trail"/);
+  assert.match(html, /class="geographic-scale"/);
+  assert.match(html, /unlocated-link/);
+
+  const dateline = panel._geographicGraphPositions({
+    ...topology,
+    nodes: [
+      { node_key: "west", protocol: "meshcore", location: { latitude: 1, longitude: 179.9 } },
+      { node_key: "east", protocol: "meshcore", location: { latitude: 1, longitude: -179.9 } },
+    ],
+    edges: [],
+  }, 1000, 640);
+  assert.ok(dateline.metersPerPixel < 100,
+    "crossing the dateline must not expand the view to almost the whole world");
+"""
+    )
+
+
+def test_topology_history_is_exact_bounded_recent_and_never_creates_edges() -> None:
+    """Optional backend trails are presentation data and cannot manufacture topology."""
+    _run_panel_script(
+        r"""
+  const originalNow = Date.now;
+  Date.now = () => Date.parse("2026-08-02T12:00:00Z");
+  const nodes = [
+    {
+      node_key: "meshtastic:!00000001",
+      node_id: "!00000001",
+      protocol: "meshtastic",
+      location: {},
+      connectivity: {},
+      routing: {},
+      last_heard: "2026-08-02T11:59:00Z",
+    },
+  ];
+  const many = Array.from({ length: 30 }, (_value, index) => ({
+    observed_at: new Date(Date.parse("2026-08-02T06:00:00Z") + index * 60_000).toISOString(),
+    latitude: 44 + index / 1000,
+    longitude: -93,
+    precision_bits: 32,
+  }));
+  const history = {
+    "meshtastic:!00000001": [
+      { observed_at: "2026-08-01T11:59:59Z", latitude: 1, longitude: 2, precision_bits: 32 },
+      { observed_at: "2026-08-02T12:05:01Z", latitude: 1, longitude: 2, precision_bits: 32 },
+      { observed_at: "2026-08-02T11:00:00Z", latitude: 1, longitude: 2, precision_bits: 12 },
+      ...many,
+    ],
+    "meshtastic:!ffffffff": many,
+  };
+  const parsed = panel._topologyLocationHistory(history, nodes);
+  assert.deepEqual([...parsed.keys()], ["meshtastic:!00000001"]);
+  assert.ok(parsed.get("meshtastic:!00000001").length <= 25);
+  assert.ok(parsed.get("meshtastic:!00000001").every((sample) => (
+    Number.isFinite(sample.latitude)
+    && Number.isFinite(sample.longitude)
+    && sample.observed_at.startsWith("2026-08-02")
+  )));
+
+  const topology = panel._passiveTopology(nodes, [], 20, history);
+  assert.equal(topology.edges.length, 0, "location history cannot create an evidence edge");
+  assert.ok(topology.nodes[0]._graph_trail.length > 1);
+  assert.equal(panel._nodeGraphLocation(topology.nodes[0]) != null, true,
+    "the latest retained trail point may place a currently unlocated node");
+  Date.now = originalNow;
+"""
+    )
+
+
+def test_evidence_selection_keeps_pairs_and_labels_maintenance_neighborinfo() -> None:
+    """A recent-node cap cannot silently retain only half an evidence relationship."""
+    _run_panel_script(
+        r"""
+  const originalNow = Date.now;
+  Date.now = () => Date.parse("2026-08-02T12:00:00Z");
+  const evidenceNodes = [
+    {
+      node_key: "meshtastic:!00000001",
+      node_id: "!00000001",
+      protocol: "meshtastic",
+      last_heard: "2026-08-01T12:00:00Z",
+      connectivity: {},
+      routing: {
+        neighbors: ["!00000002"],
+        neighbor_count: 1,
+        neighbors_updated_at: "2026-08-02T11:30:00Z",
+        neighbors_via_mqtt: false,
+        neighbors_provenance: "maintenance_scan",
+      },
+    },
+    {
+      node_key: "meshtastic:!00000002",
+      node_id: "!00000002",
+      protocol: "meshtastic",
+      last_heard: "2026-08-01T12:00:01Z",
+      connectivity: {},
+      routing: {},
+    },
+  ];
+  const recent = Array.from({ length: 25 }, (_value, index) => ({
+    node_key: `meshcore:recent-${index}`,
+    node_id: `recent-${index}`,
+    protocol: "meshcore",
+    last_heard: new Date(Date.parse("2026-08-02T11:00:00Z") + index * 1000).toISOString(),
+    connectivity: {},
+    routing: {},
+  }));
+  const topology = panel._passiveTopology([...recent, ...evidenceNodes], [], 20);
+  const visible = new Set(topology.nodes.map((node) => node.node_key));
+  assert.equal(visible.has("meshtastic:!00000001"), true);
+  assert.equal(visible.has("meshtastic:!00000002"), true);
+  assert.equal(topology.nodes.length, 20);
+  assert.equal(topology.edges.length, 1);
+  assert.equal(topology.edges[0].type, "neighbor");
+  assert.equal(topology.edges[0].provenance, "maintenance_scan");
+  const html = panel._graph(topology);
+  assert.match(html, /Friend-of-friend NeighborInfo reported during a low-traffic maintenance scan/);
+  assert.match(html, /neighbor-link maintenance-link/);
+
+  const directNode = {
+    node_key: "meshtastic:!00000003",
+    node_id: "!00000003",
+    protocol: "meshtastic",
+    last_heard: "2026-08-01T10:00:00Z",
+    last_gateway_id: "gateway-one",
+    gateway_ids: ["gateway-one"],
+    connectivity: {
+      hops: 0,
+      hops_gateway_id: "gateway-one",
+      via_mqtt: false,
+    },
+    routing: {},
+  };
+  const directTopology = panel._passiveTopology([...recent, directNode], [{
+    gateway_id: "gateway-one",
+    name: "Gateway",
+    connected: true,
+  }], 20);
+  assert.equal(directTopology.nodes.some((node) => node.node_key === directNode.node_key), true);
+  assert.equal(directTopology.edges.some((edge) => (
+    edge.type === "direct"
+    && edge.from === "gateway:gateway-one"
+    && edge.to === `node:${directNode.node_key}`
+  )), true);
+  assert.equal(directTopology.omittedDirectConnections, 0);
+
+  let starts = 0;
+  let drags = 0;
+  let calls = 0;
+  const listeners = new Map();
+  const control = (value) => ({
+    value,
+    addEventListener(name, callback) { listeners.set(`${value}:${name}`, callback); },
+  });
+  const mode = control("geographic");
+  const limit = control("20");
+  const svg = {};
+  panel.querySelector = (selector) => selector === "#meshnet-graph-mode" ? mode
+    : selector === "#meshnet-graph-limit" ? limit
+      : selector === "#meshnet-topology-graph" ? svg : null;
+  panel._hass = {
+    callWS: async () => { calls += 1; },
+    callService: async () => { calls += 1; },
+  };
+  panel._startGraphAnimation = () => { starts += 1; };
+  panel._bindGraphDrag = () => { drags += 1; return () => {}; };
+  panel._bindGraphControls(topology);
+  assert.equal(starts, 0);
+  assert.equal(drags, 0);
+  assert.equal(calls, 0);
+  Date.now = originalNow;
+"""
+    )
