@@ -26,6 +26,7 @@ _TRACEROUTE_TYPE = "meshnet/traceroute"
 _NEIGHBOR_INFO_TYPE = "meshnet/neighbor_info"
 _NEIGHBOR_INFO_STATUS_TYPE = "meshnet/neighbor_info/status"
 _SEND_MESSAGE_TYPE = "meshnet/send_message"
+_MESSAGES_DELETE_TYPE = "meshnet/messages/delete"
 _CALL_SERVICE_TYPE = "call_service"
 _MESHNET_DOMAIN = "meshnet"
 _SENSITIVE_MESHNET_SERVICES = frozenset(
@@ -46,6 +47,8 @@ _SENSITIVE_COMMAND_FIELDS = {
     _NEIGHBOR_INFO_TYPE: frozenset({"gateway_id", "target_node"}),
     _NEIGHBOR_INFO_STATUS_TYPE: frozenset({"target_node"}),
     _SEND_MESSAGE_TYPE: frozenset({"message", "target_node", "gateway_id", "channel"}),
+    # A direct conversation key embeds the peer node identity.
+    _MESSAGES_DELETE_TYPE: frozenset({"conversation_key"}),
 }
 _REDACTED = "<redacted by MeshNet>"
 _REDACTION_GUARD_MESSAGE = "WebSocket command omitted by MeshNet redaction guard"

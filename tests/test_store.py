@@ -681,3 +681,101 @@ def test_cancelled_initial_connect_is_closed_after_bounded_rollback(
         assert store._inflight == set()
 
     asyncio.run(run())
+
+
+def test_node_and_message_history_deletion(tmp_path) -> None:
+    asyncio.run(_node_and_message_history_deletion(tmp_path))
+
+
+async def _node_and_message_history_deletion(tmp_path) -> None:
+    store = MeshStore(tmp_path / "meshnet.sqlite3")
+    await store.async_open()
+    for index in range(3):
+        await store.async_upsert_node(
+            NodeState(
+                node_key=f"meshtastic:!0000000{index}",
+                protocol="meshtastic",
+                node_id=f"!0000000{index}",
+            )
+        )
+    assert await store.async_count_nodes() == 3
+    deleted_nodes = await store.async_delete_nodes(
+        ["meshtastic:!00000000", "meshtastic:!00000002", "missing", "", "meshtastic:!00000000"]
+    )
+    assert deleted_nodes == 2
+    assert await store.async_count_nodes() == 1
+    assert set((await store.async_load_snapshot()).nodes) == {"meshtastic:!00000001"}
+
+    packet = MeshPacket(
+        protocol="meshtastic",
+        gateway_id="g1",
+        packet_id="p1",
+        sender="!aaaa0001",
+        receiver="^all",
+        channel="0",
+        text="hello",
+    )
+    assert await store.async_add_packet(packet)
+    await store.async_add_message(
+        MessageRecord(
+            message_id=packet.fingerprint(),
+            protocol="meshtastic",
+            gateway_id="g1",
+            sender="!aaaa0001",
+            receiver="^all",
+            channel="0",
+            text="hello",
+        )
+    )
+    await store.async_add_message(
+        MessageRecord(
+            message_id="direct-1",
+            protocol="meshtastic",
+            gateway_id="g1",
+            sender="!aaaa0002",
+            receiver="!aaaa0003",
+            channel="0",
+            text="private",
+        )
+    )
+    await store.async_add_message(
+        MessageRecord(
+            message_id="tx-1",
+            protocol="meshtastic",
+            gateway_id="g1",
+            sender=None,
+            receiver="^all",
+            channel="0",
+            text="outbound",
+            direction="tx",
+        )
+    )
+    # A corrupt row cannot be classified, so a scoped deletion must keep it.
+    await store._execute(
+        """
+        INSERT INTO messages(message_id, protocol, gateway_id, direction, timestamp, text, data)
+        VALUES('bad', 'meshtastic', 'g1', 'rx', '2026-01-01T00:00:00+00:00', 'x', 'not json')
+        """
+    )
+
+    deleted = await store.async_delete_message_history(
+        lambda message: message.message_id == packet.fingerprint()
+    )
+    assert deleted == 1
+    packet_rows = await store._fetchone(
+        "SELECT COUNT(*) AS count FROM packets WHERE fingerprint = ?",
+        (packet.fingerprint(),),
+    )
+    assert packet_rows["count"] == 0
+    assert {message.message_id for message in await store.async_recent_messages(10)} == {
+        "direct-1",
+        "tx-1",
+    }
+    remaining = await store._fetchone("SELECT COUNT(*) AS count FROM messages")
+    assert remaining["count"] == 3
+
+    assert await store.async_delete_message_history(None) == 3
+    assert await store.async_recent_messages(10) == []
+    remaining = await store._fetchone("SELECT COUNT(*) AS count FROM messages")
+    assert remaining["count"] == 0
+    await store.async_close()

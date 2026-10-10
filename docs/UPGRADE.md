@@ -1,5 +1,42 @@
 # Upgrade Guide
 
+## From 0.11.0
+
+0.12.0 adds a rolling window for cached node records. `node_limit` defaults to
+250 and accepts 25 to 1000 under **Configure -> History and timing**. On the
+first start after upgrading, MeshNet trims the least recently heard records
+beyond the window, deletes them from `meshnet.sqlite3`, removes their Home
+Assistant devices and entities, and logs one warning with the count. At
+runtime a newly heard node beyond the window evicts the oldest record the same
+way. Nodes owned by a configured gateway and nodes labeled **MeshNet Favorite**
+are never evicted, and an evicted node that is heard again returns with fresh
+entities. This replaces the previous unbounded cache, which could reach Home
+Assistant's limit of 10,000 enabled entities per config entry and flood the
+panel. Recorder history for removed entities follows Home Assistant's own
+purge settings.
+
+0.12.0 also guards that limit directly. MeshNet reads Home Assistant's
+enabled-entity counter before caching a new node, at startup, and on every
+refresh, and evicts the least recently heard nodes whenever the next node
+would bring the integration within 1,000 entities of the cap, even if
+`node_limit` allows more. When that happens a repair named **MeshNet is near
+Home Assistant's entity limit** shows the effective and configured node
+counts and clears itself once the configured window fits. Platforms wait for
+evicted devices to finish removing before they add entities, so an upgrade
+from a flooded install recovers on its own after the first start.
+
+0.12.0 also adds permanent message history deletion. The Messages view has a
+collapsed **Manage history** disclosure with **Delete this conversation…** and
+**Delete all history…**. Both require typing `permanently delete this data`,
+which Home Assistant verifies again server-side, and both are administrator
+only. Deletion covers MeshNet's local database, including the packet captures
+that produced the messages; Recorder, logbook, events, traces, and backups are
+not changed.
+
+Restart Home Assistant after upgrading and hard-refresh the browser once so
+the 0.12.0 panel module loads. No config-entry recreation or radio setting
+change is required.
+
 ## From 0.10.0
 
 0.11.0 adds two views over the cached graph evidence. **Geographic scale** is

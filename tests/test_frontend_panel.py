@@ -2745,3 +2745,82 @@ def test_panel_diagnostics_uses_only_fixed_counts_and_registration_is_idempotent
   assert.equal(duplicateDefineCount, 0);
 """
     )
+
+
+def test_history_deletion_is_hidden_typed_and_server_verified() -> None:
+    """Permanent deletion stays out of the way and never trusts the browser alone."""
+    source = _source()
+    const = Path("custom_components/meshnet/const.py").read_text(encoding="utf-8")
+    assert 'MESSAGE_HISTORY_DELETE_PHRASE: Final = "permanently delete this data"' in const
+    assert 'const MESSAGE_HISTORY_DELETE_PHRASE = "permanently delete this data"' in source
+    assert '<details class="history-manage" id="meshnet-history-manage"' in source
+    assert 'type: "meshnet/messages/delete"' in source
+    assert 'id="meshnet-history-confirm-text" type="text" autocomplete="off"' in source
+    assert "Delete this conversation…" in source
+    assert "Delete all history…" in source
+    assert "Recorder history, logbook entries, fired events, automation traces, and backups" in source
+    persistence = source[
+        source.index("  _persistMeshCardLayout()") : source.index("  _orderedMeshCards(")
+    ]
+    assert "_historyDelete" not in persistence
+    assert "typed" not in persistence
+
+    _run_panel_script(
+        r"""
+  assert.equal(panel._historyDeleteReady("permanently delete this data"), true);
+  assert.equal(panel._historyDeleteReady("  permanently delete this data \n"), true);
+  assert.equal(panel._historyDeleteReady("Permanently Delete This Data"), false);
+  assert.equal(panel._historyDeleteReady("permanently delete"), false);
+  assert.equal(panel._historyDeleteReady(""), false);
+  assert.equal(panel._historyDeleteReady(null), false);
+
+  assert.equal(panel._historyDeleteRequest("all", null, "nope"), null);
+  assert.deepEqual(
+    panel._historyDeleteRequest("all", null, " permanently delete this data "),
+    { type: "meshnet/messages/delete", scope: "all", confirmation: "permanently delete this data" },
+  );
+  assert.deepEqual(
+    panel._historyDeleteRequest("conversation", "direct:meshtastic:!1234abcd", "permanently delete this data"),
+    {
+      type: "meshnet/messages/delete",
+      scope: "conversation",
+      conversation_key: "direct:meshtastic:!1234abcd",
+      confirmation: "permanently delete this data",
+    },
+  );
+  assert.equal(panel._historyDeleteRequest("conversation", "", "permanently delete this data"), null);
+  assert.equal(panel._historyDeleteRequest("conversation", "channel:9", "permanently delete this data"), null);
+  assert.equal(panel._historyDeleteRequest("conversation", null, "permanently delete this data"), null);
+  assert.equal(panel._historyDeleteRequest("everything", null, "permanently delete this data"), null);
+
+  assert.deepEqual(panel._validateHistoryDeleteResponse({ deleted_messages: 4, retained_active: 1 }), { deleted: 4, retained: 1 });
+  assert.deepEqual(panel._validateHistoryDeleteResponse({ deleted_messages: 0 }), { deleted: 0, retained: 0 });
+  assert.throws(() => panel._validateHistoryDeleteResponse({ deleted_messages: -1 }));
+  assert.throws(() => panel._validateHistoryDeleteResponse({ deleted_messages: "4" }));
+  assert.throws(() => panel._validateHistoryDeleteResponse([]));
+  assert.throws(() => panel._validateHistoryDeleteResponse(null));
+
+  const selected = { key: "direct:meshtastic:!1234abcd", label: "<Peer> · !1234abcd", messages: [] };
+  const idle = panel._historyManageHtml(selected);
+  assert.ok(!idle.includes('id="meshnet-history-manage" open'));
+  assert.ok(idle.includes('id="meshnet-history-delete-conversation" type="button">'));
+  assert.ok(!idle.includes('id="meshnet-history-confirm-text"'));
+
+  panel._historyDelete = { ...panel._idleHistoryDelete(), open: true, scope: "conversation", key: selected.key, label: selected.label, typed: "perm" };
+  const armed = panel._historyManageHtml(selected);
+  assert.ok(armed.includes('id="meshnet-history-manage" open'));
+  assert.ok(armed.includes('id="meshnet-history-confirm" type="button" disabled'));
+  assert.ok(armed.includes("&lt;Peer&gt;"));
+  assert.ok(!armed.includes("<Peer>"));
+  assert.ok(armed.includes("permanently delete this data"));
+
+  panel._historyDelete.typed = "permanently delete this data";
+  const ready = panel._historyManageHtml(selected);
+  assert.ok(ready.includes('id="meshnet-history-confirm" type="button">Delete permanently'));
+
+  panel._historyDelete = { ...panel._idleHistoryDelete(), open: true, scope: "all", typed: "permanently delete this data", busy: true };
+  const busy = panel._historyManageHtml(selected);
+  assert.ok(busy.includes('id="meshnet-history-confirm" type="button" disabled>Deleting…'));
+  assert.ok(busy.includes('id="meshnet-history-confirm-text" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" value="permanently delete this data" disabled'));
+        """
+    )

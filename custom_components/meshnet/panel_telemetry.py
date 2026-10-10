@@ -12,6 +12,7 @@ PANEL_OPERATIONS = frozenset(
     {
         "snapshot",
         "messages",
+        "messages_delete",
         "send_message",
         "settings_get",
         "settings_preview",
@@ -93,6 +94,9 @@ PANEL_ERROR_CODES = frozenset(
         "invalid_response",
         "invalid_schema",
         "message_load_failed",
+        "message_delete_failed",
+        "confirmation_mismatch",
+        "conversation_required",
         "operation_cancelled",
         "operation_failed",
         "poll_failed",

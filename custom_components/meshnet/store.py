@@ -29,6 +29,9 @@ from .models import (
 )
 
 _STORE_CLOSE_WAIT_TIMEOUT = 2.0
+# Bounded SQL parameter lists keep deletes well under SQLite's variable limit.
+_DELETE_CHUNK_SIZE = 500
+_MESSAGE_SCAN_PAGE_SIZE = 500
 
 
 class MeshStore:
@@ -507,6 +510,119 @@ class MeshStore:
         """Persist multiple nodes."""
         for node in nodes:
             await self.async_upsert_node(node)
+
+    async def async_delete_nodes(self, node_keys: Iterable[str]) -> int:
+        """Delete exact cached node records and report how many rows went away."""
+        keys = [key for key in dict.fromkeys(node_keys) if isinstance(key, str) and key]
+        deleted = 0
+        for start in range(0, len(keys), _DELETE_CHUNK_SIZE):
+            chunk = tuple(keys[start : start + _DELETE_CHUNK_SIZE])
+            placeholders = ",".join("?" for _ in chunk)
+            deleted += await self._run_serialized(
+                lambda conn, chunk=chunk, placeholders=placeholders: int(
+                    conn.execute(
+                        f"DELETE FROM nodes WHERE node_key IN ({placeholders})",
+                        chunk,
+                    ).rowcount
+                )
+            )
+        return max(0, deleted)
+
+    async def async_count_nodes(self) -> int:
+        """Return the number of cached node records."""
+        row = await self._fetchone("SELECT COUNT(*) AS count FROM nodes")
+        return int(row["count"]) if row is not None else 0
+
+    async def async_delete_message_history(
+        self,
+        predicate: Callable[[MessageRecord], bool] | None = None,
+    ) -> int:
+        """Delete cached messages plus the packet captures that produced them.
+
+        ``None`` deletes every message row, including rows that no longer
+        decode. A predicate is evaluated on the event loop for each decodable
+        row; rows that cannot be decoded cannot be classified, so they stay.
+        Each delete is one immediate transaction, so a cancelled caller never
+        leaves a packet capture without its message or vice versa.
+        """
+        if predicate is None:
+            return await self._run_serialized(self._delete_all_message_rows)
+
+        matching: list[str] = []
+        cursor: tuple[str, str] | None = None
+        while True:
+            if cursor is None:
+                rows = await self._fetchall(
+                    """
+                    SELECT message_id, timestamp, data
+                    FROM messages
+                    ORDER BY timestamp ASC, message_id ASC
+                    LIMIT ?
+                    """,
+                    (_MESSAGE_SCAN_PAGE_SIZE,),
+                )
+            else:
+                timestamp, message_id = cursor
+                rows = await self._fetchall(
+                    """
+                    SELECT message_id, timestamp, data
+                    FROM messages
+                    WHERE timestamp > ?
+                       OR (timestamp = ? AND message_id > ?)
+                    ORDER BY timestamp ASC, message_id ASC
+                    LIMIT ?
+                    """,
+                    (timestamp, timestamp, message_id, _MESSAGE_SCAN_PAGE_SIZE),
+                )
+            if not rows:
+                break
+            for row in rows:
+                message = self._message_from_row(row)
+                if message is not None and predicate(message):
+                    matching.append(str(row["message_id"]))
+            if len(rows) < _MESSAGE_SCAN_PAGE_SIZE:
+                break
+            last_row = rows[-1]
+            cursor = (last_row["timestamp"], last_row["message_id"])
+
+        deleted = 0
+        for start in range(0, len(matching), _DELETE_CHUNK_SIZE):
+            chunk = tuple(matching[start : start + _DELETE_CHUNK_SIZE])
+            deleted += await self._run_serialized(
+                lambda conn, chunk=chunk: self._delete_message_rows(conn, chunk)
+            )
+        return deleted
+
+    @classmethod
+    def _delete_all_message_rows(cls, conn: sqlite3.Connection) -> int:
+        def work() -> int:
+            row = conn.execute("SELECT COUNT(*) AS count FROM messages").fetchone()
+            count = int(row["count"]) if row is not None else 0
+            conn.execute(
+                "DELETE FROM packets WHERE fingerprint IN (SELECT message_id FROM messages)"
+            )
+            conn.execute("DELETE FROM messages")
+            return count
+
+        return int(cls._run_immediate_transaction(conn, work))
+
+    @classmethod
+    def _delete_message_rows(cls, conn: sqlite3.Connection, message_ids: tuple[str, ...]) -> int:
+        placeholders = ",".join("?" for _ in message_ids)
+
+        def work() -> int:
+            conn.execute(
+                f"DELETE FROM packets WHERE fingerprint IN ({placeholders})",
+                message_ids,
+            )
+            return int(
+                conn.execute(
+                    f"DELETE FROM messages WHERE message_id IN ({placeholders})",
+                    message_ids,
+                ).rowcount
+            )
+
+        return max(0, int(cls._run_immediate_transaction(conn, work)))
 
     async def async_add_message(self, message: MessageRecord) -> None:
         """Persist a message."""

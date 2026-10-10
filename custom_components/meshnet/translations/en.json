@@ -279,5 +279,11 @@
       }
     }
   },
-  "issues": { "gateway_issue": { "title": "MeshNet gateway issue", "description": "{message}" } }
+  "issues": {
+    "gateway_issue": { "title": "MeshNet gateway issue", "description": "{message}" },
+    "entity_budget": {
+      "title": "MeshNet is near Home Assistant's entity limit",
+      "description": "MeshNet is keeping {effective_limit} nodes instead of the configured {configured_limit} so this integration stays under Home Assistant's limit of {entity_cap} enabled entities ({enabled_entities} are enabled now). Home Assistant stops creating entities at that limit. Lower node_limit under Configure -> History and timing, or disable node entities you do not use. This repair clears itself once the configured window fits."
+    }
+  }
 }

@@ -257,6 +257,25 @@ PSK on every participating radio. MeshNet does not create, read, or return that
 key. Messages and telemetry may remain in MeshNet SQLite, Home Assistant
 Recorder, automation traces, and backups after HACS uninstall.
 
+### Delete Message History
+
+Message history is kept in MeshNet's local SQLite database and pruned by
+`history_days`. To remove it sooner, open **MeshNet -> Messages**, expand the
+collapsed **Manage history** disclosure under the conversation list, and choose
+**Delete this conversation…** for the selected thread or **Delete all
+history…** for every conversation. The panel then asks you to type the exact
+phrase shown, `permanently delete this data`, before the delete button
+enables. Home Assistant verifies the same phrase again before deleting
+anything, and only an administrator can call it.
+
+A deletion is permanent and includes queued unsent messages in that scope. A
+message whose send is still in flight is kept so a late radio acknowledgement
+cannot bring a deleted row back; the panel reports how many were kept. The
+deletion covers MeshNet's database only. Home Assistant Recorder history,
+logbook entries, fired `meshnet_message_received` events, automation traces,
+and backups are separate and remain until you remove them with their own
+tools. MeshNet logs only the scope and counts, never the conversation or text.
+
 ## Verify Gateway Status
 
 In Home Assistant:
@@ -503,7 +522,16 @@ It stores:
 - Packets
 - Manual traceroute cooldowns and sanitized results
 
-Pruning follows `history_days`.
+Message and packet pruning follows `history_days`. Node records follow the
+`node_limit` rolling window: the least recently heard records beyond the
+limit are evicted together with their Home Assistant devices and entities,
+except nodes owned by a configured gateway and nodes labeled **MeshNet
+Favorite**. An evicted node that is heard again is cached and gets entities
+again. The window is lowered automatically when the integration approaches
+Home Assistant's limit of 10,000 enabled entities per config entry; a repair
+shows the lowered count while that guard is active. Cached message history
+can also be deleted on demand from the Messages view with a typed
+confirmation.
 
 ## Restart After Changes
 

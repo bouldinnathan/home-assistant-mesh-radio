@@ -1843,3 +1843,27 @@ def test_owned_same_address_edit_preserves_exact_bond_without_repairing(
         assert edited["options"] == gateway["options"]
 
     asyncio.run(run())
+
+
+def test_settings_schema_includes_bounded_node_window() -> None:
+    """The rolling node window is a normal bounded option with a safe default."""
+    from custom_components.meshnet.const import (
+        CONF_HISTORY_DAYS,
+        CONF_NODE_LIMIT,
+        CONF_NODE_TIMEOUT,
+        DEFAULT_NODE_LIMIT,
+        MAX_NODE_LIMIT,
+        MIN_NODE_LIMIT,
+    )
+
+    schema = config_flow_module._settings_schema()
+    base = {CONF_NODE_TIMEOUT: 900, CONF_HISTORY_DAYS: 30}
+    assert schema(base)[CONF_NODE_LIMIT] == DEFAULT_NODE_LIMIT
+    assert schema({**base, CONF_NODE_LIMIT: "500"})[CONF_NODE_LIMIT] == 500
+    assert schema({**base, CONF_NODE_LIMIT: MIN_NODE_LIMIT})[CONF_NODE_LIMIT] == MIN_NODE_LIMIT
+    assert schema({**base, CONF_NODE_LIMIT: MAX_NODE_LIMIT})[CONF_NODE_LIMIT] == MAX_NODE_LIMIT
+    for invalid in (MIN_NODE_LIMIT - 1, MAX_NODE_LIMIT + 1, 0, -5, "many"):
+        with pytest.raises(vol.Invalid):
+            schema({**base, CONF_NODE_LIMIT: invalid})
+    restored = config_flow_module._settings_schema(node_limit=400)
+    assert restored(base)[CONF_NODE_LIMIT] == 400

@@ -20,6 +20,9 @@ const GRAPH_MODES = Object.freeze(["geographic", "topology"]);
 const GRAPH_HISTORY_MAX_NODES = 100;
 const GRAPH_HISTORY_MAX_POSITIONS_PER_NODE = 25;
 const GRAPH_HISTORY_WINDOW_MS = 24 * 60 * 60 * 1000;
+// Must match MESSAGE_HISTORY_DELETE_PHRASE in const.py; the server verifies it.
+const MESSAGE_HISTORY_DELETE_PHRASE = "permanently delete this data";
+const CONVERSATION_KEY_PATTERN = /^(?:broadcast:0|channel:[1-7]|direct:\S{1,256}|unknown)$/;
 
 class MeshNetPanel extends HTMLElement {
   constructor() {
@@ -61,6 +64,7 @@ class MeshNetPanel extends HTMLElement {
     this._messageRequestGeneration = 0;
     this._messageLoading = false;
     this._messageError = null;
+    this._historyDelete = this._idleHistoryDelete();
     this._graphLimit = 50;
     this._graphMode = "geographic";
     this._graphPositions = new Map();
@@ -417,6 +421,9 @@ class MeshNetPanel extends HTMLElement {
       "neighbor_info_lifecycle_changed",
       "neighbor_info_failed",
       "neighbor_info_status_failed",
+      "confirmation_mismatch",
+      "conversation_required",
+      "delete_failed",
     ];
     return allowed.includes(candidate) ? candidate : "other";
   }
@@ -468,6 +475,8 @@ class MeshNetPanel extends HTMLElement {
       "neighbor_info_event",
       "neighbor_info_request",
       "neighbor_info_status",
+      "messages_delete",
+      "history_event",
       "reporting",
     ], "poll_unexpected");
     const safeCategory = this._safeOperation(category, [
@@ -592,6 +601,8 @@ class MeshNetPanel extends HTMLElement {
       neighbor_info_event: "event_handler",
       neighbor_info_request: "neighbor_info_request",
       neighbor_info_status: "neighbor_info_status",
+      messages_delete: "messages_delete",
+      history_event: "event_handler",
       reporting: "reporting",
     };
     let operation = operationMap[event.operation] || "reporting";
@@ -2039,6 +2050,11 @@ class MeshNetPanel extends HTMLElement {
       "meshnet-priority",
       "meshnet-node-sort",
       "meshnet-message-conversation",
+      "meshnet-history-delete-conversation",
+      "meshnet-history-delete-all",
+      "meshnet-history-confirm-text",
+      "meshnet-history-confirm",
+      "meshnet-history-cancel",
       "meshnet-graph-mode",
       "meshnet-graph-limit",
       "meshnet-remote-gateway",
@@ -3805,6 +3821,13 @@ class MeshNetPanel extends HTMLElement {
         .composer textarea { min-height: 84px; resize: vertical; }
         .send-status { min-height: 18px; font-size: 12px; }
         .good { color: var(--success-color, #168047); } .warn { color: var(--warning-color, #b26a00); } .bad { color: var(--error-color, #d32f2f); }
+        .history-manage { margin-top: 14px; border-top: 1px solid var(--divider-color); padding-top: 8px; }
+        .history-manage summary { cursor: pointer; }
+        .history-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+        .history-confirm { display: grid; gap: 6px; margin-top: 8px; }
+        .history-confirm input { width: 100%; box-sizing: border-box; border: 1px solid var(--divider-color); border-radius: 6px; padding: 7px; color: var(--primary-text-color); background: var(--card-background-color); font: inherit; }
+        .history-confirm code { overflow-wrap: anywhere; }
+        .danger { border-color: var(--error-color, #d32f2f); color: var(--error-color, #d32f2f); }
         @media (max-width: 780px) { .messages-wrap { padding: 10px; } .messages-grid { grid-template-columns: 1fr; } }
       </style>
       <div class="messages-wrap">
@@ -3822,6 +3845,7 @@ class MeshNetPanel extends HTMLElement {
             </select>
             <p class="field-help">Direct threads use exact node identity. Duplicate names never merge conversations.</p>
             ${this._messageError ? `<p class="bad">${this._escape(this._messageError)}</p>` : ""}
+            ${this._historyManageHtml(selected)}
           </aside>
           <main class="card">
             <div class="timeline" id="meshnet-message-timeline" data-conversation-key="${this._escape(selected.key)}" aria-live="polite">
@@ -3865,7 +3889,7 @@ class MeshNetPanel extends HTMLElement {
       </div>
     `;
     this._safeStep("bind_views", "binding", () => this._bindViewControls());
-    this._safeStep("bind_messages", "binding", () => this._bindMessageControls(conversations));
+    this._safeStep("bind_messages", "binding", () => this._bindMessageControls(conversations, selected));
     this._safeStep("bind_composer", "binding", () => this._bindComposer());
     this._safeStep("restore_focus", "focus", () => this._restoreComposerFocus(focusState));
     this._safeStep("restore_focus", "focus", () => this._restoreMessageScrollState(
@@ -3874,7 +3898,7 @@ class MeshNetPanel extends HTMLElement {
     ));
   }
 
-  _bindMessageControls(conversations) {
+  _bindMessageControls(conversations, selected = null) {
     const selector = this.querySelector("#meshnet-message-conversation");
     if (selector) {
       selector.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
@@ -3885,6 +3909,200 @@ class MeshNetPanel extends HTMLElement {
     }
     const reload = this.querySelector("#meshnet-messages-reload");
     if (reload) reload.addEventListener("click", () => void this._loadMessages(100));
+    this._bindHistoryControls(selected);
+  }
+
+  _idleHistoryDelete() {
+    // The typed phrase lives only in memory and is cleared after every attempt.
+    return { open: false, scope: null, key: null, label: "", typed: "", busy: false, status: null };
+  }
+
+  _historyDeleteReady(typed) {
+    return typeof typed === "string" && typed.trim() === MESSAGE_HISTORY_DELETE_PHRASE;
+  }
+
+  _historyDeleteRequest(scope, conversationKey, typed) {
+    if (!this._historyDeleteReady(typed)) return null;
+    const confirmation = typed.trim();
+    if (scope === "all") {
+      return { type: "meshnet/messages/delete", scope: "all", confirmation };
+    }
+    if (
+      scope === "conversation"
+      && typeof conversationKey === "string"
+      && CONVERSATION_KEY_PATTERN.test(conversationKey)
+    ) {
+      return {
+        type: "meshnet/messages/delete",
+        scope: "conversation",
+        conversation_key: conversationKey,
+        confirmation,
+      };
+    }
+    return null;
+  }
+
+  _validateHistoryDeleteResponse(response) {
+    if (!response || typeof response !== "object" || Array.isArray(response)) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    const deleted = response.deleted_messages;
+    if (!Number.isSafeInteger(deleted) || deleted < 0) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
+    const retained = Number.isSafeInteger(response.retained_active) && response.retained_active >= 0
+      ? response.retained_active
+      : 0;
+    return { deleted, retained };
+  }
+
+  _historyManageHtml(selected) {
+    const state = this._historyDelete || this._idleHistoryDelete();
+    const ready = this._historyDeleteReady(state.typed);
+    const scopeText = state.scope === "all"
+      ? "every cached message in every conversation"
+      : `every cached message in the "${state.label || "selected"}" conversation`;
+    const confirm = state.scope ? `
+          <div class="history-confirm" role="group" aria-label="Confirm permanent deletion">
+            <p class="warn">This permanently deletes ${this._escape(scopeText)} from MeshNet's local database, including queued unsent messages in that scope. It cannot be undone.</p>
+            <p class="field-help">Home Assistant Recorder history, logbook entries, fired events, automation traces, and backups are separate and are not changed.</p>
+            <label class="label" for="meshnet-history-confirm-text">Type <code>${this._escape(MESSAGE_HISTORY_DELETE_PHRASE)}</code> to confirm</label>
+            <input id="meshnet-history-confirm-text" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" value="${this._escape(state.typed)}"${state.busy ? " disabled" : ""}>
+            <div class="history-actions">
+              <button class="danger" id="meshnet-history-confirm" type="button"${ready && !state.busy ? "" : " disabled"}>${state.busy ? "Deleting…" : "Delete permanently"}</button>
+              <button id="meshnet-history-cancel" type="button"${state.busy ? " disabled" : ""}>Cancel</button>
+            </div>
+          </div>` : "";
+    const statusKind = state.status && ["good", "warn", "bad"].includes(state.status.kind) ? state.status.kind : "";
+    const status = state.status
+      ? `<div class="send-status ${statusKind}" role="status" aria-live="polite">${this._escape(state.status.text)}</div>`
+      : "";
+    return `
+            <details class="history-manage" id="meshnet-history-manage"${state.open ? " open" : ""}>
+              <summary class="label">Manage history</summary>
+              <p class="field-help">Deletion is permanent and requires a typed confirmation.</p>
+              <div class="history-actions">
+                <button id="meshnet-history-delete-conversation" type="button"${state.busy || !selected ? " disabled" : ""}>Delete this conversation…</button>
+                <button id="meshnet-history-delete-all" type="button"${state.busy ? " disabled" : ""}>Delete all history…</button>
+              </div>
+              ${confirm}
+              ${status}
+            </details>`;
+  }
+
+  _bindHistoryControls(selected) {
+    const details = this.querySelector("#meshnet-history-manage");
+    if (details) {
+      details.addEventListener("toggle", () => {
+        this._historyDelete.open = details.open === true;
+      });
+    }
+    const bind = (id, handler) => {
+      const element = this.querySelector(`#${id}`);
+      if (!element) return;
+      element.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
+      element.addEventListener("click", () => {
+        this._safeStep("history_event", "binding", handler);
+      });
+    };
+    bind("meshnet-history-delete-conversation", () => {
+      if (!selected || typeof selected.key !== "string") return;
+      this._historyDelete = {
+        ...this._idleHistoryDelete(),
+        open: true,
+        scope: "conversation",
+        key: selected.key,
+        label: String(selected.label || ""),
+      };
+      this._safeRender("render");
+      this._focusHistoryConfirmInput();
+    });
+    bind("meshnet-history-delete-all", () => {
+      this._historyDelete = { ...this._idleHistoryDelete(), open: true, scope: "all" };
+      this._safeRender("render");
+      this._focusHistoryConfirmInput();
+    });
+    bind("meshnet-history-cancel", () => {
+      this._historyDelete = { ...this._idleHistoryDelete(), open: true };
+      this._safeRender("render");
+    });
+    bind("meshnet-history-confirm", () => {
+      void this._submitHistoryDelete();
+    });
+    const input = this.querySelector("#meshnet-history-confirm-text");
+    if (!input) return;
+    input.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
+    input.addEventListener("input", () => {
+      this._safeStep("history_event", "binding", () => {
+        this._historyDelete.typed = String(input.value || "");
+        const confirm = this.querySelector("#meshnet-history-confirm");
+        if (confirm) {
+          confirm.disabled = this._historyDelete.busy === true
+            || !this._historyDeleteReady(this._historyDelete.typed);
+        }
+      });
+    });
+    input.addEventListener("keydown", (event) => {
+      if (!event || event.key !== "Enter") return;
+      event.preventDefault();
+      if (this._historyDeleteReady(this._historyDelete.typed)) void this._submitHistoryDelete();
+    });
+  }
+
+  _focusHistoryConfirmInput() {
+    const input = this.querySelector("#meshnet-history-confirm-text");
+    if (input && typeof input.focus === "function") {
+      try {
+        input.focus();
+      } catch (_ignored) {
+        // Focus is a convenience; the typed confirmation still gates deletion.
+      }
+    }
+  }
+
+  async _submitHistoryDelete() {
+    const state = this._historyDelete;
+    if (!state || !state.scope || state.busy) return;
+    if (!this._hass || typeof this._hass.callWS !== "function") {
+      state.status = { kind: "bad", text: "Home Assistant connection is unavailable." };
+      this._safeRender("render");
+      return;
+    }
+    const payload = this._historyDeleteRequest(state.scope, state.key, state.typed);
+    if (!payload) {
+      state.status = { kind: "bad", text: "Type the exact confirmation phrase first." };
+      this._safeRender("render");
+      return;
+    }
+    state.busy = true;
+    state.status = null;
+    this._safeRender("render");
+    try {
+      const response = await this._withTimeout(this._hass.callWS(payload), 30000);
+      const result = this._validateHistoryDeleteResponse(response);
+      this._markOperationSuccess("messages_delete");
+      const retainedNote = result.retained > 0
+        ? ` ${result.retained} message(s) still being sent were kept.`
+        : "";
+      this._historyDelete = {
+        ...this._idleHistoryDelete(),
+        open: true,
+        status: { kind: "good", text: `Permanently deleted ${result.deleted} message(s).${retainedNote}` },
+      };
+      await this._loadMessages(100, false);
+    } catch (error) {
+      const code = this._safeErrorCode(error);
+      let text = "MeshNet could not delete message history. Reload history to check what remains.";
+      if (code === "confirmation_mismatch") text = "The confirmation phrase did not match. Nothing was deleted.";
+      else if (code === "conversation_required") text = "Select one exact conversation first. Nothing was deleted.";
+      else if (code === "timeout") text = "Deletion timed out. Reload history to check what remains.";
+      else if (code === "unauthorized") text = "Only an administrator can delete message history.";
+      if (!this._failureWasRecorded(error)) {
+        this._recordFailure("messages_delete", code === "timeout" ? "timeout" : "websocket", error);
+      }
+      this._historyDelete = { ...state, typed: "", busy: false, status: { kind: "bad", text } };
+    }
+    if (this._activeView === "messages") this._safeRender("render");
   }
 
   _bindComposer() {

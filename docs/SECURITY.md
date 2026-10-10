@@ -355,6 +355,20 @@ The setup helper stores absolute paths and local hardware identifiers under
 current user (`0700`), but it should still never be attached to a public issue
 without careful review.
 
+## Message History Deletion
+
+The panel's **Manage history** controls and the `meshnet/messages/delete`
+websocket command permanently delete cached message history. They are
+administrator only, and the server independently requires the exact phrase
+`permanently delete this data` in the request, so a client cannot skip the
+typed confirmation. A conversation deletion must name the exact conversation
+key the panel groups by; a malformed key is rejected before any row is read.
+Messages whose send is still in flight are kept and counted so a late radio
+acknowledgement cannot resurrect deleted rows. The phrase is never persisted
+by the panel, and MeshNet logs only the scope and counts. Deletion does not
+reach Home Assistant Recorder, logbook, fired events, automation traces, or
+backups, which keep their own copies until removed with their own tools.
+
 ## Backups
 
 Backups may contain message history and node locations.

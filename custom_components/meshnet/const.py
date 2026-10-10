@@ -6,7 +6,7 @@ from typing import Final
 
 DOMAIN: Final = "meshnet"
 NAME: Final = "MeshNet"
-VERSION: Final = "0.11.0"
+VERSION: Final = "0.12.0"
 DATA_BLUETOOTH_PAIRING: Final = f"{DOMAIN}_bluetooth_pairing"
 
 PLATFORMS: Final = ["sensor", "binary_sensor", "device_tracker"]
@@ -26,6 +26,7 @@ CONF_API_URL: Final = "api_url"
 CONF_API_KEY: Final = "api_key"
 CONF_NODE_TIMEOUT: Final = "node_timeout"
 CONF_HISTORY_DAYS: Final = "history_days"
+CONF_NODE_LIMIT: Final = "node_limit"
 CONF_PACKET_CAPTURE: Final = "packet_capture"
 CONF_SCAN_INTERVAL: Final = "scan_interval"
 CONF_MAINTENANCE_ENABLED: Final = "maintenance_enabled"
@@ -36,6 +37,18 @@ CONF_MAINTENANCE_MAX_REQUESTS: Final = "maintenance_max_requests"
 
 DEFAULT_NODE_TIMEOUT: Final = 900
 DEFAULT_HISTORY_DAYS: Final = 30
+# Rolling window of cached node records. Every retained node can create a
+# device plus sensors, binary sensors, and a tracker, and Home Assistant stops
+# creating entities at 10,000 per platform per config entry. The window keeps
+# the most recently updated records and evicts the rest.
+DEFAULT_NODE_LIMIT: Final = 250
+MIN_NODE_LIMIT: Final = 25
+MAX_NODE_LIMIT: Final = 1000
+# Home Assistant refuses to create more entities for one config entry once
+# this many are enabled (all platforms together). MeshNet evicts nodes before
+# the integration gets within ENTITY_BUDGET_HEADROOM of that cap.
+HA_ENABLED_ENTITY_CAP: Final = 10_000
+ENTITY_BUDGET_HEADROOM: Final = 1_000
 DEFAULT_SCAN_INTERVAL: Final = 30
 DEFAULT_MAINTENANCE_ENABLED: Final = False
 DEFAULT_MAINTENANCE_INTERVAL: Final = 3600
@@ -46,6 +59,10 @@ DEFAULT_MAINTENANCE_MAX_REQUESTS: Final = 10
 DEFAULT_MESHTASTIC_MQTT_TOPIC: Final = "msh/+/2/json/#"
 DEFAULT_MESHCORE_MQTT_TOPIC: Final = "meshcore/+/+/packets"
 DEFAULT_DATABASE_NAME: Final = "meshnet.sqlite3"
+
+# Exact phrase an administrator must type before MeshNet deletes cached
+# message history. The server compares it verbatim after trimming whitespace.
+MESSAGE_HISTORY_DELETE_PHRASE: Final = "permanently delete this data"
 
 # Bound work performed by the recurring admin sidebar projection.
 MAX_PANEL_NODES: Final = 1000

@@ -77,6 +77,7 @@ from .const import (
     CONF_MAINTENANCE_MAX_REQUESTS,
     CONF_MAINTENANCE_QUIET_TIME,
     CONF_MQTT_TOPIC,
+    CONF_NODE_LIMIT,
     CONF_NODE_TIMEOUT,
     CONF_PROTOCOL,
     CONF_SCAN_INTERVAL,
@@ -88,6 +89,7 @@ from .const import (
     DEFAULT_MAINTENANCE_INTERVAL,
     DEFAULT_MAINTENANCE_MAX_REQUESTS,
     DEFAULT_MAINTENANCE_QUIET_TIME,
+    DEFAULT_NODE_LIMIT,
     DEFAULT_NODE_TIMEOUT,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
@@ -97,6 +99,8 @@ from .const import (
     MAINTENANCE_MIN_INTERVAL_SECONDS,
     MAINTENANCE_MIN_QUIET_SECONDS,
     MAINTENANCE_MIN_REQUESTS,
+    MAX_NODE_LIMIT,
+    MIN_NODE_LIMIT,
     PROTOCOL_MESHCORE,
     PROTOCOL_MESHTASTIC,
     TRANSPORT_BLUETOOTH,
@@ -648,6 +652,7 @@ class MeshNetConfigFlow(
                 CONF_GATEWAYS: deepcopy(self._gateways),
                 CONF_NODE_TIMEOUT: DEFAULT_NODE_TIMEOUT,
                 CONF_HISTORY_DAYS: DEFAULT_HISTORY_DAYS,
+                CONF_NODE_LIMIT: DEFAULT_NODE_LIMIT,
             },
         )
         return result
@@ -679,6 +684,7 @@ class MeshNetConfigFlow(
                     CONF_GATEWAYS: deepcopy(self._gateways),
                     CONF_NODE_TIMEOUT: user_input[CONF_NODE_TIMEOUT],
                     CONF_HISTORY_DAYS: user_input[CONF_HISTORY_DAYS],
+                    CONF_NODE_LIMIT: user_input[CONF_NODE_LIMIT],
                 },
             )
         return self.async_show_form(
@@ -725,6 +731,9 @@ class MeshNetConfigFlow(
                 ),
                 CONF_HISTORY_DAYS: user_input.get(
                     CONF_HISTORY_DAYS, DEFAULT_HISTORY_DAYS
+                ),
+                CONF_NODE_LIMIT: user_input.get(
+                    CONF_NODE_LIMIT, DEFAULT_NODE_LIMIT
                 ),
             },
         )
@@ -1085,6 +1094,12 @@ class MeshNetOptionsFlow(_MeshtasticPairingFlowMixin, config_entries.OptionsFlow
                     CONF_HISTORY_DAYS,
                     self.config_entry.data.get(
                         CONF_HISTORY_DAYS, DEFAULT_HISTORY_DAYS
+                    ),
+                ),
+                node_limit=self.config_entry.options.get(
+                    CONF_NODE_LIMIT,
+                    self.config_entry.data.get(
+                        CONF_NODE_LIMIT, DEFAULT_NODE_LIMIT
                     ),
                 ),
                 scan_interval=self.config_entry.options.get(
@@ -1625,6 +1640,7 @@ def _settings_schema(
     *,
     node_timeout: int = DEFAULT_NODE_TIMEOUT,
     history_days: int = DEFAULT_HISTORY_DAYS,
+    node_limit: int = DEFAULT_NODE_LIMIT,
     scan_interval: int = DEFAULT_SCAN_INTERVAL,
     include_scan_interval: bool = False,
 ) -> vol.Schema:
@@ -1634,6 +1650,9 @@ def _settings_schema(
         ),
         vol.Required(CONF_HISTORY_DAYS, default=history_days): vol.All(
             vol.Coerce(int), vol.Range(min=1, max=3650)
+        ),
+        vol.Required(CONF_NODE_LIMIT, default=node_limit): vol.All(
+            vol.Coerce(int), vol.Range(min=MIN_NODE_LIMIT, max=MAX_NODE_LIMIT)
         ),
     }
     if include_scan_interval:

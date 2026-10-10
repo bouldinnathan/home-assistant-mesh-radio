@@ -76,7 +76,8 @@
         "description": "MeshNet will start with {gateway_count} gateway(s). These defaults work well for most networks.",
         "data": {
           "node_timeout": "Mark nodes offline after (seconds)",
-          "history_days": "Keep message history (days)"
+          "history_days": "Keep message history (days)",
+          "node_limit": "Keep at most this many nodes (rolling window)"
         }
       }
     },
@@ -214,6 +215,7 @@
         "data": {
           "node_timeout": "Mark nodes offline after (seconds)",
           "history_days": "Keep message history (days)",
+          "node_limit": "Keep at most this many nodes (rolling window)",
           "scan_interval": "Bridge polling interval (seconds)"
         }
       },
@@ -382,6 +384,10 @@
     "gateway_issue": {
       "title": "MeshNet gateway issue",
       "description": "{message}"
+    },
+    "entity_budget": {
+      "title": "MeshNet is near Home Assistant's entity limit",
+      "description": "MeshNet is keeping {effective_limit} nodes instead of the configured {configured_limit} so this integration stays under Home Assistant's limit of {entity_cap} enabled entities ({enabled_entities} are enabled now). Home Assistant stops creating entities at that limit. Lower node_limit under Configure -> History and timing, or disable node entities you do not use. This repair clears itself once the configured window fits."
     }
   }
 }

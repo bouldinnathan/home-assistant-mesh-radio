@@ -309,6 +309,20 @@ excluded destructive operations.
 
 ### Advanced local mesh tools
 
+Version 0.12.0 keeps a rolling window of cached node records (`node_limit`,
+default 250, range 25 to 1000). The least recently heard records beyond the
+window are evicted together with their Home Assistant devices and entities,
+while gateway-owned nodes and **MeshNet Favorite** nodes are never evicted.
+This replaces an unbounded cache that could reach Home Assistant's limit of
+10,000 enabled entities per config entry. As a last line of defense MeshNet
+also reads Home Assistant's own enabled-entity counter, evicts nodes before
+the integration gets within 1,000 entities of that limit, and raises a repair
+that shows the lowered window. The Messages view also gains a collapsed
+**Manage history** disclosure that can permanently delete one conversation or
+all cached history after you type `permanently delete this data`; Home
+Assistant verifies the phrase again server-side, and Recorder, logbook,
+events, traces, and backups are not touched.
+
 Version 0.11.0 adds **Geographic scale** and **Topology** graph layouts. The
 geographic view uses one real map scale, labels edge distance, keeps a rolling
 24-hour hourly position trail for moving nodes, and places unlocated nodes on

@@ -499,3 +499,31 @@ def test_install_is_idempotent_and_real_logger_never_emits_secret(caplog) -> Non
 
     assert secret not in caplog.text
     assert "<redacted by MeshNet>" in caplog.text
+
+
+def test_filter_redacts_history_delete_conversation_identity() -> None:
+    command = {
+        "id": 9,
+        "type": "meshnet/messages/delete",
+        "scope": "conversation",
+        "conversation_key": "direct:meshtastic:!12345678",
+        "confirmation": "permanently delete this data",
+    }
+    original = dict(command)
+    record = logging.LogRecord(
+        "homeassistant.components.websocket_api.http.connection",
+        logging.DEBUG,
+        __file__,
+        1,
+        "%s: Received %s",
+        ("connection", command),
+        None,
+    )
+
+    assert _MeshNetWebSocketRedactionFilter().filter(record) is True
+
+    rendered = record.getMessage()
+    assert "!12345678" not in rendered
+    assert rendered.count("<redacted by MeshNet>") == 1
+    assert "permanently delete this data" in rendered
+    assert command == original

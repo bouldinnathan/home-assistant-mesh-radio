@@ -508,6 +508,46 @@ Expected:
 
 If unauthorized, configure `api_key`.
 
+### Too Many Entities Or A Flooded Panel
+
+Symptoms in the Home Assistant log:
+
+```text
+Reached the maximum of 10000 enabled entities for config entry ... integration meshnet
+Client unable to keep up with pending messages. Reached 4096 pending messages.
+```
+
+Every cached node creates a device plus sensors, binary sensors, and a tracker,
+and each coordinator update writes state for all of them. Home Assistant stops
+creating entities for a config entry once 10,000 are enabled, counted across
+all platforms together, and logs the first line above from each platform.
+Before 0.12.0 the cached node table was never pruned, so a large MQTT mesh or
+a long-lived cache could reach that cap and starve the event loop, which can
+also make a local Bluetooth radio connection time out.
+
+0.12.0 keeps a rolling window of `node_limit` node records (default 250). On
+the first start it trims records beyond the window, removes their devices and
+entities, and logs one warning with the count. Lower `node_limit` under
+**Configure -> History and timing** if the panel still feels slow, or raise it
+up to 1000 for a large mesh. Gateway-owned nodes and **MeshNet Favorite**
+nodes are never evicted. The `node_window` section of the diagnostics download
+shows the limit and the trim, eviction, and device-removal counters.
+
+MeshNet also guards the cap itself. Before it caches a node it has never seen,
+at startup, and on every refresh it reads the same enabled-entity counter Home
+Assistant checks and keeps 1,000 entities of headroom under the cap. When the
+next node would not fit, it evicts the least recently heard nodes until the
+window fits the budget, even if `node_limit` allows more, and raises the
+repair **MeshNet is near Home Assistant's entity limit** with the effective
+and configured node counts. The repair clears itself once the configured
+window fits again. While evicted devices are still being removed, platforms
+hold new entities so Home Assistant never refuses them. The `entity_budget`
+block under `node_window` in diagnostics shows the measured count, the node
+ceiling, and whether the guard is active. The window never drops below 25
+nodes, so if the repair stays at 25 the registry holds enabled entities that
+do not belong to cached nodes; remove or disable them under
+**Settings -> Devices & services -> Entities**.
+
 ### No Nodes Appear
 
 Checks:

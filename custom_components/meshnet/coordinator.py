@@ -25,6 +25,13 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
+try:
+    from homeassistant.helpers.entity_platform import (
+        MAX_ENABLED_ENTITIES_PER_CONFIG_ENTRY as _HA_ENABLED_ENTITY_CAP,
+    )
+except Exception:  # pragma: no cover - older Home Assistant or the lightweight test shim
+    _HA_ENABLED_ENTITY_CAP = None
+
 from .aiomeshtastic.errors import MeshtasticNeighborInfoError
 from .const import (
     ATTR_CHANNEL,
@@ -40,6 +47,7 @@ from .const import (
     CONF_MAINTENANCE_INTERVAL,
     CONF_MAINTENANCE_MAX_REQUESTS,
     CONF_MAINTENANCE_QUIET_TIME,
+    CONF_NODE_LIMIT,
     CONF_NODE_TIMEOUT,
     CONF_SCAN_INTERVAL,
     DEFAULT_DATABASE_NAME,
@@ -48,14 +56,17 @@ from .const import (
     DEFAULT_MAINTENANCE_INTERVAL,
     DEFAULT_MAINTENANCE_MAX_REQUESTS,
     DEFAULT_MAINTENANCE_QUIET_TIME,
+    DEFAULT_NODE_LIMIT,
     DEFAULT_NODE_TIMEOUT,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    ENTITY_BUDGET_HEADROOM,
     EVENT_GATEWAY_STATUS,
     EVENT_MESSAGE_RECEIVED,
     EVENT_MESSAGE_SENT,
     EVENT_MESSAGE_STATUS,
     EVENT_PACKET,
+    HA_ENABLED_ENTITY_CAP,
     MAINTENANCE_MAX_INTERVAL_SECONDS,
     MAINTENANCE_MAX_QUIET_SECONDS,
     MAINTENANCE_MAX_REQUESTS,
@@ -65,11 +76,13 @@ from .const import (
     MAINTENANCE_REQUEST_SPACING_SECONDS,
     MAINTENANCE_SCHEDULER_TICK_SECONDS,
     MANUAL_TRACEROUTE_COOLDOWN_SECONDS,
+    MAX_NODE_LIMIT,
     MAX_PANEL_NODES,
     MESSAGE_TYPE_BROADCAST,
     MESSAGE_TYPE_DIRECT,
     MESSAGE_TYPE_EMERGENCY,
     MESSAGE_TYPE_GROUP,
+    MIN_NODE_LIMIT,
     PROTOCOL_MESHCORE,
     PROTOCOL_MESHTASTIC,
     TRANSPORT_BLUETOOTH,
@@ -114,6 +127,11 @@ _RECONNECT_JITTER_RATIO = 0.2
 _GATEWAY_TASK_CANCEL_TIMEOUT = 2.0
 _CONNECTION_UPDATE_ACK_TIMEOUT = 5.0
 _DIAGNOSTIC_STORE_TIMEOUT = 2.0
+# Yield to the event loop between registry removals so a one-time trim of a
+# very large cached node table cannot stall Home Assistant.
+_NODE_WINDOW_REGISTRY_YIELD_EVERY = 100
+_CONVERSATION_KEY_RE = re.compile(r"^(?:broadcast:0|channel:[1-7]|direct:\S{1,256}|unknown)$")
+_MESSAGE_HISTORY_SCOPES = frozenset({"all", "conversation"})
 _AMBIGUOUS_MESSAGE_ERROR = (
     "The selected Meshtastic identity is ambiguous; direct messaging is disabled until its node records agree"
 )
@@ -643,6 +661,84 @@ def _message_delivery(message: MessageRecord) -> tuple[str, str | None]:
     return "unknown", None
 
 
+def message_conversation_key(message: MessageRecord) -> str:
+    """Return the panel's conversation key for one retained message.
+
+    The panel groups ``meshnet/messages`` records by delivery, peer identity,
+    and channel index. This mirrors that grouping on the server so a deletion
+    request names exactly the thread an administrator is looking at.
+    """
+    delivery, peer_node_key = _message_delivery(message)
+    if delivery == "direct":
+        return f"direct:{peer_node_key}" if peer_node_key else "unknown"
+    if delivery == "channel":
+        index = _message_channel_index(message.channel)
+        return f"channel:{index}" if index is not None and 1 <= index <= 7 else "unknown"
+    if delivery == "broadcast":
+        return "broadcast:0"
+    return "unknown"
+
+
+def conversation_key_is_valid(value: Any) -> bool:
+    """Return whether a caller-supplied conversation key has the exact shape."""
+    return isinstance(value, str) and _CONVERSATION_KEY_RE.fullmatch(value) is not None
+
+
+def entity_cap() -> int:
+    """Return Home Assistant's enabled-entity limit per config entry."""
+    cap = _HA_ENABLED_ENTITY_CAP
+    if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0:
+        return cap
+    return HA_ENABLED_ENTITY_CAP
+
+
+def entity_budget(cap: int) -> int:
+    """Return the enabled-entity count MeshNet refuses to grow past."""
+    if cap > ENTITY_BUDGET_HEADROOM * 2:
+        return cap - ENTITY_BUDGET_HEADROOM
+    return max(1, cap // 2)
+
+
+def entity_budget_node_ceiling(enabled_entities: Any, cached_nodes: Any, *, budget: int) -> int | None:
+    """Return how many cached nodes fit under ``budget`` enabled entities.
+
+    ``None`` means one more node clearly fits, so the configured window
+    applies unchanged. Once the next node might not fit, the current node
+    count is scaled by the remaining budget, so stale registry entries,
+    user-disabled entities, and per-node telemetry growth are all accounted
+    for exactly as Home Assistant counts them.
+    """
+    for value in (enabled_entities, cached_nodes):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return None
+    per_node = -(-enabled_entities // cached_nodes)
+    if enabled_entities + per_node <= budget:
+        return None
+    return (cached_nodes * budget) // enabled_entities
+
+
+def bounded_node_limit(value: Any) -> int:
+    """Clamp a configured rolling node window to the supported range."""
+    if isinstance(value, bool):
+        return DEFAULT_NODE_LIMIT
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_NODE_LIMIT
+    return max(MIN_NODE_LIMIT, min(MAX_NODE_LIMIT, limit))
+
+
+def _node_device(device_registry: Any, *, config_entry_id: str, node_key: str) -> Any:
+    """Look up one node device across the old and entry-scoped registry APIs."""
+    scoped_lookup = getattr(device_registry, "async_get_device_by_identifier", None)
+    if callable(scoped_lookup):
+        return scoped_lookup((DOMAIN, node_key), config_entry_id)
+    legacy_lookup = getattr(device_registry, "async_get_device", None)
+    if callable(legacy_lookup):
+        return legacy_lookup(identifiers={(DOMAIN, node_key)})
+    return None
+
+
 def message_submission_response(message_id: str, status: str) -> dict[str, Any]:
     """Return the bounded response for a Home Assistant send action."""
     durable_status = status if status in _PUBLIC_MESSAGE_STATUSES else "queued"
@@ -957,6 +1053,14 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         self.history_days = int(
             entry.options.get(CONF_HISTORY_DAYS, entry.data.get(CONF_HISTORY_DAYS, DEFAULT_HISTORY_DAYS))
         )
+        self.node_limit = bounded_node_limit(
+            entry.options.get(CONF_NODE_LIMIT, entry.data.get(CONF_NODE_LIMIT, DEFAULT_NODE_LIMIT))
+        )
+        self._node_removed_listeners: list[Callable[[frozenset[str]], None]] = []
+        self._node_window_stats: dict[str, int] = {}
+        self._node_cleanup_pending = 0
+        self._entity_budget_state: dict[str, Any] = {}
+        self._entity_budget_issue_signature: tuple[int, int] | None = None
         self.store = MeshStore(Path(hass.config.path(DEFAULT_DATABASE_NAME)), executor=hass.async_add_executor_job)
         self.deduplicator = PacketDeduplicator()
         self.tx_limiter = TokenBucket(rate=0.5, capacity=5)
@@ -1213,6 +1317,31 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         await self.store.async_open()
         cached = await self.store.async_load_snapshot(recent_limit=100)
         self._raw_nodes = dict(cached.nodes)
+        trimmed = self._trim_raw_nodes_to_window()
+        if trimmed:
+            await self.store.async_delete_nodes(trimmed)
+            self._bump_node_window_stat("startup_trimmed", len(trimmed))
+            _LOGGER.warning(
+                "MeshNet trimmed %d cached node record(s) outside the %d-node rolling window",
+                len(trimmed),
+                self._effective_node_limit(),
+            )
+            self._schedule_node_cleanup(trimmed)
+        # Entities registered by earlier runs count toward Home Assistant's cap
+        # before any platform loads, so the budget is measured here as well.
+        if self._refresh_entity_budget():
+            budget_trimmed = self._trim_raw_nodes_to_window()
+            if budget_trimmed:
+                await self.store.async_delete_nodes(budget_trimmed)
+                self._bump_node_window_stat("startup_trimmed", len(budget_trimmed))
+                self._bump_node_window_stat("budget_evicted", len(budget_trimmed))
+                _LOGGER.warning(
+                    "MeshNet trimmed %d more cached node record(s) so the integration stays "
+                    "under Home Assistant's limit of %d enabled entities",
+                    len(budget_trimmed),
+                    self._entity_cap(),
+                )
+                self._schedule_node_cleanup(budget_trimmed)
         self._refresh_effective_node_projection()
         self.snapshot.recent_messages = cached.recent_messages
         try:
@@ -1311,6 +1440,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         started = time.monotonic()
         self._last_update_attempt_at = utcnow()
         try:
+            await self._async_enforce_entity_budget()
             await self.store.async_prune(self.history_days)
             self._prune_topology_history_cache()
             self._mark_stale_nodes()
@@ -2911,9 +3041,11 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             topology_history = {}
 
         return {
+            "node_window": self.node_window_diagnostics(),
             "configuration": {
                 "node_timeout": self.node_timeout,
                 "history_days": self.history_days,
+                "node_limit": self._configured_node_limit(),
                 "gateway_count": len(self.gateways),
                 "maintenance_requested": entry_options.get(
                     CONF_MAINTENANCE_ENABLED,
@@ -3170,6 +3302,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             if raw_nodes is None:
                 raw_nodes = self._raw_nodes = dict(self.snapshot.nodes)
             existing = raw_nodes.get(node.node_key)
+            new_record = existing is None
             identity_before = self._node_identity_signature(existing) if existing is not None else None
             if existing:
                 existing.merge(node)
@@ -3179,10 +3312,522 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             await self.store.async_upsert_node(node)
             if not self._gateway_callback_is_current(gateway_generation):
                 return
-            self._refresh_effective_node_projection(changed_raw_key=node.node_key if identity_unchanged else None)
+            if new_record:
+                # A record that was never cached may need entities, so measure
+                # Home Assistant's enabled-entity count before widening the window.
+                self._refresh_entity_budget()
+            evicted = self._trim_raw_nodes_to_window(protect=(node.node_key,))
+            if evicted:
+                await self.store.async_delete_nodes(evicted)
+                self._record_window_eviction(len(evicted))
+                if not self._gateway_callback_is_current(gateway_generation):
+                    return
+                self._refresh_effective_node_projection()
+            else:
+                self._refresh_effective_node_projection(
+                    changed_raw_key=node.node_key if identity_unchanged else None
+                )
+        if evicted:
+            self._schedule_node_cleanup(evicted)
         if not self._gateway_callback_is_current(gateway_generation):
             return
         self.async_set_updated_data(self.snapshot)
+
+    def _effective_node_limit(self) -> int:
+        """Return the configured window, lowered while the entity budget binds."""
+        configured = self._configured_node_limit()
+        ceiling = self._entity_budget_ceiling()
+        if ceiling is None:
+            return configured
+        return min(configured, max(MIN_NODE_LIMIT, ceiling))
+
+    def _configured_node_limit(self) -> int:
+        return bounded_node_limit(getattr(self, "node_limit", DEFAULT_NODE_LIMIT))
+
+    @staticmethod
+    def _entity_cap() -> int:
+        return entity_cap()
+
+    def _entity_budget_ceiling(self) -> int | None:
+        state = getattr(self, "_entity_budget_state", None)
+        if not isinstance(state, dict):
+            return None
+        ceiling = state.get("node_ceiling")
+        if isinstance(ceiling, bool) or not isinstance(ceiling, int):
+            return None
+        return ceiling
+
+    def _entity_budget_binding(self) -> bool:
+        """Return True while the entity budget keeps fewer nodes than configured."""
+        return self._effective_node_limit() < self._configured_node_limit()
+
+    def node_cleanup_pending(self) -> bool:
+        """Return True while evicted devices are still being removed.
+
+        Platforms wait for this to clear before adding entities, because Home
+        Assistant keeps counting the evicted entities until the removal lands.
+        """
+        return int(getattr(self, "_node_cleanup_pending", 0) or 0) > 0
+
+    def _record_window_eviction(self, count: int) -> None:
+        self._bump_node_window_stat("evicted", count)
+        if self._entity_budget_binding():
+            self._bump_node_window_stat("budget_evicted", count)
+
+    def _enabled_entity_count(self) -> int | None:
+        """Return Home Assistant's enabled-entity count for this config entry.
+
+        This is the same registry counter Home Assistant checks before it
+        refuses to add an entity, so it includes stale entries and excludes
+        entities the user disabled.
+        """
+        hass = getattr(self, "hass", None)
+        entry_id = getattr(getattr(self, "entry", None), "entry_id", None)
+        if hass is None or not isinstance(entry_id, str):
+            return None
+        try:
+            from homeassistant.helpers import entity_registry as er
+
+            registry = er.async_get(hass)
+        except Exception as err:
+            _LOGGER.debug(
+                "MeshNet could not open the entity registry for the entity budget (%s)",
+                _safe_error_type(err),
+            )
+            return None
+        counter = getattr(getattr(registry, "entities", None), "get_enabled_count_for_config_entry_id", None)
+        if callable(counter):
+            try:
+                count = counter(entry_id)
+            except Exception as err:
+                _LOGGER.debug(
+                    "MeshNet could not read the enabled-entity counter (%s)",
+                    _safe_error_type(err),
+                )
+            else:
+                if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+                    return count
+        lister = getattr(er, "async_entries_for_config_entry", None)
+        if not callable(lister):
+            return None
+        try:
+            return sum(1 for entity in lister(registry, entry_id) if getattr(entity, "disabled_by", None) is None)
+        except Exception as err:
+            _LOGGER.debug(
+                "MeshNet could not count enabled entities (%s)",
+                _safe_error_type(err),
+            )
+            return None
+
+    def _refresh_entity_budget(self) -> bool:
+        """Re-measure the entity budget; returns True when a fresh ceiling applies.
+
+        Measurement is skipped while evicted devices are still being removed:
+        the registry count only drops once that cleanup finishes, and
+        re-measuring early would evict more nodes than necessary.
+        """
+        state = getattr(self, "_entity_budget_state", None)
+        if not isinstance(state, dict):
+            state = self._entity_budget_state = {}
+        if self.node_cleanup_pending():
+            state["skipped_during_cleanup"] = int(state.get("skipped_during_cleanup", 0)) + 1
+            return False
+        raw_nodes = getattr(self, "_raw_nodes", None)
+        cached = len(raw_nodes) if isinstance(raw_nodes, dict) else len(self.snapshot.nodes)
+        cap = self._entity_cap()
+        budget = entity_budget(cap)
+        enabled = self._enabled_entity_count()
+        state.update(
+            {
+                "available": enabled is not None,
+                "entity_cap": cap,
+                "budget": budget,
+                "enabled_entities": enabled,
+                "cached_nodes": cached,
+                "node_ceiling": entity_budget_node_ceiling(enabled, cached, budget=budget),
+                "checks": int(state.get("checks", 0)) + 1,
+                "last_checked_at": utcnow().isoformat(),
+            }
+        )
+        self._sync_entity_budget_issue()
+        return True
+
+    async def _async_enforce_entity_budget(self) -> int:
+        """Evict nodes when the enabled-entity count crept up without new nodes."""
+        lock = getattr(self, "_node_update_lock", None)
+        if lock is None:
+            lock = self._node_update_lock = asyncio.Lock()
+        async with lock:
+            if not self._refresh_entity_budget():
+                return 0
+            evicted = self._trim_raw_nodes_to_window()
+            if not evicted:
+                return 0
+            await self.store.async_delete_nodes(evicted)
+            self._record_window_eviction(len(evicted))
+            self._refresh_effective_node_projection()
+        self._schedule_node_cleanup(evicted)
+        return len(evicted)
+
+    def _sync_entity_budget_issue(self) -> None:
+        """Raise or clear the identity-free repair that explains a lowered window."""
+        configured = self._configured_node_limit()
+        effective = self._effective_node_limit()
+        signature = (effective, configured) if effective < configured else None
+        previous = getattr(self, "_entity_budget_issue_signature", None)
+        if signature == previous:
+            return
+        self._entity_budget_issue_signature = signature
+        state = getattr(self, "_entity_budget_state", None)
+        if not isinstance(state, dict):
+            state = {}
+        cap = state.get("entity_cap", self._entity_cap())
+        enabled = state.get("enabled_entities")
+        if signature is None:
+            _LOGGER.info("MeshNet's rolling node window is back to the configured %d node(s)", configured)
+            self._delete_resolved_issue("entity_budget")
+            return
+        if previous is None:
+            _LOGGER.warning(
+                "MeshNet is holding the rolling node window at %d node(s) instead of the configured %d "
+                "so the integration stays under Home Assistant's limit of %d enabled entities "
+                "(%d enabled now)",
+                effective,
+                configured,
+                cap,
+                enabled if isinstance(enabled, int) else 0,
+            )
+        self._create_entity_budget_issue(
+            effective_limit=effective,
+            configured_limit=configured,
+            entity_cap=cap,
+            enabled_entities=enabled if isinstance(enabled, int) else 0,
+        )
+
+    def _create_entity_budget_issue(
+        self,
+        *,
+        effective_limit: int,
+        configured_limit: int,
+        entity_cap: int,
+        enabled_entities: int,
+    ) -> None:
+        creator = getattr(ir, "async_create_issue", None)
+        hass = getattr(self, "hass", None)
+        if not callable(creator) or hass is None:
+            return
+        try:
+            creator(
+                hass,
+                DOMAIN,
+                "entity_budget",
+                is_fixable=False,
+                is_persistent=False,
+                severity=ir.IssueSeverity.WARNING,
+                translation_key="entity_budget",
+                translation_placeholders={
+                    "effective_limit": str(effective_limit),
+                    "configured_limit": str(configured_limit),
+                    "entity_cap": str(entity_cap),
+                    "enabled_entities": str(enabled_entities),
+                },
+            )
+        except Exception as err:
+            _LOGGER.debug(
+                "Could not create the MeshNet entity budget repair: %s",
+                type(err).__name__,
+            )
+
+    def entity_budget_diagnostics(self) -> dict[str, Any]:
+        """Return identity-free entity budget measurements."""
+        state = getattr(self, "_entity_budget_state", None)
+        if not isinstance(state, dict):
+            state = {}
+        cap = state.get("entity_cap", self._entity_cap())
+        return {
+            "available": bool(state.get("available", False)),
+            "entity_cap": cap,
+            "budget": state.get("budget", entity_budget(cap)),
+            "enabled_entities": state.get("enabled_entities"),
+            "cached_nodes": state.get("cached_nodes"),
+            "node_ceiling": state.get("node_ceiling"),
+            "binding": self._entity_budget_binding(),
+            "checks": int(state.get("checks", 0)),
+            "skipped_during_cleanup": int(state.get("skipped_during_cleanup", 0)),
+            "last_checked_at": state.get("last_checked_at"),
+        }
+
+    def _bump_node_window_stat(self, name: str, amount: int) -> None:
+        stats = getattr(self, "_node_window_stats", None)
+        if not isinstance(stats, dict):
+            stats = self._node_window_stats = {}
+        stats[name] = int(stats.get(name, 0)) + int(amount)
+
+    def node_window_diagnostics(self) -> dict[str, Any]:
+        """Return identity-free rolling-window counters."""
+        stats = getattr(self, "_node_window_stats", None)
+        if not isinstance(stats, dict):
+            stats = {}
+        raw_nodes = getattr(self, "_raw_nodes", None)
+        return {
+            "node_limit": self._configured_node_limit(),
+            "effective_node_limit": self._effective_node_limit(),
+            "retained_raw_records": len(raw_nodes) if isinstance(raw_nodes, dict) else len(self.snapshot.nodes),
+            "startup_trimmed": int(stats.get("startup_trimmed", 0)),
+            "evicted": int(stats.get("evicted", 0)),
+            "budget_evicted": int(stats.get("budget_evicted", 0)),
+            "devices_removed": int(stats.get("devices_removed", 0)),
+            "registry_failures": int(stats.get("registry_failures", 0)),
+            "cleanup_pending": self.node_cleanup_pending(),
+            "entity_budget": self.entity_budget_diagnostics(),
+        }
+
+    def _trim_raw_nodes_to_window(self, *, protect: Collection[str] = ()) -> list[str]:
+        """Evict the least recently heard raw node records beyond the window.
+
+        Gateway-owned nodes, favorite nodes, and the record being updated are
+        never evicted. Records that were never heard go first, then the oldest
+        ``last_heard``; ties break on the key so eviction is deterministic.
+        """
+        raw_nodes = getattr(self, "_raw_nodes", None)
+        if not isinstance(raw_nodes, dict):
+            return []
+        overflow = len(raw_nodes) - self._effective_node_limit()
+        if overflow <= 0:
+            return []
+        protected = set(protect) | self._protected_node_keys(raw_nodes)
+        candidates = [key for key in raw_nodes if key not in protected]
+        if not candidates:
+            return []
+
+        def recency(key: str) -> tuple[bool, float, str]:
+            heard = getattr(raw_nodes[key], "last_heard", None)
+            stamp: float | None = None
+            if isinstance(heard, datetime):
+                try:
+                    stamp = heard.timestamp()
+                except (OverflowError, OSError, ValueError):
+                    stamp = None
+            return (stamp is not None, stamp if stamp is not None else 0.0, key)
+
+        candidates.sort(key=recency)
+        evicted = candidates[:overflow]
+        observed = getattr(self, "_session_observed_node_keys", None)
+        for key in evicted:
+            raw_nodes.pop(key, None)
+            if isinstance(observed, set):
+                observed.discard(key)
+        return evicted
+
+    def _protected_node_keys(self, raw_nodes: Mapping[str, NodeState]) -> set[str]:
+        """Return raw keys the rolling window must keep."""
+        protected: set[str] = set()
+        local_ids: set[str] = set()
+        gateways = getattr(self, "gateways", None)
+        if isinstance(gateways, Mapping):
+            for gateway in gateways.values():
+                local_id = canonical_meshtastic_node_id(getattr(gateway, "local_node_id", None))
+                if local_id is not None:
+                    local_ids.add(local_id)
+        if local_ids:
+            for key, node in raw_nodes.items():
+                if canonical_meshtastic_node_id(getattr(node, "node_id", None)) in local_ids:
+                    protected.add(key)
+        protected.update(self._favorite_raw_node_keys())
+        return protected
+
+    def _favorite_raw_node_keys(self) -> set[str]:
+        """Map the optional favorite label back onto retained raw records."""
+        hass = getattr(self, "hass", None)
+        entry_id = getattr(getattr(self, "entry", None), "entry_id", None)
+        if hass is None or not isinstance(entry_id, str):
+            return set()
+        try:
+            from .websocket_api import _favorite_nodes
+
+            _configured, favorites = _favorite_nodes(hass, entry_id, dict(self.snapshot.nodes))
+        except Exception as err:
+            _LOGGER.debug(
+                "MeshNet could not read favorite nodes for window protection (%s)",
+                _safe_error_type(err),
+            )
+            return set()
+        aliases_by_effective = getattr(self, "_node_aliases_by_effective", {})
+        protected: set[str] = set()
+        for key in favorites:
+            if not isinstance(key, str):
+                continue
+            protected.add(key)
+            aliases = aliases_by_effective.get(key, ()) if isinstance(aliases_by_effective, Mapping) else ()
+            protected.update(alias for alias in aliases if isinstance(alias, str))
+        return protected
+
+    def _schedule_node_cleanup(self, node_keys: Collection[str]) -> None:
+        """Remove evicted node devices and entities without blocking the caller."""
+        keys = frozenset(key for key in node_keys if isinstance(key, str) and key)
+        if not keys:
+            return
+        if getattr(self, "hass", None) is None or getattr(self, "entry", None) is None:
+            self._notify_node_removed(keys)
+            return
+        self._node_cleanup_pending = int(getattr(self, "_node_cleanup_pending", 0) or 0) + 1
+        cleanup = self._async_run_node_cleanup(keys)
+        try:
+            self._async_create_background_task(cleanup, "MeshNet node window cleanup")
+        except Exception as err:
+            cleanup.close()
+            self._node_cleanup_pending = max(0, self._node_cleanup_pending - 1)
+            _LOGGER.debug(
+                "MeshNet could not schedule node cleanup (%s)",
+                _safe_error_type(err),
+            )
+            self._notify_node_removed(keys)
+
+    async def _async_run_node_cleanup(self, node_keys: frozenset[str]) -> None:
+        try:
+            await self._async_forget_node_devices(node_keys)
+        finally:
+            self._node_cleanup_pending = max(0, int(getattr(self, "_node_cleanup_pending", 0) or 0) - 1)
+            if not self._node_cleanup_pending:
+                # Platforms hold new entities while devices are being removed;
+                # wake them now that Home Assistant's count reflects the removals.
+                wake = getattr(self, "async_update_listeners", None)
+                if callable(wake):
+                    try:
+                        wake()
+                    except Exception as err:
+                        _LOGGER.debug(
+                            "MeshNet could not wake platforms after node cleanup (%s)",
+                            _safe_error_type(err),
+                        )
+
+    async def _async_forget_node_devices(self, node_keys: Collection[str]) -> None:
+        keys = frozenset(key for key in node_keys if isinstance(key, str) and key)
+        removed = 0
+        failures = 0
+        registry: Any = None
+        hass = getattr(self, "hass", None)
+        entry_id = getattr(getattr(self, "entry", None), "entry_id", None)
+        if hass is not None and isinstance(entry_id, str):
+            try:
+                from homeassistant.helpers import device_registry as dr
+
+                registry = dr.async_get(hass)
+            except Exception as err:
+                failures += 1
+                _LOGGER.debug(
+                    "MeshNet could not open the device registry for node cleanup (%s)",
+                    _safe_error_type(err),
+                )
+        if registry is not None:
+            for index, key in enumerate(sorted(keys)):
+                if index and index % _NODE_WINDOW_REGISTRY_YIELD_EVERY == 0:
+                    await asyncio.sleep(0)
+                try:
+                    device = _node_device(registry, config_entry_id=entry_id, node_key=key)
+                    if device is None:
+                        continue
+                    registry.async_remove_device(device.id)
+                    removed += 1
+                except Exception as err:
+                    failures += 1
+                    _LOGGER.debug(
+                        "MeshNet could not remove a node device outside the rolling window (%s)",
+                        _safe_error_type(err),
+                    )
+        if removed:
+            self._bump_node_window_stat("devices_removed", removed)
+            _LOGGER.info("MeshNet removed %d node device(s) outside the rolling window", removed)
+        if failures:
+            self._bump_node_window_stat("registry_failures", failures)
+        self._notify_node_removed(keys)
+
+    def async_add_node_removed_listener(
+        self, listener: Callable[[frozenset[str]], None]
+    ) -> Callable[[], None]:
+        """Subscribe to rolling-window evictions; returns an unsubscribe callable."""
+        listeners = getattr(self, "_node_removed_listeners", None)
+        if not isinstance(listeners, list):
+            listeners = self._node_removed_listeners = []
+        listeners.append(listener)
+
+        def unsubscribe() -> None:
+            try:
+                listeners.remove(listener)
+            except ValueError:
+                pass
+
+        return unsubscribe
+
+    def _notify_node_removed(self, node_keys: frozenset[str]) -> None:
+        listeners = getattr(self, "_node_removed_listeners", None)
+        if not isinstance(listeners, list) or not node_keys:
+            return
+        for listener in list(listeners):
+            try:
+                listener(node_keys)
+            except Exception as err:
+                _LOGGER.debug(
+                    "MeshNet node removal listener failed (%s)",
+                    _safe_error_type(err),
+                )
+
+    async def async_delete_message_history(
+        self,
+        *,
+        scope: str,
+        conversation_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Permanently delete cached message history from MeshNet's database.
+
+        ``scope`` is ``all`` or ``conversation``. Messages whose send is still
+        in flight are kept so a late provider acknowledgement cannot resurrect
+        a deleted row. Home Assistant Recorder history, logbook entries, fired
+        events, automation traces, and backups are outside this database and
+        are not touched.
+        """
+        if scope not in _MESSAGE_HISTORY_SCOPES:
+            raise ValueError("Unsupported message history scope")
+        if scope == "conversation":
+            if not conversation_key_is_valid(conversation_key):
+                raise ValueError("A conversation deletion needs one exact conversation key")
+        else:
+            conversation_key = None
+        active = frozenset(getattr(self, "_active_send_message_ids", ()))
+        retained_active = 0
+
+        def predicate(message: MessageRecord) -> bool:
+            nonlocal retained_active
+            if scope != "all" and message_conversation_key(message) != conversation_key:
+                return False
+            if message.message_id in active:
+                retained_active += 1
+                return False
+            return True
+
+        if scope == "all" and not active:
+            deleted = await self.store.async_delete_message_history(None)
+        else:
+            deleted = await self.store.async_delete_message_history(predicate)
+        self.snapshot.recent_messages = await self.store.async_recent_messages(100)
+        midnight = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        self.snapshot.messages_today = await self.store.async_messages_since(midnight)
+        self.async_set_updated_data(self.snapshot)
+        # Direct conversation keys carry node identity, so only the scope and
+        # counts are logged.
+        _LOGGER.warning(
+            "MeshNet permanently deleted %d cached message(s) (scope=%s, retained_in_flight=%d)",
+            deleted,
+            scope,
+            retained_active,
+        )
+        return {
+            "schema_version": 1,
+            "scope": scope,
+            "conversation_key": conversation_key,
+            "deleted_messages": int(deleted),
+            "retained_active": int(retained_active),
+        }
 
     async def _async_record_graph_position(self, node: NodeState) -> None:
         """Best-effort retain one real node observation for a rolling-day trail."""
@@ -4019,8 +4664,8 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         for category in _GATEWAY_ISSUE_CATEGORIES:
             if issue_id.startswith(f"{category}_"):
                 return category
-        if issue_id == "no_gateways":
-            return "no_gateways"
+        if issue_id in ("no_gateways", "entity_budget"):
+            return issue_id
         return "other"
 
     def _delete_legacy_gateway_issues(self) -> int:
@@ -4060,7 +4705,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
 
     def _delete_resolved_issue(self, issue_id: str) -> bool:
         """Delete one identity-free resolved repair without affecting startup."""
-        if issue_id != "no_gateways" and _SAFE_GATEWAY_ISSUE_RE.fullmatch(issue_id) is None:
+        if issue_id not in ("no_gateways", "entity_budget") and _SAFE_GATEWAY_ISSUE_RE.fullmatch(issue_id) is None:
             return False
         issue_deleter = getattr(ir, "async_delete_issue", None)
         hass = getattr(self, "hass", None)

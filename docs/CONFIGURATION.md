@@ -19,6 +19,7 @@ Advanced YAML import:
 meshnet:
   node_timeout: 900
   history_days: 30
+  node_limit: 250
   gateways:
     meshtastic_wifi_1:
       gateway_id: meshtastic_wifi_1
@@ -43,6 +44,7 @@ current-bond cleanup for a different address.
 | --- | --- | --- |
 | `node_timeout` | `900` | Seconds before a node is marked offline after its last packet |
 | `history_days` | `30` | Days of message and packet history to keep in `meshnet.sqlite3` |
+| `node_limit` | `250` | Rolling window of cached node records (25 to 1000). When more nodes are cached, the least recently heard records are evicted and their Home Assistant devices and entities are removed. Nodes owned by a configured gateway and nodes labeled **MeshNet Favorite** are never evicted. The effective window is lowered automatically, never below 25, when the integration approaches Home Assistant's limit of 10,000 enabled entities per config entry; see Troubleshooting. |
 | `scan_interval` | `30` | Polling interval for transports that poll, such as REST |
 
 ## Gateway Fields

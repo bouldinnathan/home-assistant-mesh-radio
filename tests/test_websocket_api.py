@@ -17,6 +17,7 @@ from homeassistant.helpers import device_registry as dr  # noqa: E402
 from homeassistant.helpers import label_registry as lr  # noqa: E402
 
 from custom_components.meshnet import websocket_api as websocket_api_module  # noqa: E402
+from custom_components.meshnet.const import MESSAGE_HISTORY_DELETE_PHRASE  # noqa: E402
 from custom_components.meshnet.models import (  # noqa: E402
     GatewayStatus,
     MeshSnapshot,
@@ -30,6 +31,7 @@ from custom_components.meshnet.websocket_api import (  # noqa: E402
     _safe_maintenance_status,
     _snapshot_with_panel_metadata,
     websocket_messages,
+    websocket_messages_delete,
     websocket_panel_log,
     websocket_send_message,
     websocket_settings_apply,
@@ -1157,3 +1159,127 @@ def test_settings_websocket_handlers_delegate_without_exposing_provider_errors()
     import asyncio
 
     asyncio.run(run())
+
+
+def test_messages_delete_requires_exact_phrase_and_returns_fixed_errors() -> None:
+    """The typed phrase is verified server-side and failures never leak text."""
+
+    async def run() -> None:
+        coordinator = _coordinator()
+        coordinator.async_delete_message_history = AsyncMock(
+            return_value={
+                "schema_version": 1,
+                "scope": "all",
+                "conversation_key": None,
+                "deleted_messages": 3,
+                "retained_active": 0,
+            }
+        )
+        hass = SimpleNamespace(data={"meshnet": {ENTRY_ID: coordinator}})
+        connection = SimpleNamespace(send_message=MagicMock(), send_error=MagicMock())
+        handler = websocket_messages_delete.__wrapped__.__wrapped__
+        command = "meshnet/messages/delete"
+
+        await handler(hass, connection, {"id": 1, "type": command, "scope": "all", "confirmation": "delete it"})
+        await handler(
+            hass,
+            connection,
+            {"id": 2, "type": command, "scope": "all", "confirmation": "Permanently Delete This Data"},
+        )
+        await handler(
+            hass,
+            connection,
+            {"id": 3, "type": command, "scope": "conversation", "confirmation": MESSAGE_HISTORY_DELETE_PHRASE},
+        )
+        await handler(
+            hass,
+            connection,
+            {
+                "id": 4,
+                "type": command,
+                "scope": "conversation",
+                "conversation_key": "direct:",
+                "confirmation": MESSAGE_HISTORY_DELETE_PHRASE,
+            },
+        )
+        assert connection.send_error.call_args_list == [
+            call(1, "confirmation_mismatch", "Type the exact confirmation phrase to delete message history"),
+            call(2, "confirmation_mismatch", "Type the exact confirmation phrase to delete message history"),
+            call(3, "conversation_required", "Select one exact conversation to delete"),
+            call(4, "conversation_required", "Select one exact conversation to delete"),
+        ]
+        coordinator.async_delete_message_history.assert_not_awaited()
+        connection.send_message.assert_not_called()
+
+        await handler(
+            hass,
+            connection,
+            {"id": 5, "type": command, "scope": "all", "confirmation": f"  {MESSAGE_HISTORY_DELETE_PHRASE}\n"},
+        )
+        coordinator.async_delete_message_history.assert_awaited_once_with(scope="all", conversation_key=None)
+        assert connection.send_message.call_count == 1
+
+        coordinator.async_delete_message_history.reset_mock()
+        await handler(
+            hass,
+            connection,
+            {
+                "id": 6,
+                "type": command,
+                "scope": "conversation",
+                "conversation_key": "direct:meshtastic:!12345678",
+                "confirmation": MESSAGE_HISTORY_DELETE_PHRASE,
+            },
+        )
+        coordinator.async_delete_message_history.assert_awaited_once_with(
+            scope="conversation", conversation_key="direct:meshtastic:!12345678"
+        )
+
+        private_error = "database /config/private.sqlite for node !12345678 failed"
+        coordinator.async_delete_message_history = AsyncMock(side_effect=RuntimeError(private_error))
+        await handler(
+            hass,
+            connection,
+            {"id": 7, "type": command, "scope": "all", "confirmation": MESSAGE_HISTORY_DELETE_PHRASE},
+        )
+        assert connection.send_error.call_args_list[-1] == call(
+            7, "delete_failed", "MeshNet could not delete message history"
+        )
+        serialized = json.dumps(
+            {
+                "errors": connection.send_error.call_args_list,
+                "telemetry": coordinator.panel_telemetry.snapshot(),
+            },
+            default=str,
+        )
+        assert private_error not in serialized
+        assert "/config/private.sqlite" not in serialized
+
+    import asyncio
+
+    asyncio.run(run())
+
+
+def test_messages_delete_schema_bounds_scope_key_and_phrase() -> None:
+    schema = websocket_messages_delete._ws_schema
+    valid = schema(
+        {
+            "id": 1,
+            "type": "meshnet/messages/delete",
+            "scope": "conversation",
+            "conversation_key": "channel:2",
+            "confirmation": MESSAGE_HISTORY_DELETE_PHRASE,
+        }
+    )
+    assert valid["scope"] == "conversation"
+    for invalid in (
+        {**valid, "scope": "everything"},
+        {k: v for k, v in valid.items() if k != "confirmation"},
+        {**valid, "confirmation": ""},
+        {**valid, "confirmation": "x" * 201},
+        {**valid, "conversation_key": ""},
+        {**valid, "conversation_key": "k" * 301},
+        {**valid, "message": "private"},
+    ):
+        with pytest.raises(vol.Invalid):
+            schema(invalid)

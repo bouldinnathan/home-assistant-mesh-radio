@@ -4441,3 +4441,451 @@ def test_connection_update_failure_clears_reload_marker(monkeypatch) -> None:
         assert gateway_config.options["pin"] == "123456"
 
     asyncio.run(run())
+
+
+def _window_store():
+    class Store:
+        def __init__(self) -> None:
+            self.deleted: list[list[str]] = []
+            self.cached: dict[str, NodeState] = {}
+
+        async def async_open(self) -> None:
+            return None
+
+        async def async_load_snapshot(self, *, recent_limit: int):
+            assert recent_limit == 100
+            return MeshSnapshot(nodes=dict(self.cached))
+
+        async def async_upsert_node(self, node: NodeState) -> None:
+            return None
+
+        async def async_delete_nodes(self, node_keys) -> int:
+            keys = list(node_keys)
+            self.deleted.append(keys)
+            return len(keys)
+
+    return Store()
+
+
+def _window_coordinator(coordinator_class, store):
+    coordinator = object.__new__(coordinator_class)
+    coordinator.store = store
+    coordinator.snapshot = MeshSnapshot()
+    coordinator.node_limit = 25
+    coordinator._session_observed_node_keys = set()
+    coordinator._rebuild_gateways = AsyncMock()
+    coordinator._gateway_generation = 1
+    coordinator._shutting_down = False
+    coordinator._reconnect_suspended = False
+    coordinator.async_set_updated_data = lambda _snapshot: None
+    coordinator.gateways = {}
+    return coordinator
+
+
+def _heard_node(index: int, heard: datetime | None) -> NodeState:
+    return NodeState(
+        node_key=f"meshtastic:!000000{index:02x}",
+        protocol=PROTOCOL_MESHTASTIC,
+        node_id=f"!000000{index:02x}",
+        last_heard=heard,
+        online=heard is not None,
+    )
+
+
+def _coordinator_module(monkeypatch):
+    """Return the coordinator module under either the real or shimmed HA."""
+    coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+    return importlib.import_module(coordinator_class.__module__)
+
+
+def test_bounded_node_limit_clamps_to_supported_range(monkeypatch) -> None:
+    module = _coordinator_module(monkeypatch)
+    assert module.bounded_node_limit(None) == 250
+    assert module.bounded_node_limit("abc") == 250
+    assert module.bounded_node_limit(True) == 250
+    assert module.bounded_node_limit(5) == 25
+    assert module.bounded_node_limit("400") == 400
+    assert module.bounded_node_limit(10_000) == 1000
+
+
+def test_rolling_node_window_evicts_least_recent_and_protects_gateway_node(
+    monkeypatch,
+) -> None:
+    """Keep the cache bounded without ever dropping the radio's own record."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+        store = _window_store()
+        coordinator = _window_coordinator(coordinator_class, store)
+        coordinator.gateways = {"g1": SimpleNamespace(local_node_id="!000000ff")}
+        removed: list[set[str]] = []
+        unsubscribe = coordinator.async_add_node_removed_listener(
+            lambda keys: removed.append(set(keys))
+        )
+        await coordinator._async_setup()
+        now = datetime.now(UTC)
+
+        for index in range(1, 26):
+            await coordinator._handle_node(
+                _heard_node(index, now - timedelta(minutes=index)), gateway_generation=1
+            )
+        assert len(coordinator._raw_nodes) == 25
+        assert store.deleted == []
+
+        own_radio = NodeState(
+            node_key="meshtastic:!000000ff",
+            protocol=PROTOCOL_MESHTASTIC,
+            node_id="!000000ff",
+            last_heard=now - timedelta(days=30),
+        )
+        await coordinator._handle_node(own_radio, gateway_generation=1)
+        # The oldest ordinary node leaves; the gateway's own very old record stays.
+        assert store.deleted == [["meshtastic:!00000019"]]
+        assert "meshtastic:!000000ff" in coordinator._raw_nodes
+        assert removed == [{"meshtastic:!00000019"}]
+
+        never_heard = _heard_node(0x40, None)
+        await coordinator._handle_node(never_heard, gateway_generation=1)
+        # The record being updated is protected, so the next-oldest heard goes.
+        assert store.deleted[-1] == ["meshtastic:!00000018"]
+
+        await coordinator._handle_node(_heard_node(0x41, now), gateway_generation=1)
+        # A never-heard record is evicted before any heard record.
+        assert store.deleted[-1] == ["meshtastic:!00000040"]
+        assert "meshtastic:!00000040" not in coordinator._session_observed_node_keys
+        assert len(coordinator._raw_nodes) == 25
+        assert len(coordinator.snapshot.nodes) == 25
+
+        diagnostics = coordinator.node_window_diagnostics()
+        assert diagnostics["node_limit"] == 25
+        assert diagnostics["evicted"] == 3
+        assert diagnostics["retained_raw_records"] == 25
+
+        unsubscribe()
+        await coordinator._handle_node(_heard_node(0x42, now), gateway_generation=1)
+        assert len(removed) == 3
+
+    asyncio.run(run())
+
+
+def test_rolling_node_window_trims_cached_records_on_startup(monkeypatch) -> None:
+    """A previously unbounded cache is cut back before any entity is created."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+        store = _window_store()
+        now = datetime.now(UTC)
+        for index in range(1, 31):
+            node = _heard_node(index, now - timedelta(hours=index))
+            store.cached[node.node_key] = node
+        coordinator = _window_coordinator(coordinator_class, store)
+        removed: list[set[str]] = []
+        coordinator.async_add_node_removed_listener(lambda keys: removed.append(set(keys)))
+
+        await coordinator._async_setup()
+
+        assert len(coordinator._raw_nodes) == 25
+        assert len(coordinator.snapshot.nodes) == 25
+        expected = [f"meshtastic:!000000{index:02x}" for index in range(26, 31)]
+        assert store.deleted == [sorted(expected, key=expected.index)] or set(store.deleted[0]) == set(expected)
+        assert removed == [set(expected)]
+        assert coordinator.node_window_diagnostics()["startup_trimmed"] == 5
+        assert coordinator.node_observability_diagnostics()["node_counts"]["total"] == 25
+
+    asyncio.run(run())
+
+
+def test_message_conversation_key_matches_panel_grouping(monkeypatch) -> None:
+    module = _coordinator_module(monkeypatch)
+    key = module.message_conversation_key
+
+    def record(**overrides):
+        base = {
+            "message_id": "m",
+            "protocol": PROTOCOL_MESHTASTIC,
+            "gateway_id": "g1",
+            "sender": "!aaaa0001",
+            "receiver": "^all",
+            "channel": "0",
+            "text": "x",
+        }
+        base.update(overrides)
+        return MessageRecord(**base)
+
+    assert key(record()) == "broadcast:0"
+    assert key(record(channel="3")) == "channel:3"
+    assert key(record(receiver="!aaaa0003")) == "direct:meshtastic:!aaaa0001"
+    assert key(record(receiver="!aaaa0002", direction="tx")) == "direct:meshtastic:!aaaa0002"
+    # An unsupported channel index with a broadcast receiver is still shown as
+    # the primary broadcast thread by the panel, so the server agrees.
+    assert key(record(channel="9")) == "broadcast:0"
+    assert key(record(receiver="somebody")) == "unknown"
+    assert module.conversation_key_is_valid("broadcast:0")
+    assert module.conversation_key_is_valid("channel:7")
+    assert module.conversation_key_is_valid("direct:meshtastic:!aaaa0001")
+    assert module.conversation_key_is_valid("unknown")
+    assert not module.conversation_key_is_valid("channel:0")
+    assert not module.conversation_key_is_valid("direct:")
+    assert not module.conversation_key_is_valid("direct:has space")
+    assert not module.conversation_key_is_valid(None)
+
+
+def test_delete_message_history_scopes_and_keeps_in_flight_sends(monkeypatch) -> None:
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+
+        def record(message_id: str, **overrides):
+            base = {
+                "message_id": message_id,
+                "protocol": PROTOCOL_MESHTASTIC,
+                "gateway_id": "g1",
+                "sender": "!aaaa0001",
+                "receiver": "^all",
+                "channel": "0",
+                "text": "x",
+            }
+            base.update(overrides)
+            return MessageRecord(**base)
+
+        class Store:
+            def __init__(self) -> None:
+                self.messages = [
+                    record("broadcast-1"),
+                    record("direct-rx", sender="!aaaa0002", receiver="!aaaa0003"),
+                    record("direct-tx", sender=None, receiver="!aaaa0002", direction="tx"),
+                    record("active", sender=None, direction="tx"),
+                ]
+                self.predicates: list[object] = []
+
+            async def async_delete_message_history(self, predicate) -> int:
+                self.predicates.append(predicate)
+                if predicate is None:
+                    count = len(self.messages)
+                    self.messages.clear()
+                    return count
+                kept = [message for message in self.messages if not predicate(message)]
+                deleted = len(self.messages) - len(kept)
+                self.messages[:] = kept
+                return deleted
+
+            async def async_recent_messages(self, limit: int):
+                return list(self.messages)[-limit:]
+
+            async def async_messages_since(self, _when) -> int:
+                return len(self.messages)
+
+        store = Store()
+        coordinator = object.__new__(coordinator_class)
+        coordinator.store = store
+        coordinator.snapshot = MeshSnapshot()
+        coordinator._active_send_message_ids = {"active"}
+        updates: list[object] = []
+        coordinator.async_set_updated_data = lambda snapshot: updates.append(snapshot)
+
+        result = await coordinator.async_delete_message_history(
+            scope="conversation", conversation_key="direct:meshtastic:!aaaa0002"
+        )
+        assert result == {
+            "schema_version": 1,
+            "scope": "conversation",
+            "conversation_key": "direct:meshtastic:!aaaa0002",
+            "deleted_messages": 2,
+            "retained_active": 0,
+        }
+        assert [message.message_id for message in store.messages] == ["broadcast-1", "active"]
+        assert [message.message_id for message in coordinator.snapshot.recent_messages] == [
+            "broadcast-1",
+            "active",
+        ]
+        assert coordinator.snapshot.messages_today == 2
+
+        result = await coordinator.async_delete_message_history(scope="all", conversation_key="ignored")
+        assert result["scope"] == "all"
+        assert result["conversation_key"] is None
+        assert result["deleted_messages"] == 1
+        assert result["retained_active"] == 1
+        assert [message.message_id for message in store.messages] == ["active"]
+        assert store.predicates[-1] is not None
+
+        coordinator._active_send_message_ids = set()
+        result = await coordinator.async_delete_message_history(scope="all")
+        assert result["deleted_messages"] == 1
+        assert store.predicates[-1] is None
+        assert len(updates) == 3
+
+        with pytest.raises(ValueError):
+            await coordinator.async_delete_message_history(scope="everything")
+        with pytest.raises(ValueError):
+            await coordinator.async_delete_message_history(scope="conversation")
+        with pytest.raises(ValueError):
+            await coordinator.async_delete_message_history(
+                scope="conversation", conversation_key="direct:"
+            )
+
+    asyncio.run(run())
+
+
+def _budget_node(index: int, heard: datetime | None) -> NodeState:
+    return NodeState(
+        node_key=f"meshtastic:!{index:08x}",
+        protocol=PROTOCOL_MESHTASTIC,
+        node_id=f"!{index:08x}",
+        last_heard=heard,
+        online=heard is not None,
+    )
+
+
+def test_entity_budget_math_scales_cached_nodes_to_the_remaining_budget(monkeypatch) -> None:
+    module = _coordinator_module(monkeypatch)
+    assert module.entity_cap() == 10_000
+    assert module.entity_budget(10_000) == 9_000
+    assert module.entity_budget(1_500) == 750
+    ceiling = module.entity_budget_node_ceiling
+    assert ceiling(9_100, 350, budget=9_000) == 346
+    # One more node still fits comfortably, so the configured window applies.
+    assert ceiling(6_500, 250, budget=9_000) is None
+    assert ceiling(39, 1, budget=9_000) is None
+    # The next node would not fit: hold the window at its current size.
+    assert ceiling(8_990, 345, budget=9_000) == 345
+    assert ceiling(0, 250, budget=9_000) is None
+    assert ceiling(100, 0, budget=9_000) is None
+    assert ceiling(True, 10, budget=9_000) is None
+    assert ceiling("9000", 10, budget=9_000) is None
+
+
+def test_entity_budget_evicts_nodes_before_home_assistant_stops_adding_entities(
+    monkeypatch, caplog
+) -> None:
+    """Hold the window below node_limit when the registry nears the entity cap."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+        module = importlib.import_module(coordinator_class.__module__)
+        issues: dict[str, dict] = {}
+        monkeypatch.setattr(
+            module.ir,
+            "async_create_issue",
+            lambda hass, domain, issue_id, **kwargs: issues.__setitem__(issue_id, kwargs),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            module.ir,
+            "async_delete_issue",
+            lambda hass, domain, issue_id: issues.pop(issue_id, None),
+            raising=False,
+        )
+        store = _window_store()
+        coordinator = _window_coordinator(coordinator_class, store)
+        coordinator.node_limit = 1000
+        coordinator.hass = SimpleNamespace()
+        cost = {"per_node": 26}
+        # Simulates Home Assistant's registry counter: fixed summary/gateway
+        # entities plus a per-node cost for every cached record.
+        coordinator._enabled_entity_count = lambda: 13 + cost["per_node"] * len(coordinator._raw_nodes)
+        removed: list[set[str]] = []
+        coordinator.async_add_node_removed_listener(lambda keys: removed.append(set(keys)))
+        await coordinator._async_setup()
+        assert coordinator._effective_node_limit() == 1000
+        now = datetime.now(UTC)
+
+        for index in range(1, 400):
+            await coordinator._handle_node(
+                _budget_node(index, now - timedelta(seconds=1000 - index)), gateway_generation=1
+            )
+            if index == 50:
+                # Far from the cap nothing binds and no repair is raised.
+                assert coordinator._effective_node_limit() == 1000
+                assert issues == {}
+                assert coordinator.node_window_diagnostics()["entity_budget"]["node_ceiling"] is None
+
+        retained = len(coordinator._raw_nodes)
+        assert retained < 399
+        assert retained == coordinator._effective_node_limit()
+        assert coordinator._enabled_entity_count() <= 9_000 + cost["per_node"]
+        assert coordinator._enabled_entity_count() >= 9_000 - 2 * cost["per_node"]
+        # The newest records survive; the oldest were evicted.
+        assert _budget_node(399, now).node_key in coordinator._raw_nodes
+        assert _budget_node(1, now).node_key not in coordinator._raw_nodes
+        assert removed and all(len(keys) == 1 for keys in removed)
+
+        diagnostics = coordinator.node_window_diagnostics()
+        assert diagnostics["node_limit"] == 1000
+        assert diagnostics["effective_node_limit"] == retained
+        assert diagnostics["evicted"] == diagnostics["budget_evicted"] > 0
+        assert diagnostics["cleanup_pending"] is False
+        budget = diagnostics["entity_budget"]
+        assert budget["available"] is True
+        assert budget["binding"] is True
+        assert budget["entity_cap"] == 10_000
+        assert budget["budget"] == 9_000
+        assert budget["node_ceiling"] == retained
+        assert budget["checks"] == 400
+        assert budget["last_checked_at"]
+        issue = issues["entity_budget"]
+        assert issue["translation_key"] == "entity_budget"
+        assert issue["is_fixable"] is False
+        placeholders = issue["translation_placeholders"]
+        assert placeholders["effective_limit"] == str(retained)
+        assert placeholders["configured_limit"] == "1000"
+        assert placeholders["entity_cap"] == "10000"
+        assert int(placeholders["enabled_entities"]) > 8_000
+        # The guard stays quiet while the mesh is small.
+        assert not any("instead of the configured" in record.message for record in caplog.records[:1])
+
+        # While evicted devices are still being removed the registry count is
+        # stale, so the budget is not re-measured and nothing extra is evicted.
+        coordinator._node_cleanup_pending = 1
+        assert coordinator.node_cleanup_pending() is True
+        assert coordinator._refresh_entity_budget() is False
+        assert await coordinator._async_enforce_entity_budget() == 0
+        assert coordinator.node_window_diagnostics()["entity_budget"]["skipped_during_cleanup"] == 2
+        coordinator._node_cleanup_pending = 0
+
+        # Telemetry growth without any new node is caught by the refresh check.
+        cost["per_node"] = 40
+        evicted = await coordinator._async_enforce_entity_budget()
+        assert evicted > 0
+        assert len(coordinator._raw_nodes) == coordinator._effective_node_limit() < retained
+        assert coordinator._enabled_entity_count() <= 9_000 + cost["per_node"]
+        assert store.deleted[-1] and len(store.deleted[-1]) == evicted
+        assert len(coordinator.snapshot.nodes) == len(coordinator._raw_nodes)
+
+        # Fewer enabled entities per node lets the configured window apply again.
+        cost["per_node"] = 5
+        await coordinator._handle_node(_budget_node(900, now), gateway_generation=1)
+        assert coordinator._effective_node_limit() == 1000
+        assert "entity_budget" not in issues
+        assert coordinator.node_window_diagnostics()["entity_budget"]["binding"] is False
+
+        # A registry flooded by stale entries never collapses the window below
+        # the smallest supported node_limit.
+        cost["per_node"] = 5_000
+        await coordinator._handle_node(_budget_node(901, now), gateway_generation=1)
+        assert coordinator._effective_node_limit() == 25
+        assert len(coordinator._raw_nodes) == 25
+        assert issues["entity_budget"]["translation_placeholders"]["effective_limit"] == "25"
+
+    asyncio.run(run())
+
+
+def test_entity_budget_is_inactive_without_a_registry_count(monkeypatch) -> None:
+    """Without Home Assistant's counter only the configured window applies."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+        store = _window_store()
+        coordinator = _window_coordinator(coordinator_class, store)
+        await coordinator._async_setup()
+        now = datetime.now(UTC)
+        for index in range(1, 40):
+            await coordinator._handle_node(_budget_node(index, now), gateway_generation=1)
+        assert len(coordinator._raw_nodes) == 25
+        assert await coordinator._async_enforce_entity_budget() == 0
+        budget = coordinator.node_window_diagnostics()["entity_budget"]
+        assert budget["available"] is False
+        assert budget["binding"] is False
+        assert budget["node_ceiling"] is None
+        assert budget["enabled_entities"] is None
+        assert coordinator.node_window_diagnostics()["budget_evicted"] == 0
+
+    asyncio.run(run())

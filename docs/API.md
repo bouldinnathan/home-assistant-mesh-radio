@@ -40,6 +40,40 @@ The MQTT publish format does not return an on-air packet ID at submission time,
 so an incoming reaction cannot be joined to that local outbound MQTT record
 unless the original packet is later observed as a received record.
 
+## Delete Message History
+
+```json
+{
+  "type": "meshnet/messages/delete",
+  "scope": "conversation",
+  "conversation_key": "direct:meshtastic:!1234abcd",
+  "confirmation": "permanently delete this data"
+}
+```
+
+`scope` is `all` or `conversation`. A conversation deletion needs the exact
+key the panel groups by: `broadcast:0`, `channel:1` through `channel:7`,
+`direct:<node_key>`, or `unknown`. `confirmation` must equal the fixed phrase
+`permanently delete this data` after trimming whitespace; the server verifies
+it so no client can skip the typed step. Returns:
+
+```json
+{
+  "schema_version": 1,
+  "scope": "conversation",
+  "conversation_key": "direct:meshtastic:!1234abcd",
+  "deleted_messages": 12,
+  "retained_active": 0
+}
+```
+
+`retained_active` counts messages whose send was still in flight; they are
+kept so a late acknowledgement cannot resurrect a deleted row. The deletion
+also removes the packet captures that produced those messages. It never
+touches Home Assistant Recorder, logbook, events, traces, or backups. Errors
+are `confirmation_mismatch`, `conversation_required`, and `delete_failed`;
+none of them echo message text or node identity.
+
 ## Send Message
 
 ```json

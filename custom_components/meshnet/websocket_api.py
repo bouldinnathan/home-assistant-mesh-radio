@@ -26,6 +26,7 @@ from .const import (
     DOMAIN,
     MAX_PANEL_GATEWAYS,
     MAX_PANEL_NODES,
+    MESSAGE_HISTORY_DELETE_PHRASE,
     MESSAGE_TYPE_BROADCAST,
     MESSAGE_TYPE_DIRECT,
     MESSAGE_TYPE_EMERGENCY,
@@ -36,6 +37,7 @@ from .coordinator import (
     MeshNetCoordinator,
     NeighborInfoError,
     TracerouteError,
+    conversation_key_is_valid,
     message_api_dict,
     message_submission_response,
 )
@@ -158,6 +160,7 @@ async def async_register_websocket_api(hass: HomeAssistant) -> None:
     """Register MeshNet websocket commands."""
     websocket_api.async_register_command(hass, websocket_snapshot)
     websocket_api.async_register_command(hass, websocket_messages)
+    websocket_api.async_register_command(hass, websocket_messages_delete)
     websocket_api.async_register_command(hass, websocket_send_message)
     websocket_api.async_register_command(hass, websocket_traceroute)
     websocket_api.async_register_command(hass, websocket_traceroute_status)
@@ -183,6 +186,7 @@ _MESSAGE_TYPES = (
     MESSAGE_TYPE_EMERGENCY,
 )
 _MESSAGE_PRIORITIES = ("normal", "high", "emergency")
+_MESSAGE_HISTORY_SCOPES = ("all", "conversation")
 _SETTINGS_PREVIEW_KEYS = frozenset({"id", "type", ATTR_GATEWAY_ID, "revision", "changes"})
 _TRACEROUTE_STATUS_KEYS = frozenset({"id", "type"})
 _SETTINGS_PREVIEW_ENVELOPE = vol.All(
@@ -572,6 +576,61 @@ async def websocket_messages(
             msg["id"],
             "messages_failed",
             "MeshNet could not load message history",
+        )
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "meshnet/messages/delete",
+        vol.Required("scope"): vol.In(_MESSAGE_HISTORY_SCOPES),
+        vol.Optional("conversation_key"): vol.All(str, vol.Length(min=1, max=300)),
+        vol.Required("confirmation"): vol.All(str, vol.Length(min=1, max=200)),
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_messages_delete(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Permanently delete cached message history after an exact typed phrase."""
+    coordinator = _get_coordinator(hass)
+    scope = msg["scope"]
+    conversation_key = msg.get("conversation_key")
+    # The phrase is verified here, not only in the panel, so no client can
+    # skip the deliberate confirmation step.
+    if msg["confirmation"].strip() != MESSAGE_HISTORY_DELETE_PHRASE:
+        connection.send_error(
+            msg["id"],
+            "confirmation_mismatch",
+            "Type the exact confirmation phrase to delete message history",
+        )
+        return
+    if scope == "conversation" and not conversation_key_is_valid(conversation_key):
+        connection.send_error(
+            msg["id"],
+            "conversation_required",
+            "Select one exact conversation to delete",
+        )
+        return
+
+    async def delete_history() -> None:
+        result = await coordinator.async_delete_message_history(
+            scope=scope,
+            conversation_key=conversation_key if scope == "conversation" else None,
+        )
+        send_sensitive_result(connection, msg["id"], dict(result))
+
+    try:
+        await _async_panel_operation(coordinator, "messages_delete", delete_history)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        connection.send_error(
+            msg["id"],
+            "delete_failed",
+            "MeshNet could not delete message history",
         )
 
 
