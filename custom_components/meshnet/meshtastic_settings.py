@@ -29,6 +29,7 @@ from .settings_contracts import (
     explicit_read_only_reason,
     write_contract,
 )
+from .settings_help import setting_help, setting_unit
 
 _MAX_STRING_LENGTH = 1024
 _MAX_REPEATED_VALUES = 128
@@ -445,6 +446,16 @@ def _friendly_label(name: str) -> str:
     return name.replace("_", " ").strip().title()
 
 
+def _attach_help(projected: dict[str, Any], path: str) -> None:
+    """Add the reviewed help sentence and display unit for a path."""
+    description = setting_help(path)
+    if description is not None:
+        projected["description"] = description
+    unit = setting_unit(path)
+    if unit is not None and projected.get("type") in {"integer", "number"}:
+        projected["unit"] = unit
+
+
 def _read_only_reason(
     path: str,
     field_name: str,
@@ -543,6 +554,7 @@ def _project_message_fields(
                 field_value["value"] = value
             else:
                 continue
+            _attach_help(field_value, path)
             result.append(field_value)
         return result
 
@@ -645,6 +657,7 @@ def _project_message_fields(
             projected["max_length"] = 6
         elif path.endswith(".settings.psk"):
             projected["max_length"] = 44
+        _attach_help(projected, path)
         result.append(projected)
     return result
 

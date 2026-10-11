@@ -493,6 +493,11 @@ def test_remote_get_projects_read_only_fields_and_keeps_unreviewed_ones_read_onl
         assert fields["config.device.tzdef"]["allow_empty"] is True
         assert fields["config.device.tzdef"]["max_length"] == 64
         assert fields["config.position.position_broadcast_secs"]["minimum_nonzero"] == 32
+        assert fields["config.lora.hop_limit"]["description"].startswith("Maximum hops")
+        assert fields["config.lora.hop_limit"]["unit"] == "hops"
+        assert region["description"].startswith("The regulatory region")
+        assert "unit" not in region
+        assert fields["config.position.position_broadcast_secs"]["unit"] == "seconds"
 
         with pytest.raises(RemoteAdminError) as raised:
             await manager.async_preview(GATEWAY_ID, TARGET, loaded["revision"], {"config.device.button_gpio": 4})

@@ -202,7 +202,9 @@ put the gateway's public key on that list:
 Loading fetches the owner record and the device, position, power, network,
 display, LoRa, and Bluetooth configuration, one read-only request each, so it
 can take a minute or two over several hops. Each setting is either editable
-with reviewed bounds or shown read-only with the reason. Editable settings
+with reviewed bounds or shown read-only with the reason, and the **?** button
+next to each one explains what it does, its unit, and the allowed range.
+Editable settings
 include the role, rebroadcast mode, broadcast intervals, GPS mode, power
 saving, Wi-Fi, display preferences, hop limit, transmit power, duty-cycle
 override, and the Bluetooth radio. Region, modem preset, frequency and

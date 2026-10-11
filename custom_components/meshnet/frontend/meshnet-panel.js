@@ -86,6 +86,7 @@ class MeshNetPanel extends HTMLElement {
     this._remoteTargetNode = "";
     this._remoteSettingsSnapshot = null;
     this._remoteSettingsDraft = {};
+    this._openFieldTip = null;
     this._remoteSettingsPreview = null;
     this._remoteSettingsStatus = null;
     this._remoteSettingsBusy = null;
@@ -1179,6 +1180,45 @@ class MeshNetPanel extends HTMLElement {
           color: var(--secondary-text-color);
           font-size: 11px;
         }
+        .field-tip { position: relative; display: inline-block; vertical-align: middle; margin-left: 4px; }
+        .field-tip-button {
+          width: 18px;
+          height: 18px;
+          padding: 0;
+          border: 1px solid var(--secondary-text-color);
+          border-radius: 50%;
+          color: var(--secondary-text-color);
+          background: transparent;
+          font-family: inherit;
+          font-size: 11px;
+          font-weight: 600;
+          line-height: 16px;
+          cursor: help;
+        }
+        .field-tip-text {
+          display: none;
+          position: absolute;
+          z-index: 20;
+          left: 0;
+          top: calc(100% + 4px);
+          width: min(320px, calc(100vw - 48px));
+          padding: 8px 10px;
+          border: 1px solid var(--divider-color);
+          border-radius: 6px;
+          color: var(--primary-text-color);
+          background: var(--card-background-color);
+          box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+          font-size: 12px;
+          font-weight: 400;
+          line-height: 1.4;
+          text-align: left;
+          white-space: normal;
+        }
+        .field-tip-text span { display: block; }
+        .field-tip-text span + span { margin-top: 4px; }
+        .field-tip:hover .field-tip-text,
+        .field-tip:focus-within .field-tip-text,
+        .field-tip[data-open="true"] .field-tip-text { display: block; }
         .operator-controls {
           display: grid;
           gap: 9px;
@@ -1745,11 +1785,91 @@ class MeshNetPanel extends HTMLElement {
       : this._formatSettingValue(field.value);
     return `
       <div class="operator-field remote-read-only">
-        <span>${this._escape(field.label)}</span>
+        <span>${this._escape(field.label)}${this._fieldTipHtml(field, { scope: "remote", reason: this._humanizeReasonCode(field.read_only_reason) })}</span>
         <code>${this._escape(shown)}</code>
         <span class="field-help">${this._escape(field.path)} · ${this._escape(this._humanizeReasonCode(field.read_only_reason))}</span>
       </div>
     `;
+  }
+
+  _settingLimitsText(field) {
+    const unit = field.unit ? ` ${field.unit}` : "";
+    const number = (value) => this._formatSettingValue(value);
+    if (field.type === "boolean") return "Allowed: on or off.";
+    if (field.type === "select") {
+      const labels = Array.isArray(field.options) ? field.options.map((option) => option.label) : [];
+      if (!labels.length) return "";
+      return labels.length <= 8
+        ? `Allowed: ${labels.join(", ")}.`
+        : `Allowed: one of the ${labels.length} options in the list.`;
+    }
+    if (field.type === "integer" || field.type === "number") {
+      if (field.min == null || field.max == null) return "";
+      const unbounded = field.max >= 4294967295;
+      if (field.minimum_nonzero != null) {
+        return unbounded
+          ? `Allowed: 0 keeps the firmware default; otherwise ${number(field.minimum_nonzero)}${unit} or more.`
+          : `Allowed: 0 keeps the firmware default; otherwise ${number(field.minimum_nonzero)} to ${number(field.max)}${unit}.`;
+      }
+      return unbounded
+        ? `Allowed: ${number(field.min)}${unit} or more.`
+        : `Allowed: ${number(field.min)} to ${number(field.max)}${unit}.`;
+    }
+    if (field.type === "secret") {
+      return field.max_length != null
+        ? `Allowed: up to ${field.max_length} characters. Leave blank to keep the current value.`
+        : "Leave blank to keep the current value.";
+    }
+    if (field.type === "string" && field.max_length != null) {
+      return `Allowed: up to ${field.max_length} bytes of UTF-8; ${field.allow_empty ? "may be left empty" : "must not be empty"}.`;
+    }
+    return "";
+  }
+
+  _fieldTipHtml(field, options = {}) {
+    const writable = options.writable != null ? options.writable === true : field.writable === true;
+    const lines = [];
+    if (field.description) lines.push({ text: field.description });
+    const limits = writable ? this._settingLimitsText(field) : "";
+    if (limits) lines.push({ text: limits });
+    if (writable && options.warning) lines.push({ text: `Before applying: ${options.warning}.`, warn: true });
+    if (!writable && options.reason) lines.push({ text: `Read-only here: ${options.reason}`, warn: true });
+    if (!lines.length) return "";
+    const key = `${options.scope || "field"}:${field.path}`;
+    const id = `meshnet-tip-${key.replace(/[^a-zA-Z0-9_]/g, "-")}`;
+    const open = this._openFieldTip === key;
+    return `<span class="field-tip"${open ? ' data-open="true"' : ""}>`
+      + `<button type="button" class="field-tip-button" data-field-tip="${this._escape(key)}" aria-label="About ${this._escape(field.label)}" aria-expanded="${open ? "true" : "false"}" aria-describedby="${id}">?</button>`
+      + `<span class="field-tip-text" role="tooltip" id="${id}">${lines.map((line) => `<span${line.warn ? ' class="warn"' : ""}>${this._escape(line.text)}</span>`).join("")}</span>`
+      + "</span>";
+  }
+
+  _bindFieldTips() {
+    this.querySelectorAll("[data-field-tip]").forEach((button) => {
+      if (button.getAttribute("data-field-tip-bound") === "true") return;
+      button.setAttribute("data-field-tip-bound", "true");
+      button.addEventListener("click", (event) => {
+        if (event && typeof event.preventDefault === "function") event.preventDefault();
+        this._toggleFieldTip(button.getAttribute("data-field-tip"));
+      });
+      button.addEventListener("keydown", (event) => {
+        if (event && event.key === "Escape") this._toggleFieldTip(null);
+      });
+      button.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
+    });
+  }
+
+  _toggleFieldTip(key) {
+    const next = key && this._openFieldTip !== key ? key : null;
+    this._openFieldTip = next;
+    this.querySelectorAll("[data-field-tip]").forEach((button) => {
+      const open = next != null && button.getAttribute("data-field-tip") === next;
+      button.setAttribute("aria-expanded", open ? "true" : "false");
+      const wrapper = button.parentElement;
+      if (!wrapper) return;
+      if (open) wrapper.setAttribute("data-open", "true");
+      else wrapper.removeAttribute("data-open");
+    });
   }
 
   _humanizeReasonCode(code) {
@@ -1803,7 +1923,7 @@ class MeshNetPanel extends HTMLElement {
     }
     return `
       <label class="operator-field" for="meshnet-remote-setting-${index}">
-        <span>${this._escape(field.label)} ${badges}</span>
+        <span>${this._escape(field.label)}${this._fieldTipHtml(field, { scope: "remote", warning: field.warning ? this._humanizeReasonCode(field.warning) : "" })} ${badges}</span>
         ${input}
         <span class="field-help">${this._escape(field.path)}</span>
       </label>
@@ -2280,6 +2400,7 @@ class MeshNetPanel extends HTMLElement {
   }
 
   _bindViewControls() {
+    this._bindFieldTips();
     this.querySelectorAll("[data-meshnet-view]").forEach((button) => {
       button.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
       button.addEventListener("click", () => {
@@ -2385,6 +2506,45 @@ class MeshNetPanel extends HTMLElement {
         }
         .label, .field-help { color: var(--secondary-text-color); font-size: 12px; }
         .field-help { overflow-wrap: anywhere; }
+        .field-tip { position: relative; display: inline-block; vertical-align: middle; margin-left: 4px; }
+        .field-tip-button {
+          width: 18px;
+          height: 18px;
+          padding: 0;
+          border: 1px solid var(--secondary-text-color);
+          border-radius: 50%;
+          color: var(--secondary-text-color);
+          background: transparent;
+          font-family: inherit;
+          font-size: 11px;
+          font-weight: 600;
+          line-height: 16px;
+          cursor: help;
+        }
+        .field-tip-text {
+          display: none;
+          position: absolute;
+          z-index: 20;
+          left: 0;
+          top: calc(100% + 4px);
+          width: min(320px, calc(100vw - 48px));
+          padding: 8px 10px;
+          border: 1px solid var(--divider-color);
+          border-radius: 6px;
+          color: var(--primary-text-color);
+          background: var(--card-background-color);
+          box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+          font-size: 12px;
+          font-weight: 400;
+          line-height: 1.4;
+          text-align: left;
+          white-space: normal;
+        }
+        .field-tip-text span { display: block; }
+        .field-tip-text span + span { margin-top: 4px; }
+        .field-tip:hover .field-tip-text,
+        .field-tip:focus-within .field-tip-text,
+        .field-tip[data-open="true"] .field-tip-text { display: block; }
         .badge { display: inline-block; margin-right: 5px; font-size: 11px; }
         .warn { color: var(--warning-color, #b26a00); }
         .bad { color: var(--error-color, #d32f2f); }
@@ -2503,9 +2663,8 @@ class MeshNetPanel extends HTMLElement {
     return `
       <div class="settings-field">
         <label class="settings-label" for="meshnet-setting-${index}">
-          <span>${this._escape(field.label)}</span>
+          <span>${this._escape(field.label)}${this._fieldTipHtml(field, { scope: "local", reason, writable: snapshot.writable && field.writable })}</span>
           <span>${badges}</span>
-          ${field.description ? `<span class="field-help">${this._escape(field.description)}</span>` : ""}
           ${reason ? `<span class="field-help warn">${this._escape(reason)}</span>` : ""}
         </label>
         <span class="settings-control">
@@ -2772,6 +2931,7 @@ class MeshNetPanel extends HTMLElement {
         || (field.type === "integer" && !Number.isSafeInteger(number))
         || (field.min != null && number < field.min)
         || (field.max != null && number > field.max)
+        || (field.minimum_nonzero != null && number > 0 && number < field.minimum_nonzero)
       ) throw { name: "ValidationError", code: "invalid_format" };
       return number;
     }
@@ -3167,8 +3327,10 @@ class MeshNetPanel extends HTMLElement {
     const min = numeric("min");
     const max = numeric("max");
     const step = numeric("step");
+    const minimumNonzero = numeric("minimum_nonzero");
     if (
-      (writable && (type === "integer" || type === "number")
+      (writable && minimumNonzero != null && minimumNonzero <= 0)
+      || (writable && (type === "integer" || type === "number")
         && (min == null || max == null))
       || (writable && min != null && max != null && min > max)
       || (writable && step != null && step <= 0)
@@ -3210,7 +3372,9 @@ class MeshNetPanel extends HTMLElement {
       min,
       max,
       step,
+      minimum_nonzero: minimumNonzero,
       max_length: maxLength,
+      allow_empty: field.allow_empty === true,
       unit: this._optionalSettingText(field.unit, 32),
       description: this._optionalSettingText(field.description, 512),
       writable,
@@ -5275,6 +5439,8 @@ class MeshNetPanel extends HTMLElement {
       type,
       value,
       value_label: this._optionalSettingText(field.value_label, 96),
+      description: this._optionalSettingText(field.description, 512),
+      unit: this._optionalSettingText(field.unit, 32),
       writable: false,
       read_only_reason: reason,
       options: [],
@@ -5341,6 +5507,8 @@ class MeshNetPanel extends HTMLElement {
       allow_empty: field.allow_empty === true,
       critical: field.critical === true,
       warning,
+      description: this._optionalSettingText(field.description, 512),
+      unit: this._optionalSettingText(field.unit, 32),
     };
     try {
       const validatedValue = this._coerceRemoteSettingValue(sanitized, field.value);

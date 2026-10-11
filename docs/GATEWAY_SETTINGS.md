@@ -39,7 +39,9 @@ revision is also rejected instead of applying a stale edit.
 ## Current Support Matrix
 
 The live page is authoritative because firmware and installed provider-library
-capabilities can vary. A field shown as read-only includes the reason.
+capabilities can vary. A field shown as read-only includes the reason, and
+the **?** button next to every field opens a tooltip with what the setting
+does, its unit, the allowed range, and why it is read-only when it is.
 Beginning with 0.6.2, the page also reports the exact number of controls that
 are currently editable and read-only. An **Editable** badge means both the live
 gateway capability and MeshNet's path-specific safety contract permit a

@@ -3002,3 +3002,124 @@ def test_remote_editor_sanitizes_read_only_rows_and_contract_bounds() -> None:
   assert.ok(html.includes("reboot once"));
 """
     )
+
+
+def test_setting_tooltips_explain_purpose_limits_and_read_only_reasons() -> None:
+    """Every field row carries a ? tooltip with the help text and the allowed range."""
+    source = _source()
+    assert 'class="field-tip-button"' in source
+    assert '.field-tip[data-open="true"] .field-tip-text { display: block; }' in source
+    _run_panel_script(
+        r"""
+  panel._bindViewControls = () => {};
+  panel._bindSettingsControls = () => {};
+  panel._restoreComposerFocus = () => {};
+  panel.querySelectorAll = () => [];
+  panel.querySelector = () => null;
+  const snapshot = panel._sanitizeSettingsSnapshot({
+    schema_version: 1,
+    gateway_id: "gateway-1",
+    name: "Test gateway",
+    protocol: "meshtastic",
+    transport: "bluetooth",
+    connected: true,
+    writable: true,
+    revision: "c".repeat(64),
+    fetched_at: "2026-07-30T12:00:00Z",
+    categories: [{
+      key: "device",
+      label: "Device",
+      fields: [
+        { path: "config.position.position_broadcast_secs", label: "Position Broadcast Secs", type: "integer", value: 900, min: 0, max: 4294967295, minimum_nonzero: 32, unit: "seconds", description: "Seconds between position broadcasts.", writable: true },
+        { path: "owner.short_name", label: "Short Name", type: "string", value: "TEST", max_length: 4, description: "The short name.", writable: true },
+        { path: "config.network.wifi_psk", label: "Wifi Psk", type: "secret", configured: true, allow_clear: true, max_length: 64, description: "Password of the Wi-Fi network.", writable: true },
+        { path: "config.lora.region", label: "Region", type: "select", value: "US", options: [{ value: "US", label: "US" }], description: "The regulatory region.", writable: false, read_only_reason: "Radio parameters can isolate the node from the mesh." },
+      ],
+    }],
+    warnings: [],
+  });
+  panel._settingsSnapshot = snapshot;
+  panel._settingsGateways = [{ gateway_id: "gateway-1", name: "Test gateway", protocol: "meshtastic", transport: "bluetooth", connected: true }];
+  panel._settingsGatewayId = "gateway-1";
+  panel._renderSettings();
+  const html = panel.innerHTML;
+  assert.equal((html.match(/class="field-tip-button"/g) || []).length, 4);
+  assert.ok(html.includes('aria-label="About Position Broadcast Secs"'));
+  assert.ok(html.includes("Seconds between position broadcasts."));
+  assert.ok(html.includes("Allowed: 0 keeps the firmware default; otherwise 32 seconds or more."));
+  assert.ok(html.includes("Unit: seconds"));
+  assert.ok(html.includes("Allowed: up to 4 bytes of UTF-8; must not be empty."));
+  assert.ok(html.includes("Allowed: up to 64 characters. Leave blank to keep the current value."));
+  assert.ok(html.includes("Read-only here: Radio parameters can isolate the node from the mesh."));
+  assert.equal(html.includes("Allowed: US."), false);
+  assert.ok(html.includes('data-field-tip="local:config.lora.region"'));
+  assert.ok(html.includes('role="tooltip"'));
+
+  // Toggling opens exactly one tooltip, survives a re-render, and closes again.
+  const makeButton = (key) => {
+    const wrapper = {
+      attributes: {},
+      setAttribute(name, value) { this.attributes[name] = value; },
+      removeAttribute(name) { delete this.attributes[name]; },
+    };
+    return {
+      attributes: { "data-field-tip": key },
+      parentElement: wrapper,
+      getAttribute(name) { return Object.hasOwn(this.attributes, name) ? this.attributes[name] : null; },
+      setAttribute(name, value) { this.attributes[name] = value; },
+      addEventListener() {},
+    };
+  };
+  const buttons = [makeButton("local:owner.short_name"), makeButton("local:config.lora.region")];
+  panel.querySelectorAll = () => buttons;
+  panel._bindFieldTips();
+  panel._bindFieldTips();
+  assert.equal(buttons[0].getAttribute("data-field-tip-bound"), "true");
+  panel._toggleFieldTip("local:owner.short_name");
+  assert.equal(buttons[0].getAttribute("aria-expanded"), "true");
+  assert.equal(buttons[0].parentElement.attributes["data-open"], "true");
+  assert.equal(buttons[1].getAttribute("aria-expanded"), "false");
+  assert.equal(buttons[1].parentElement.attributes["data-open"], undefined);
+  panel.querySelectorAll = () => [];
+  panel._renderSettings();
+  assert.ok(panel.innerHTML.includes('<span class="field-tip" data-open="true"><button type="button" class="field-tip-button" data-field-tip="local:owner.short_name"'));
+  panel.querySelectorAll = () => buttons;
+  panel._toggleFieldTip("local:owner.short_name");
+  assert.equal(panel._openFieldTip, null);
+  assert.equal(buttons[0].getAttribute("aria-expanded"), "false");
+  assert.equal(buttons[0].parentElement.attributes["data-open"], undefined);
+
+  // Remote rows: writable rows show the range and warning; read-only rows show the reason.
+  const response = {
+    schema_version: 1,
+    gateway_id: "ble-gateway",
+    target_node: "!1234abcd",
+    revision: "a".repeat(64),
+    controller: { node_id: "!01020304", short_name: "CTRL", public_key: "base64:" + "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=", public_key_copy_only: true },
+    target: { node_id: "!1234abcd", long_name: "Remote", short_name: "RMT", public_key_available: true, remote_admin_eligible: true },
+    categories: [{
+      key: "config.lora",
+      label: "Lora",
+      fields: [
+        { path: "config.lora.hop_limit", label: "Hop Limit", type: "integer", value: 3, min: 1, max: 7, unit: "hops", description: "Maximum hops a packet from this node may travel.", critical: true, warning: "hop_limit_changes_how_far_this_node_reaches", writable: true },
+        { path: "config.lora.region", label: "Region", type: "select", value: "US", value_label: "US", description: "The regulatory region.", writable: false, read_only_reason: "radio_parameters_can_isolate_the_node_from_the_mesh" },
+      ],
+    }],
+  };
+  const remote = panel._sanitizeRemoteSettingsSnapshot(response, "ble-gateway", "!1234abcd");
+  const rendered = panel._remoteCategoryBody(remote.categories[0], panel._remoteSettingsFields(remote));
+  assert.ok(rendered.includes("Maximum hops a packet from this node may travel."));
+  assert.ok(rendered.includes("Allowed: 1 to 7 hops."));
+  assert.ok(rendered.includes("Before applying: Hop limit changes how far this node reaches."));
+  assert.ok(rendered.includes("The regulatory region."));
+  assert.ok(rendered.includes("Read-only here: Radio parameters can isolate the node from the mesh"));
+  assert.ok(rendered.includes('data-field-tip="remote:config.lora.region"'));
+
+  const tooLong = JSON.parse(JSON.stringify(response));
+  tooLong.categories[0].fields[0].description = "x".repeat(513);
+  assert.throws(() => panel._sanitizeRemoteSettingsSnapshot(tooLong, "ble-gateway", "!1234abcd"), (error) => error.name === "PanelSchemaError");
+  const badUnit = JSON.parse(JSON.stringify(response));
+  badUnit.categories[0].fields[1].unit = { not: "text" };
+  assert.throws(() => panel._sanitizeRemoteSettingsSnapshot(badUnit, "ble-gateway", "!1234abcd"), (error) => error.name === "PanelSchemaError");
+"""
+    )

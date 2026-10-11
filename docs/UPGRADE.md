@@ -1,5 +1,15 @@
 # Upgrade Guide
 
+## From 0.13.0
+
+0.13.1 adds a **?** tooltip to every setting in the gateway settings tab and
+the remote node editor. The tooltip explains what the setting does, its unit,
+what a zero or empty value means, the allowed range from the reviewed
+contract, and, for read-only fields, why they cannot be edited here. Numeric
+fields also show their unit under the control. Hard-refresh the browser once
+so the 0.13.1 panel module loads. No config-entry or radio setting change is
+required.
+
 ## From 0.12.1
 
 0.13.0 replaces the small fixed write allowlist with a reviewed contract

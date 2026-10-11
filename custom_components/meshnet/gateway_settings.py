@@ -1178,7 +1178,7 @@ class GatewaySettingsManager:
         )
         if read_only_reason is not None:
             field["read_only_reason"] = read_only_reason
-        for key in ("min", "max", "step"):
+        for key in ("min", "max", "step", "minimum_nonzero"):
             if key not in raw:
                 continue
             value = _safe_scalar(raw.get(key))
@@ -1199,6 +1199,8 @@ class GatewaySettingsManager:
             unsafe_contract = True
         elif isinstance(max_length, int) and not isinstance(max_length, bool):
             field["max_length"] = max(1, min(max_length, MAX_SETTING_STRING_LENGTH))
+        if raw.get("allow_empty") is True:
+            field["allow_empty"] = True
         if field_type == "select":
             options: list[dict[str, Any]] = []
             seen_options: set[tuple[type[Any], Any]] = set()

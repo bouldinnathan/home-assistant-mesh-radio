@@ -300,7 +300,9 @@ write contract carry `writable: true` plus their bounds (`min`, `max`,
 `minimum_nonzero` when zero means "firmware default", `max_length`,
 `allow_empty`), a `critical` flag when the change can affect mesh reach, and
 an optional `warning` code. Every other field is `writable: false` with a
-`read_only_reason` code. The result contains no private key, session passkey,
+`read_only_reason` code. Every field also carries a `description` sentence
+and, for numeric fields with a known unit, a `unit` string; both come from
+MeshNet's reviewed help table, not from the radio. The result contains no private key, session passkey,
 channel PSK, SecurityConfig, or raw protobuf; secret fields are omitted
 entirely. Module configuration and channels are not loaded over the mesh in
 this release; they remain editable on the local gateway only.

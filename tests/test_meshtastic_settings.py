@@ -639,3 +639,23 @@ def test_local_bluetooth_plan_still_blocks_link_hazards_the_remote_policy_allows
         "config.lora.region",
     }
     assert plan.blocked_paths["config.lora.region"] == "radio_parameters_can_isolate_the_node_from_the_mesh"
+
+
+def test_public_snapshot_carries_help_text_and_units_for_every_field() -> None:
+    """Both policies ship the reviewed help sentence; units only on numeric fields."""
+    state, _admin = _real_state()
+    for remote in (False, True):
+        snapshot = state.public_snapshot(transport="bluetooth", write_supported=True, remote=remote)
+        fields = _fields(snapshot)
+        assert fields, "snapshot projected no fields"
+        for path, field in fields.items():
+            assert field.get("description"), path
+            assert len(field["description"]) <= 512, path
+            if "unit" in field:
+                assert field["type"] in {"integer", "number"}, path
+        assert fields["config.lora.hop_limit"]["unit"] == "hops"
+        assert fields["config.lora.hop_limit"]["description"].startswith("Maximum hops")
+        assert fields["config.position.position_broadcast_secs"]["unit"] == "seconds"
+        assert "unit" not in fields["owner.short_name"]
+        assert fields["channel.1.settings.name"]["description"] == fields["channel.1.settings.name"]["description"]
+        assert "The channel name" in fields["channel.1.settings.name"]["description"]

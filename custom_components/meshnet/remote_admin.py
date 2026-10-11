@@ -28,6 +28,7 @@ from .const import (
     TRANSPORT_BLUETOOTH,
 )
 from .settings_contracts import preview_warning, remote_write_allowed
+from .settings_help import setting_help, setting_unit
 
 _TARGET_RE = re.compile(r"^![0-9a-f]{8}$")
 _REVISION_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -532,6 +533,7 @@ class RemoteAdminManager:
             "type": field_type,
             "writable": True,
         }
+        self._attach_help(public, path, field_type)
         for name in ("min", "max", "step", "minimum_nonzero"):
             candidate = source.get(name)
             if (
@@ -598,6 +600,7 @@ class RemoteAdminManager:
             "writable": False,
             "read_only_reason": reason or "setting_requires_dedicated_semantic_validation",
         }
+        self._attach_help(public, path, field_type)
         options = source.get("options")
         if field_type == "select" and isinstance(options, Sequence) and not isinstance(options, (str, bytes, bytearray)):
             labels = {
@@ -609,6 +612,16 @@ class RemoteAdminManager:
             if isinstance(label, str):
                 public["value_label"] = label
         return public
+
+    @staticmethod
+    def _attach_help(public: dict[str, Any], path: str, field_type: str) -> None:
+        """Add the reviewed help sentence and unit; both come from MeshNet, not the radio."""
+        description = setting_help(path)
+        if description is not None:
+            public["description"] = description
+        unit = setting_unit(path)
+        if unit is not None and field_type in {"integer", "number"}:
+            public["unit"] = unit
 
     @staticmethod
     def _preview_warnings(

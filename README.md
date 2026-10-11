@@ -309,6 +309,10 @@ excluded destructive operations.
 
 ### Advanced local mesh tools
 
+Version 0.13.1 adds a **?** tooltip to every setting in both editors that
+explains what it does, its unit, the allowed range, and why a field is
+read-only here.
+
 Version 0.13.0 opens the settings editors. A reviewed contract table shared
 by the gateway settings tab and the remote node editor makes device, position,
 power, network, display, LoRa reach, and Bluetooth settings editable with
