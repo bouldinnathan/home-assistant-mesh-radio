@@ -8,7 +8,7 @@ from .settings_contracts import REMOTE_WRITABLE_PATHS
 
 DOMAIN: Final = "meshnet"
 NAME: Final = "MeshNet"
-VERSION: Final = "0.13.1"
+VERSION: Final = "0.13.2"
 DATA_BLUETOOTH_PAIRING: Final = f"{DOMAIN}_bluetooth_pairing"
 
 PLATFORMS: Final = ["sensor", "binary_sensor", "device_tracker"]

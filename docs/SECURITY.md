@@ -117,6 +117,13 @@ someone presses a button. The panel keeps a copy of the remote allowlist for
 early validation and a test asserts it matches the table; the backend remains
 the boundary.
 
+The **Remote nodes** tab reads the gateway radio's own public key through
+`meshnet/remote_admin/controller`, an administrator-only local read that
+sends no RF and returns only the node ID, short name, and public key. It
+exists so the key can be authorized on a remote node before the first remote
+load; the private key, session passkeys, and SecurityConfig never cross that
+boundary.
+
 ### Radio reboots
 
 `meshnet.reboot_gateway_radio` is the only reboot an automation can trigger,

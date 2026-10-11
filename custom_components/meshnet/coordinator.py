@@ -2762,6 +2762,10 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             confirm_critical=confirm_critical,
         )
 
+    async def async_remote_controller_get(self, *, gateway_id: str) -> dict[str, Any]:
+        """Return the gateway radio's copy-only admin public key; no RF is sent."""
+        return await self.remote_admin.async_get_controller(gateway_id)
+
     async def async_remote_settings_get(self, *, gateway_id: str, target_node: str) -> dict[str, Any]:
         """Read the reviewed settings projection for one exact remote node."""
         self._record_network_activity()

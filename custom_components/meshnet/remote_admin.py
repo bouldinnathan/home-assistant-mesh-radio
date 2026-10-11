@@ -159,6 +159,29 @@ class RemoteAdminManager:
             self._invalidate_target_previews(key)
             return public
 
+    async def async_get_controller(self, gateway_id: str) -> dict[str, Any]:
+        """Return the gateway radio's copy-only admin identity without RF."""
+        async with self._operation(gateway_id):
+            gateway_id = self._validate_gateway_id(gateway_id)
+            gateway = self._gateway(gateway_id)
+            getter = getattr(gateway, "async_get_remote_controller_identity", None)
+            if not callable(getter):
+                raise RemoteAdminError("remote_admin_unavailable")
+            try:
+                raw = await getter()
+            except Exception as err:
+                code = getattr(err, "code", None)
+                if isinstance(code, str) and code in _PASSTHROUGH_PROVIDER_CODES:
+                    raise RemoteAdminError(code) from None
+                raise RemoteAdminError("remote_admin_unavailable") from None
+            if not isinstance(raw, Mapping):
+                raise RemoteAdminError("remote_admin_snapshot_invalid")
+            return {
+                "schema_version": 1,
+                "gateway_id": gateway_id,
+                "controller": self._project_controller(raw),
+            }
+
     async def async_preview(
         self,
         gateway_id: str,
@@ -449,11 +472,10 @@ class RemoteAdminManager:
         target = snapshot.get("target")
         if not isinstance(controller, Mapping) or not isinstance(target, Mapping):
             raise RemoteAdminError("remote_admin_snapshot_invalid")
-        controller_id = self._validate_target(controller.get("node_id"))
+        projected_controller = self._project_controller(controller)
         target_id = self._validate_target(target.get("node_id"))
         if target_id != target_node:
             raise RemoteAdminError("remote_admin_snapshot_invalid")
-        public_key = self._public_key(controller.get("public_key"))
 
         fields: dict[str, dict[str, Any]] = {}
         categories: list[dict[str, Any]] = []
@@ -500,12 +522,7 @@ class RemoteAdminManager:
             "schema_version": 1,
             "gateway_id": gateway_id,
             "target_node": target_node,
-            "controller": {
-                "node_id": controller_id,
-                "short_name": self._safe_text(controller.get("short_name"), 64),
-                "public_key": public_key,
-                "public_key_copy_only": True,
-            },
+            "controller": projected_controller,
             "target": {
                 "node_id": target_id,
                 "long_name": self._safe_text(target.get("long_name"), 96),
@@ -518,6 +535,15 @@ class RemoteAdminManager:
         if not public["target"]["remote_admin_eligible"]:
             raise RemoteAdminError("remote_admin_unavailable")
         return public, fields
+
+    def _project_controller(self, controller: Mapping[str, Any]) -> dict[str, Any]:
+        """Project the controller radio identity; only the public key crosses."""
+        return {
+            "node_id": self._validate_target(controller.get("node_id")),
+            "short_name": self._safe_text(controller.get("short_name"), 64),
+            "public_key": self._public_key(controller.get("public_key")),
+            "public_key_copy_only": True,
+        }
 
     def _public_field(self, path: str, source: Mapping[str, Any]) -> dict[str, Any]:
         field_type = source.get("type")

@@ -21,6 +21,7 @@ from custom_components.meshnet.remote_admin import RemoteAdminError  # noqa: E40
 from custom_components.meshnet.websocket_api import (  # noqa: E402
     websocket_neighbor_info,
     websocket_neighbor_info_status,
+    websocket_remote_controller,
     websocket_remote_reboot,
     websocket_remote_settings_apply,
     websocket_remote_settings_get,
@@ -36,6 +37,7 @@ def _hass(coordinator):
 
 def test_remote_websocket_schemas_are_exact_and_admin_only() -> None:
     coordinator = SimpleNamespace(
+        async_remote_controller_get=AsyncMock(),
         async_remote_settings_get=AsyncMock(),
         async_remote_settings_preview=AsyncMock(),
         async_remote_settings_apply=AsyncMock(),
@@ -47,6 +49,14 @@ def test_remote_websocket_schemas_are_exact_and_admin_only() -> None:
         send_error=MagicMock(),
     )
     messages = (
+        (
+            websocket_remote_controller,
+            {
+                "id": 0,
+                "type": "meshnet/remote_admin/controller",
+                "gateway_id": "ble-gateway",
+            },
+        ),
         (
             websocket_remote_settings_get,
             {
@@ -83,6 +93,7 @@ def test_remote_websocket_schemas_are_exact_and_admin_only() -> None:
     for handler, message in messages:
         with pytest.raises(Unauthorized):
             handler(hass, connection, message)
+    coordinator.async_remote_controller_get.assert_not_awaited()
     coordinator.async_remote_settings_get.assert_not_awaited()
     coordinator.async_remote_settings_preview.assert_not_awaited()
     coordinator.async_remote_settings_apply.assert_not_awaited()
@@ -615,3 +626,67 @@ def test_remote_preview_message_accepts_empty_strings_and_bounds_long_ones() -> 
         _validated_remote_preview_message({**base, "changes": {"config.device.tzdef": "x" * 129}})
     assert raised.value.code == "remote_admin_changes_invalid"
     assert "x" * 129 not in str(raised.value)
+
+
+def test_remote_controller_handler_delegates_exactly_and_maps_errors() -> None:
+    """The gateway key read is admin-only, exact, privacy-marked, and never echoes."""
+
+    async def run() -> None:
+        identity = {
+            "schema_version": 1,
+            "gateway_id": "ble-gateway",
+            "controller": {
+                "node_id": "!01020304",
+                "short_name": "CTRL",
+                "public_key": "base64:" + "A" * 43 + "=",
+                "public_key_copy_only": True,
+            },
+        }
+        coordinator = SimpleNamespace(async_remote_controller_get=AsyncMock(return_value=identity))
+        connection = SimpleNamespace(send_message=MagicMock(), send_error=MagicMock())
+        hass = _hass(coordinator)
+        handler = websocket_remote_controller.__wrapped__.__wrapped__
+
+        await handler(
+            hass,
+            connection,
+            {"id": 30, "type": "meshnet/remote_admin/controller", "gateway_id": "ble-gateway"},
+        )
+        coordinator.async_remote_controller_get.assert_awaited_once_with(gateway_id="ble-gateway")
+        sent = connection.send_message.call_args.args[0]
+        assert sent["id"] == 30
+        assert sent["success"] is True
+        assert sent["result"] is identity
+        assert sent["__meshnet_private_response__"] == "meshnet-server-redact-v1"
+        connection.send_error.assert_not_called()
+
+        coordinator.async_remote_controller_get = AsyncMock(
+            side_effect=RemoteAdminError("remote_admin_requires_bluetooth")
+        )
+        await handler(
+            hass,
+            connection,
+            {"id": 31, "type": "meshnet/remote_admin/controller", "gateway_id": "ble-gateway"},
+        )
+        code, message = connection.send_error.call_args.args[1:]
+        assert code == "remote_admin_requires_bluetooth"
+        assert "Bluetooth" in message
+
+        coordinator.async_remote_controller_get = AsyncMock(
+            side_effect=RuntimeError("provider secret detail")
+        )
+        await handler(
+            hass,
+            connection,
+            {"id": 32, "type": "meshnet/remote_admin/controller", "gateway_id": "ble-gateway"},
+        )
+        assert connection.send_error.call_args.args == (
+            32,
+            "remote_admin_unavailable",
+            "Remote administration is unavailable",
+        )
+        assert "provider secret detail" not in json.dumps(
+            connection.send_error.call_args_list, default=str
+        )
+
+    asyncio.run(run())

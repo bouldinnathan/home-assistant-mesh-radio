@@ -309,6 +309,14 @@ excluded destructive operations.
 
 ### Advanced local mesh tools
 
+Version 0.13.2 moves remote node administration to its own **Remote nodes**
+tab. Its **Gateway identity** card shows the gateway radio's public key as soon
+as the tab opens, read locally with no mesh traffic, so the key can be added to
+a remote node before the first load. Both settings editors now present each
+section as a collapsed panel with its editable and read-only counts and a
+**Changed** badge, grouped under Radio configuration, Channels, Modules, and
+Device information, with **Expand all** and **Collapse all** controls.
+
 Version 0.13.1 adds a **?** tooltip to every setting in both editors that
 explains what it does, its unit, the allowed range, and why a field is
 read-only here.

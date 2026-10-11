@@ -42,6 +42,11 @@ The live page is authoritative because firmware and installed provider-library
 capabilities can vary. A field shown as read-only includes the reason, and
 the **?** button next to every field opens a tooltip with what the setting
 does, its unit, the allowed range, and why it is read-only when it is.
+Beginning with 0.13.2 each category is a collapsed section whose summary shows
+its editable and read-only counts and a **Changed** badge while a draft
+touches it. Meshtastic sections are grouped under Radio configuration,
+Channels, Modules, and Device information; **Expand all** and **Collapse
+all** sit above them. Open or closed state lives only in the page's memory.
 Beginning with 0.6.2, the page also reports the exact number of controls that
 are currently editable and read-only. An **Editable** badge means both the live
 gateway capability and MeshNet's path-specific safety contract permit a

@@ -51,7 +51,6 @@ def test_mesh_card_layout_is_persistent_bounded_and_presentation_only() -> None:
   const requiredCards = [
     "send-message",
     "gateways",
-    "remote-admin",
     "traceroute",
     "neighbor-info",
     "panel-diagnostics",
@@ -166,7 +165,7 @@ def test_mesh_card_layout_storage_rejects_malformed_and_denied_state() -> None:
         r"""
   const key = "meshnet.frontend.mesh-workspace-layout.v1";
   const defaults = [
-    "send-message", "gateways", "remote-admin", "traceroute", "neighbor-info",
+    "send-message", "gateways", "traceroute", "neighbor-info",
     "panel-diagnostics", "nodes", "recent-messages", "rf-heat",
   ];
   let value = null;
@@ -559,7 +558,7 @@ def test_card_scroll_is_restored_and_poll_flushes_only_after_interaction() -> No
     remote: {
       scrollTop: 85,
       scrollLeft: 0,
-      getAttribute(name) { return name === "data-mesh-card" ? "remote-admin" : null; },
+      getAttribute(name) { return name === "data-mesh-card" ? "gateways" : null; },
     },
     unknown: {
       scrollTop: 999,
@@ -572,12 +571,12 @@ def test_card_scroll_is_restored_and_poll_flushes_only_after_interaction() -> No
   let currentCards = cards;
   panel.querySelector = (selector) => selector === '[data-mesh-card="nodes"]'
     ? currentCards.nodes
-    : selector === '[data-mesh-card="remote-admin"]' ? currentCards.remote : null;
+    : selector === '[data-mesh-card="gateways"]' ? currentCards.remote : null;
 
   const state = panel._captureMeshCardScrollState();
   assert.deepEqual([...state.entries()], [
     ["nodes", { top: 420, left: 12 }],
-    ["remote-admin", { top: 85, left: 0 }],
+    ["gateways", { top: 85, left: 0 }],
   ]);
   currentCards = {
     nodes: { scrollTop: 0, scrollLeft: 0 },

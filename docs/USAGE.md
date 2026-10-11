@@ -27,6 +27,8 @@ The panel shows:
   labeled great-circle distances on independently evidenced edges
 - A link to Home Assistant's native Map
 - RF heat based on RSSI or SNR
+- A **Gateway settings** tab for the physically connected radio and a
+  **Remote nodes** tab for administering other Meshtastic nodes over the mesh
 
 On the main **Mesh** view, drag a side-card handle to reorder cards or use its
 accessible earlier/later buttons. Resize with the corner handle or its keyboard
@@ -183,27 +185,30 @@ up to three **admin keys**: the public keys of the radios it will accept
 changes from. The list lives on the remote node, so the one-time setup is to
 put the gateway's public key on that list:
 
-1. Open **MeshNet** in the Home Assistant sidebar and use its **Remote node
-   administration** card with a connected Meshtastic Bluetooth gateway. The
-   collapsed **How a remote node authorizes this gateway** note repeats these
-   steps.
-2. Select the exact target and press **Load / test access**. The first load
-   fails with "has not authorized this controller public key"; that is
-   expected.
-3. Copy the displayed controller public key. It is copy-only; MeshNet never
-   handles the controller private key.
-4. With the Meshtastic app connected to the remote node, open **Radio
+1. Open **MeshNet** in the Home Assistant sidebar and choose the **Remote
+   nodes** tab. Its **Gateway identity** card selects a connected Meshtastic
+   Bluetooth gateway and shows that radio's public key right away. The key is
+   read from the gateway over Bluetooth, sends nothing over the mesh, and is
+   copy-only; MeshNet never handles the controller private key. The collapsed
+   **How a remote node authorizes this gateway** note repeats these steps.
+2. Press **Copy controller public key**.
+3. With the Meshtastic app connected to the remote node, open **Radio
    configuration -> Security**, paste the key into a free **Admin key** slot,
    and save. The CLI equivalent is `meshtastic --set security.admin_key
    base64:<key>`.
-5. Load the target again. A successful load proves the authorization and
-   shows its settings.
+4. Back in the **Remote nodes** tab, select the exact target in **Remote node
+   administration** and press **Load / test access**. A successful load proves
+   the authorization and shows the node's settings; a load before the key is
+   added fails with "has not authorized this controller public key".
 
 Loading fetches the owner record and the device, position, power, network,
 display, LoRa, and Bluetooth configuration, one read-only request each, so it
-can take a minute or two over several hops. Each setting is either editable
-with reviewed bounds or shown read-only with the reason, and the **?** button
-next to each one explains what it does, its unit, and the allowed range.
+can take a minute or two over several hops. Each section opens from a
+collapsed summary that shows its editable and read-only counts and a
+**Changed** badge while a draft touches it; **Expand all** and **Collapse
+all** sit above the sections. Each setting is either editable with reviewed
+bounds or shown read-only with the reason, and the **?** button next to each
+one explains what it does, its unit, and the allowed range.
 Editable settings
 include the role, rebroadcast mode, broadcast intervals, GPS mode, power
 saving, Wi-Fi, display preferences, hop limit, transmit power, duty-cycle
@@ -449,7 +454,7 @@ repair, which names the action to take.
 
 `meshnet.reboot_gateway_radio` reboots the radio behind a Bluetooth gateway
 from **Developer tools -> Actions** or any automation. Remote nodes are
-rebooted from the panel instead: open **Remote node administration**, load
+rebooted from the panel instead: open the **Remote nodes** tab, load
 the node, expand **Reboot this node**, confirm, and send. Remote reboots need
 the same admin authorization as remote settings writes and are never
 available to automations.

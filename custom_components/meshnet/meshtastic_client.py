@@ -1313,6 +1313,25 @@ class MeshtasticClient(MeshGateway):
             )
         return await self._async_run_bluetooth_operation(getter(target_node))
 
+    async def async_get_remote_controller_identity(self) -> dict[str, Any]:
+        """Return the owned BLE client's copy-only controller identity; no RF."""
+        from .aiomeshtastic.errors import MeshtasticRemoteAdminError
+
+        if self.config.transport != TRANSPORT_BLUETOOTH:
+            raise MeshtasticRemoteAdminError(
+                "remote_admin_requires_bluetooth",
+                "Remote administration requires a Meshtastic Bluetooth gateway",
+            )
+        transport = self._ble_transport
+        client = getattr(transport, "_client", None)
+        getter = getattr(client, "async_get_remote_controller_identity", None)
+        if not callable(getter):
+            raise MeshtasticRemoteAdminError(
+                "remote_admin_unavailable",
+                "Remote administration is unavailable",
+            )
+        return await self._async_run_bluetooth_operation(getter())
+
     async def async_manual_traceroute(self, target_node: str) -> dict[str, Any]:
         """Delegate one explicit RouteDiscovery request to the owned BLE client."""
         if self.config.transport != TRANSPORT_BLUETOOTH:

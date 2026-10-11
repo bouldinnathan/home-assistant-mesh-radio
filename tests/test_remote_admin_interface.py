@@ -534,3 +534,83 @@ def test_remote_get_projects_read_only_fields_and_keeps_unreviewed_ones_read_onl
         assert "ROUTER" not in json.dumps(preview)
 
     asyncio.run(run())
+
+
+def test_controller_identity_is_ble_only_copy_only_and_fails_closed() -> None:
+    """The gateway key is readable before any remote load, through the same boundary."""
+
+    async def run() -> None:
+        manager, gateway = _manager()
+        gateway.async_get_remote_controller_identity = AsyncMock(
+            return_value={
+                "node_id": "!01020304",
+                "short_name": "CTRL",
+                "public_key": CONTROLLER_KEY,
+                "private_key": "must-not-cross",
+            }
+        )
+
+        result = await manager.async_get_controller(GATEWAY_ID)
+
+        assert result == {
+            "schema_version": 1,
+            "gateway_id": GATEWAY_ID,
+            "controller": {
+                "node_id": "!01020304",
+                "short_name": "CTRL",
+                "public_key": CONTROLLER_KEY,
+                "public_key_copy_only": True,
+            },
+        }
+        assert "private" not in json.dumps(result).casefold()
+        gateway.async_get_remote_controller_identity.assert_awaited_once_with()
+        gateway.async_get_remote_settings_snapshot.assert_not_awaited()
+
+        gateway.async_get_remote_controller_identity = AsyncMock(
+            return_value={"node_id": "!01020304", "public_key": "base64:AAAA"}
+        )
+        with pytest.raises(RemoteAdminError) as bad_key:
+            await manager.async_get_controller(GATEWAY_ID)
+        assert bad_key.value.code == "remote_admin_snapshot_invalid"
+
+        passthrough = RuntimeError("provider detail")
+        passthrough.code = "remote_admin_controller_public_key_unavailable"
+        gateway.async_get_remote_controller_identity = AsyncMock(side_effect=passthrough)
+        with pytest.raises(RemoteAdminError) as mapped:
+            await manager.async_get_controller(GATEWAY_ID)
+        assert mapped.value.code == "remote_admin_controller_public_key_unavailable"
+        assert "provider detail" not in str(mapped.value)
+
+        gateway.async_get_remote_controller_identity = AsyncMock(
+            side_effect=RuntimeError("secret provider text")
+        )
+        with pytest.raises(RemoteAdminError) as generic:
+            await manager.async_get_controller(GATEWAY_ID)
+        assert generic.value.code == "remote_admin_unavailable"
+        assert "secret provider text" not in str(generic.value)
+
+        del gateway.async_get_remote_controller_identity
+        with pytest.raises(RemoteAdminError) as missing:
+            await manager.async_get_controller(GATEWAY_ID)
+        assert missing.value.code == "remote_admin_unavailable"
+
+        with pytest.raises(RemoteAdminError) as unknown:
+            await manager.async_get_controller("missing-gateway")
+        assert unknown.value.code == "remote_admin_gateway_not_found"
+
+        for transport in ("serial", "tcp", "mqtt"):
+            serial_manager, serial_gateway = _manager(transport=transport)
+            serial_gateway.async_get_remote_controller_identity = AsyncMock()
+            with pytest.raises(RemoteAdminError) as wrong_transport:
+                await serial_manager.async_get_controller(GATEWAY_ID)
+            assert wrong_transport.value.code == "remote_admin_requires_bluetooth"
+            serial_gateway.async_get_remote_controller_identity.assert_not_awaited()
+
+        offline_manager, offline_gateway = _manager(connected=False)
+        offline_gateway.async_get_remote_controller_identity = AsyncMock()
+        with pytest.raises(RemoteAdminError) as offline:
+            await offline_manager.async_get_controller(GATEWAY_ID)
+        assert offline.value.code == "remote_admin_requires_bluetooth"
+        offline_gateway.async_get_remote_controller_identity.assert_not_awaited()
+
+    asyncio.run(run())

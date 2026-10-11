@@ -17,6 +17,7 @@ PANEL_OPERATIONS = frozenset(
         "settings_get",
         "settings_preview",
         "settings_apply",
+        "remote_controller_get",
         "remote_settings_get",
         "remote_settings_preview",
         "remote_settings_apply",

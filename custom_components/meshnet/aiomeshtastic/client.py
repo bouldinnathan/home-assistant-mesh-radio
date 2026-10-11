@@ -914,6 +914,18 @@ class MeshtasticBluetoothClient:
             apply_reason=reason,
         )
 
+    async def async_get_remote_controller_identity(self) -> dict[str, Any]:
+        """Return this radio's copy-only admin identity without sending RF.
+
+        A remote node must hold the controller public key before it accepts
+        any remote-admin request, so the panel needs this key before the first
+        load can succeed. It is read from the local NodeInfo already
+        downloaded during the session; the private key never leaves the radio.
+        """
+        if not self.connected:
+            raise self._remote_error("remote_admin_unavailable")
+        return self._controller_identity()
+
     async def async_get_remote_settings_snapshot(self, target_node: str) -> dict[str, Any]:
         """Explicitly load one exact node's reviewed settings over the mesh."""
         target_num, target, target_key = self._remote_admin_target(target_node)

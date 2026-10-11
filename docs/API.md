@@ -275,6 +275,25 @@ the exact target and its last sanitized result without transmitting.
 See [Automatic Network Maintenance](NETWORK_MAINTENANCE.md) for target rotation,
 traffic gates, lifecycle, privacy, and uninstall behavior.
 
+## Remote Controller Identity
+
+```json
+{
+  "type": "meshnet/remote_admin/controller",
+  "gateway_id": "garage_radio"
+}
+```
+
+Administrator-only and Bluetooth gateway only. Returns the gateway radio's own
+remote-admin identity so an operator can authorize it on a remote node before
+the first load: `schema_version`, `gateway_id`, and a `controller` object with
+`node_id`, `short_name`, the `base64:` public key, and
+`public_key_copy_only: true`. The value is read from the NodeInfo the radio
+already delivered over Bluetooth; the command sends nothing over the mesh and
+never returns the private key. Errors use the same `remote_admin_*` codes as
+the settings commands, for example `remote_admin_requires_bluetooth` or
+`remote_admin_controller_public_key_unavailable`.
+
 ## Remote Node Settings
 
 The three commands below are administrator-only and supported only through a

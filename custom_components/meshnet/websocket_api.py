@@ -170,6 +170,7 @@ async def async_register_websocket_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, websocket_settings_get)
     websocket_api.async_register_command(hass, websocket_settings_preview)
     websocket_api.async_register_command(hass, websocket_settings_apply)
+    websocket_api.async_register_command(hass, websocket_remote_controller)
     websocket_api.async_register_command(hass, websocket_remote_settings_get)
     websocket_api.async_register_command(hass, websocket_remote_settings_preview)
     websocket_api.async_register_command(hass, websocket_remote_settings_apply)
@@ -398,6 +399,40 @@ async def websocket_settings_apply(
             msg["id"],
             "settings_error",
             "MeshNet could not apply gateway settings",
+        )
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "meshnet/remote_admin/controller",
+        vol.Required(ATTR_GATEWAY_ID): _GATEWAY_ID,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_remote_controller(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Return the gateway radio's copy-only admin public key without RF."""
+    coordinator = _get_coordinator(hass)
+
+    async def get_remote_controller() -> None:
+        result = await coordinator.async_remote_controller_get(
+            gateway_id=msg[ATTR_GATEWAY_ID],
+        )
+        send_sensitive_result(connection, msg["id"], result)
+
+    try:
+        await _async_panel_operation(coordinator, "remote_controller_get", get_remote_controller)
+    except RemoteAdminError as err:
+        _send_remote_admin_error(connection, msg["id"], err)
+    except Exception:
+        connection.send_error(
+            msg["id"],
+            "remote_admin_unavailable",
+            "Remote administration is unavailable",
         )
 
 

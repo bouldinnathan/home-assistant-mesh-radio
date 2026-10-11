@@ -19,6 +19,7 @@ from collections.abc import Mapping
 from typing import Any
 
 _SETTINGS_PREVIEW_TYPE = "meshnet/settings/preview"
+_REMOTE_CONTROLLER_TYPE = "meshnet/remote_admin/controller"
 _REMOTE_SETTINGS_GET_TYPE = "meshnet/remote_settings/get"
 _REMOTE_SETTINGS_PREVIEW_TYPE = "meshnet/remote_settings/preview"
 _REMOTE_SETTINGS_APPLY_TYPE = "meshnet/remote_settings/apply"
@@ -41,6 +42,7 @@ _SENSITIVE_MESHNET_SERVICES = frozenset(
 _SENSITIVE_SERVICE_FIELDS = frozenset({"message", "target_node", "gateway_id", "channel"})
 _SENSITIVE_COMMAND_FIELDS = {
     _SETTINGS_PREVIEW_TYPE: frozenset({"changes"}),
+    _REMOTE_CONTROLLER_TYPE: frozenset({"gateway_id"}),
     _REMOTE_SETTINGS_GET_TYPE: frozenset({"gateway_id", "target_node"}),
     _REMOTE_SETTINGS_PREVIEW_TYPE: frozenset({"gateway_id", "target_node", "changes"}),
     _REMOTE_SETTINGS_APPLY_TYPE: frozenset({"gateway_id", "target_node"}),

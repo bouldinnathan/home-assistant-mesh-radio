@@ -114,6 +114,11 @@ def test_filter_redacts_send_message_and_identifiers_without_mutation() -> None:
 def test_filter_redacts_remote_admin_and_traceroute_identifiers_and_drafts() -> None:
     commands = (
         {
+            "id": 19,
+            "type": "meshnet/remote_admin/controller",
+            "gateway_id": "private-gateway",
+        },
+        {
             "id": 20,
             "type": "meshnet/remote_settings/get",
             "gateway_id": "private-gateway",

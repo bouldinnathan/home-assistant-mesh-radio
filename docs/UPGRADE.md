@@ -1,5 +1,24 @@
 # Upgrade Guide
 
+## From 0.13.1
+
+0.13.2 moves **Remote node administration** out of the Mesh view into its own
+**Remote nodes** tab next to Gateway settings. The tab opens with a **Gateway
+identity** card that reads the gateway radio's public key locally, through
+the new administrator-only `meshnet/remote_admin/controller` command, so the
+key can be copied and added to a remote node before the first
+**Load / test access**. Nothing is sent over the mesh for that read and the
+private key never leaves the radio. The Mesh view's saved card layout no
+longer has a remote-admin card; a layout saved by an earlier version is
+discarded once and the default order returns.
+
+Both settings editors now render each category as a collapsed section with
+its editable and read-only counts and a **Changed** badge, grouped under
+Radio configuration, Channels, Modules, and Device information, with
+**Expand all** and **Collapse all** controls. Hard-refresh the browser once
+so the 0.13.2 panel module loads. No config-entry or radio setting change is
+required.
+
 ## From 0.13.0
 
 0.13.1 adds a **?** tooltip to every setting in the gateway settings tab and

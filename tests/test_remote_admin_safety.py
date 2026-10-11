@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 from types import SimpleNamespace
 from typing import Any
@@ -386,6 +387,13 @@ def test_remote_admin_is_rejected_outside_meshtastic_bluetooth(
             "remote_admin_requires_bluetooth"
         )
 
+        with pytest.raises(RuntimeError) as identity_raised:
+            await gateway.async_get_remote_controller_identity()
+
+        assert getattr(identity_raised.value, "code", None) == (
+            "remote_admin_requires_bluetooth"
+        )
+
     asyncio.run(run())
 
 
@@ -606,5 +614,38 @@ def test_remote_reboot_keeps_stable_codes_when_the_target_refuses() -> None:
             await client.async_reboot_remote(TARGET_ID)
         assert err.value.code == "remote_admin_controller_unauthorized"
         assert connection.write_operations == []
+
+    asyncio.run(run())
+
+
+def test_controller_identity_is_a_local_read_with_no_rf_and_no_private_key() -> None:
+    """The gateway key the panel shows before any load comes from local NodeInfo."""
+
+    async def run() -> None:
+        client, connection = _active_remote_client()
+
+        result = await client.async_get_remote_controller_identity()
+
+        assert result == {
+            "node_id": CONTROLLER_ID,
+            "short_name": "CTRL",
+            "public_key": "base64:" + base64.b64encode(CONTROLLER_PUBLIC_KEY).decode(),
+        }
+        assert connection.packets == [], "reading the controller key must not send RF"
+        assert connection.session_requests == 0
+        assert PRIVATE_KEY_SENTINEL not in json.dumps(result)
+
+        client._nodes[CONTROLLER_NUM]["user"].pop("publicKey")
+        with pytest.raises(Exception) as missing:
+            await client.async_get_remote_controller_identity()
+        assert getattr(missing.value, "code", None) == (
+            "remote_admin_controller_public_key_unavailable"
+        )
+
+        client._connected = False
+        with pytest.raises(Exception) as disconnected:
+            await client.async_get_remote_controller_identity()
+        assert getattr(disconnected.value, "code", None) == "remote_admin_unavailable"
+        assert connection.packets == []
 
     asyncio.run(run())

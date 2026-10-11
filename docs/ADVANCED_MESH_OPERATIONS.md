@@ -129,8 +129,10 @@ eligible." It does not return the SecurityConfig payload.
 
 To authorize the MeshNet controller radio:
 
-1. In MeshNet, open **Remote administration** and select the connected
-   Meshtastic Bluetooth gateway.
+1. In MeshNet, open the **Remote nodes** tab and select the connected
+   Meshtastic Bluetooth gateway in its **Gateway identity** card. The card
+   reads the controller public key from the gateway radio locally; nothing is
+   sent over the mesh.
 2. Copy the controller public key. Confirm that the displayed node number and
    short name match the physical controller.
 3. Connect the official Meshtastic app or CLI locally to the target radio.

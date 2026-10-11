@@ -1,7 +1,6 @@
 const MESH_CARD_IDS = Object.freeze([
   "send-message",
   "gateways",
-  "remote-admin",
   "traceroute",
   "neighbor-info",
   "panel-diagnostics",
@@ -87,6 +86,12 @@ class MeshNetPanel extends HTMLElement {
     this._remoteSettingsSnapshot = null;
     this._remoteSettingsDraft = {};
     this._openFieldTip = null;
+    this._openSettingsSections = new Set();
+    this._controllerIdentity = null;
+    this._controllerIdentityBusy = false;
+    this._controllerIdentityStatus = null;
+    this._controllerIdentityAttemptedFor = "";
+    this._controllerIdentityRequestGeneration = 0;
     this._remoteSettingsPreview = null;
     this._remoteSettingsStatus = null;
     this._remoteSettingsBusy = null;
@@ -468,7 +473,9 @@ class MeshNetPanel extends HTMLElement {
       "bind_settings",
       "bind_views",
       "bind_remote_controls",
+      "bind_advanced_controls",
       "remote_control_event",
+      "remote_controller_get",
       "remote_settings_get",
       "remote_settings_preview",
       "remote_settings_apply",
@@ -595,7 +602,9 @@ class MeshNetPanel extends HTMLElement {
       bind_settings: "event_handler",
       bind_views: "event_handler",
       bind_remote_controls: "event_handler",
+      bind_advanced_controls: "event_handler",
       remote_control_event: "event_handler",
+      remote_controller_get: "remote_controller_get",
       remote_settings_get: "remote_settings_get",
       remote_settings_preview: "remote_settings_preview",
       remote_settings_apply: "remote_settings_apply",
@@ -869,6 +878,10 @@ class MeshNetPanel extends HTMLElement {
     this._cancelMeshLayoutInteraction();
     if (this._activeView === "settings") {
       this._renderSettings(composerFocus);
+      return;
+    }
+    if (this._activeView === "remote") {
+      this._renderRemote(composerFocus);
       return;
     }
     if (this._activeView === "messages") {
@@ -1180,136 +1193,8 @@ class MeshNetPanel extends HTMLElement {
           color: var(--secondary-text-color);
           font-size: 11px;
         }
-        .field-tip { position: relative; display: inline-block; vertical-align: middle; margin-left: 4px; }
-        .field-tip-button {
-          width: 18px;
-          height: 18px;
-          padding: 0;
-          border: 1px solid var(--secondary-text-color);
-          border-radius: 50%;
-          color: var(--secondary-text-color);
-          background: transparent;
-          font-family: inherit;
-          font-size: 11px;
-          font-weight: 600;
-          line-height: 16px;
-          cursor: help;
-        }
-        .field-tip-text {
-          display: none;
-          position: absolute;
-          z-index: 20;
-          left: 0;
-          top: calc(100% + 4px);
-          width: min(320px, calc(100vw - 48px));
-          padding: 8px 10px;
-          border: 1px solid var(--divider-color);
-          border-radius: 6px;
-          color: var(--primary-text-color);
-          background: var(--card-background-color);
-          box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
-          font-size: 12px;
-          font-weight: 400;
-          line-height: 1.4;
-          text-align: left;
-          white-space: normal;
-        }
-        .field-tip-text span { display: block; }
-        .field-tip-text span + span { margin-top: 4px; }
-        .field-tip:hover .field-tip-text,
-        .field-tip:focus-within .field-tip-text,
-        .field-tip[data-open="true"] .field-tip-text { display: block; }
-        .operator-controls {
-          display: grid;
-          gap: 9px;
-        }
-        .operator-controls label {
-          display: grid;
-          gap: 4px;
-          color: var(--secondary-text-color);
-          font-size: 12px;
-        }
-        .operator-controls select,
-        .operator-controls input[type="text"],
-        .operator-controls input[type="number"] {
-          width: 100%;
-          box-sizing: border-box;
-          border: 1px solid var(--divider-color);
-          border-radius: 6px;
-          padding: 7px;
-          color: var(--primary-text-color);
-          background: var(--card-background-color);
-          font: inherit;
-        }
-        .operator-actions {
-          display: flex;
-          flex-wrap: wrap;
-          align-items: center;
-          gap: 7px;
-        }
-        .operator-button {
-          border: 1px solid var(--primary-color);
-          border-radius: 6px;
-          padding: 7px 10px;
-          color: var(--primary-color);
-          background: transparent;
-          cursor: pointer;
-          font: inherit;
-        }
-        .operator-button.primary {
-          color: var(--text-primary-color, #fff);
-          background: var(--primary-color);
-        }
-        .operator-button:disabled {
-          cursor: default;
-          opacity: 0.55;
-        }
-        .operator-status {
-          min-height: 17px;
-          overflow-wrap: anywhere;
-          font-size: 12px;
-        }
-        .operator-card {
-          display: grid;
-          gap: 8px;
-          margin-top: 10px;
-          padding-top: 10px;
-          border-top: 1px solid var(--divider-color);
-        }
-        .operator-card h3 {
-          margin: 0;
-          font-size: 14px;
-          font-weight: 500;
-        }
-        .operator-field {
-          display: grid;
-          gap: 4px;
-        }
-        .controller-key {
-          display: block;
-          padding: 7px;
-          border: 1px solid var(--divider-color);
-          border-radius: 6px;
-          overflow-wrap: anywhere;
-          user-select: all;
-          font: 11px var(--code-font-family, monospace);
-        }
-        .confirmation-box {
-          display: grid;
-          grid-template-columns: auto 1fr;
-          align-items: start;
-          gap: 7px;
-          padding: 8px;
-          border: 1px solid var(--warning-color, #b26a00);
-          border-radius: 6px;
-          color: var(--primary-text-color);
-          font-size: 12px;
-        }
-        .route-list {
-          margin: 2px 0 0;
-          padding-left: 20px;
-          font-size: 12px;
-        }
+        ${this._fieldTipCss()}
+        ${this._operatorCss()}
         .diagnostic-detail {
           color: var(--secondary-text-color);
           font-size: 11px;
@@ -1530,7 +1415,6 @@ class MeshNetPanel extends HTMLElement {
               </div>
             `).join("") || `<div class="label">No gateways configured</div>`}
           </section>
-          ${this._remoteAdminPanel(nodes, gateways)}
           ${this._traceroutePanel(nodes, gateways)}
           ${this._neighborInfoPanel(nodes, gateways)}
           ${this._panelDiagnostics(snapshot.panel_metadata, nodes)}
@@ -1598,7 +1482,7 @@ class MeshNetPanel extends HTMLElement {
     this._safeStep("bind_mesh_layout", "binding", () => this._bindMeshCardLayout(meshCardScroll));
     this._safeStep("bind_composer", "binding", () => this._bindComposer());
     this._safeStep("bind_nodes", "binding", () => this._bindNodeControls());
-    this._safeStep("bind_remote_controls", "binding", () => this._bindAdvancedControls());
+    this._safeStep("bind_advanced_controls", "binding", () => this._bindAdvancedControls());
     this._safeStep("bind_graph", "binding", () => this._bindGraphControls(topology));
     this._safeStep("restore_focus", "focus", () => this._restoreComposerFocus(composerFocus));
   }
@@ -1690,12 +1574,142 @@ class MeshNetPanel extends HTMLElement {
     }).join("");
   }
 
-  _remoteAdminPanel(nodes, gateways) {
+  _snapshotGateways() {
+    const snapshot = this._snapshot || {};
+    return Object.values(snapshot.gateways || {}).filter(
+      (gateway) => gateway && typeof gateway === "object" && !Array.isArray(gateway),
+    );
+  }
+
+  _selectedRemoteGatewayId(gateways = null) {
+    const candidates = this._remoteGatewayCandidates(gateways || this._snapshotGateways());
+    return candidates.some((gateway) => gateway.gateway_id === this._remoteGatewayId)
+      ? this._remoteGatewayId
+      : candidates[0] && candidates[0].gateway_id || "";
+  }
+
+  _statusKindClass(status) {
+    const kind = status && status.kind;
+    return ["good", "warn", "bad"].includes(kind) ? kind : "";
+  }
+
+  _renderRemote(focusState = null) {
+    const snapshot = this._snapshot || { nodes: {}, gateways: {}, recent_messages: [] };
+    const sourceNodes = Object.values(snapshot.nodes || {}).filter(
+      (node) => node && typeof node === "object" && !Array.isArray(node),
+    );
+    const nodes = this._nodesWithExactMeshtasticNameHints(sourceNodes);
+    const gateways = this._snapshotGateways();
     const compatibleGateways = this._remoteGatewayCandidates(gateways);
+    const selectedGateway = this._selectedRemoteGatewayId(gateways);
+    // Start the local key read before composing HTML so the card shows the
+    // in-progress state immediately. It is a local radio read; no RF is sent.
+    this._maybeLoadControllerIdentity(selectedGateway);
+    this.innerHTML = `
+      <style>
+        ${this._editorCss()}
+        ${this._operatorCss()}
+        .remote-wrap { max-width: 1040px; margin: 0 auto; padding: 16px; box-sizing: border-box; }
+        .remote-wrap .operator-controls > label { max-width: 480px; }
+        .remote-wrap .operator-field {
+          display: grid;
+          grid-template-columns: minmax(190px, 0.8fr) minmax(220px, 1.2fr);
+          gap: 4px 14px;
+          align-items: center;
+          padding-top: 11px;
+          border-top: 1px solid var(--divider-color);
+        }
+        .remote-wrap .operator-field > .field-help { grid-column: 2; }
+        .remote-wrap .operator-field input[type="checkbox"] { justify-self: start; width: 20px; height: 20px; }
+        .remote-wrap .operator-field code { font: 12px var(--code-font-family, monospace); overflow-wrap: anywhere; }
+        .remote-wrap .controller-key { max-width: 640px; }
+        @media (max-width: 720px) {
+          .remote-wrap { padding: 10px; }
+          .remote-wrap .operator-field { grid-template-columns: 1fr; }
+          .remote-wrap .operator-field > .field-help { grid-column: auto; }
+        }
+      </style>
+      <div class="remote-wrap">
+        <div class="toolbar">
+          <div>
+            <h1>MeshNet</h1>
+            <div class="label">Administrator remote node controls</div>
+          </div>
+          <span class="${selectedGateway ? "good" : "warn"}">${selectedGateway ? "Bluetooth gateway online" : "No connected Meshtastic Bluetooth gateway"}</span>
+        </div>
+        ${this._viewTabs()}
+        ${this._remoteGatewayCard(compatibleGateways, selectedGateway)}
+        ${this._remoteAdminPanel(nodes, gateways)}
+      </div>
+    `;
+    this._safeStep("bind_views", "binding", () => this._bindViewControls());
+    this._safeStep("bind_remote_controls", "binding", () => this._bindRemoteAdminControls());
+    this._safeStep("restore_focus", "focus", () => this._restoreComposerFocus(focusState));
+  }
+
+  _controllerIdentityFor(gatewayId) {
+    if (!gatewayId) return null;
+    const identity = this._controllerIdentity;
+    if (identity && identity.gateway_id === gatewayId) return identity;
+    const snapshot = this._remoteSettingsSnapshot;
+    if (snapshot && snapshot.gateway_id === gatewayId && snapshot.controller) {
+      return {
+        gateway_id: gatewayId,
+        node_id: snapshot.controller.node_id,
+        short_name: snapshot.controller.short_name,
+        public_key: snapshot.controller.public_key,
+      };
+    }
+    return null;
+  }
+
+  _remoteGatewayCard(compatibleGateways, selectedGateway) {
+    const identity = this._controllerIdentityFor(selectedGateway);
+    const status = this._controllerIdentityStatus;
+    let keyHtml;
+    if (identity) {
+      keyHtml = `
+            <div class="field-help">Controller ${this._escape(this._remoteControllerLabel(identity))}</div>
+            <label>Controller public key (copy-only)
+              <code class="controller-key" id="meshnet-controller-public-key">${this._escape(identity.public_key)}</code>
+            </label>
+            <div class="operator-actions">
+              <button class="operator-button" id="meshnet-controller-key-copy" type="button">Copy controller public key</button>
+            </div>`;
+    } else if (this._controllerIdentityBusy) {
+      keyHtml = '<div class="field-help">Reading the gateway radio’s public key…</div>';
+    } else if (selectedGateway) {
+      keyHtml = `
+            <div class="operator-actions">
+              <button class="operator-button" id="meshnet-controller-key-load" type="button">Show gateway public key</button>
+            </div>`;
+    } else {
+      keyHtml = '<div class="field-help">Connect a Meshtastic Bluetooth gateway to see its public key.</div>';
+    }
+    return `
+      <section class="settings-card" id="meshnet-remote-gateway-card">
+        <h2>Gateway identity</h2>
+        <div class="field-help">The gateway radio has exactly one key pair. A remote node accepts changes only from a radio whose public key is on its admin key list, so this public key is added to each remote node once. MeshNet never handles the private key.</div>
+        <div class="operator-controls">
+          <label>Gateway
+            <select id="meshnet-remote-gateway"${compatibleGateways.length ? "" : " disabled"}>
+              ${this._operatorGatewayOptions(compatibleGateways, selectedGateway)}
+            </select>
+          </label>
+          ${keyHtml}
+          <div class="operator-status ${this._statusKindClass(status)}" id="meshnet-controller-status" role="status" aria-live="polite">${this._escape(status ? status.text : "")}</div>
+        </div>
+        <details class="history-manage" id="meshnet-remote-authorize-help">
+          <summary>How a remote node authorizes this gateway</summary>
+          <div class="field-help">A remote node keeps a list of up to three admin public keys and accepts changes only from a radio whose key is on that list. One time, with the Meshtastic app connected to the remote node: copy the controller public key above, then in the app open <strong>Radio configuration → Security</strong>, paste the key into a free <strong>Admin key</strong> slot, and save. Then select the node below and use <strong>Load / test access</strong>; a successful load proves the authorization.</div>
+        </details>
+      </section>
+    `;
+  }
+
+  _remoteAdminPanel(nodes, gateways) {
     const compatibleNodes = this._remoteNodeCandidates(nodes);
-    const selectedGateway = compatibleGateways.some(
-      (gateway) => gateway.gateway_id === this._remoteGatewayId,
-    ) ? this._remoteGatewayId : compatibleGateways[0] && compatibleGateways[0].gateway_id || "";
+    const selectedGateway = this._selectedRemoteGatewayId(gateways);
     const selectedTarget = compatibleNodes.some(
       (node) => this._meshtasticNodeId(node) === this._remoteTargetNode,
     ) ? this._remoteTargetNode : compatibleNodes[0] ? this._meshtasticNodeId(compatibleNodes[0]) : "";
@@ -1707,19 +1721,10 @@ class MeshNetPanel extends HTMLElement {
     const hasDraft = Object.keys(this._remoteSettingsDraft).length > 0;
     const busy = this._remoteSettingsBusy != null;
     return `
-      <section class="panel" id="meshnet-remote-admin-panel" data-mesh-card="remote-admin">
+      <section class="settings-card" id="meshnet-remote-admin-panel">
         <h2>Remote node administration</h2>
         <div class="field-help">Explicit Meshtastic Bluetooth requests only. Loading is read-only; every write requires a preview and a separate confirmation.</div>
-        <details class="history-manage" id="meshnet-remote-authorize-help">
-          <summary>How a remote node authorizes this gateway</summary>
-          <div class="field-help">The gateway radio has exactly one key pair. A remote node keeps a list of up to three admin public keys and accepts changes only from a radio whose key is on that list. One time, with the Meshtastic app connected to the remote node: load the node here, copy the controller public key, then in the app open <strong>Radio configuration → Security</strong>, paste the key into a free <strong>Admin key</strong> slot, and save. Load the node again afterwards; a successful load proves the authorization.</div>
-        </details>
         <div class="operator-controls">
-          <label>Gateway
-            <select id="meshnet-remote-gateway"${compatibleGateways.length ? "" : " disabled"}>
-              ${this._operatorGatewayOptions(compatibleGateways, selectedGateway)}
-            </select>
-          </label>
           <label>Exact target node
             <select id="meshnet-remote-target"${compatibleNodes.length ? "" : " disabled"}>
               ${this._operatorTargetOptions(compatibleNodes, selectedTarget)}
@@ -1731,22 +1736,17 @@ class MeshNetPanel extends HTMLElement {
           ${snapshotMatches ? `
             <section class="operator-card">
               <h3>${this._escape(this._remoteTargetLabel(snapshot.target))}</h3>
-              <div class="field-help">Controller ${this._escape(this._remoteControllerLabel(snapshot.controller))}</div>
-              <label>Controller public key (copy-only)
-                <code class="controller-key" id="meshnet-controller-public-key">${this._escape(snapshot.controller.public_key)}</code>
-              </label>
-              <div class="operator-actions">
-                <button class="operator-button" id="meshnet-controller-key-copy" type="button">Copy controller public key</button>
-              </div>
+              <div class="field-help">Loaded through controller ${this._escape(this._remoteControllerLabel(snapshot.controller))}. The node has authorized this gateway.</div>
             </section>
             ${this._remoteRebootCard(snapshot)}
             <form class="operator-card" id="meshnet-remote-settings-form">
-              ${snapshot.categories.map((category) => `
-                <section class="operator-card" data-remote-category="${this._escape(category.key)}">
-                  <h3>${this._escape(category.label)}</h3>
-                  ${this._remoteCategoryBody(category, fields)}
-                </section>
-              `).join("")}
+              ${this._settingsSectionTools("remote")}
+              ${snapshot.categories.map((category) => this._settingsSectionHtml("remote", category, {
+                editable: category.fields.filter((field) => field.writable).length,
+                readOnly: category.fields.filter((field) => !field.writable).length,
+                changed: category.fields.some((field) => Object.hasOwn(this._remoteSettingsDraft, field.path)),
+                body: this._remoteCategoryBody(category, fields),
+              })).join("")}
               <div class="operator-actions">
                 <button class="operator-button primary" id="meshnet-remote-preview" type="submit"${busy || !hasDraft || this._remoteSettingsPreview ? " disabled" : ""}>${this._remoteSettingsBusy === "preview" ? "Preparing preview…" : "Preview remote changes"}</button>
               </div>
@@ -1757,6 +1757,80 @@ class MeshNetPanel extends HTMLElement {
         </div>
       </section>
     `;
+  }
+
+  _maybeLoadControllerIdentity(gatewayId) {
+    if (
+      this._activeView !== "remote"
+      || !this._connected
+      || !this._hass
+      || typeof this._hass.callWS !== "function"
+      || !this._validOperatorGatewayId(gatewayId)
+      || this._controllerIdentityBusy
+      || this._controllerIdentityAttemptedFor === gatewayId
+      || (this._controllerIdentity && this._controllerIdentity.gateway_id === gatewayId)
+    ) return;
+    void this._loadControllerIdentity(gatewayId);
+  }
+
+  async _loadControllerIdentity(gatewayId) {
+    if (
+      this._controllerIdentityBusy
+      || !this._hass
+      || typeof this._hass.callWS !== "function"
+      || !this._validOperatorGatewayId(gatewayId)
+    ) return;
+    const generation = ++this._controllerIdentityRequestGeneration;
+    this._controllerIdentityAttemptedFor = gatewayId;
+    this._controllerIdentityBusy = true;
+    this._controllerIdentity = null;
+    this._controllerIdentityStatus = null;
+    try {
+      const response = await this._withTimeout(this._hass.callWS({
+        type: "meshnet/remote_admin/controller",
+        gateway_id: gatewayId,
+      }), 20000);
+      if (generation !== this._controllerIdentityRequestGeneration) return;
+      this._controllerIdentity = this._sanitizeControllerIdentity(response, gatewayId);
+      this._markOperationSuccess("remote_controller_get");
+    } catch (error) {
+      if (generation !== this._controllerIdentityRequestGeneration) return;
+      this._controllerIdentity = null;
+      this._recordFailure(
+        "remote_controller_get",
+        this._safeErrorCode(error) === "timeout" ? "timeout" : this._safeErrorType(error) === "PanelSchemaError" ? "schema" : "websocket",
+        error,
+      );
+      this._controllerIdentityStatus = {
+        kind: "bad",
+        text: this._remoteAdminErrorText(error, "controller"),
+      };
+    } finally {
+      if (generation === this._controllerIdentityRequestGeneration) {
+        this._controllerIdentityBusy = false;
+        this._safeRender("render");
+      }
+    }
+  }
+
+  _sanitizeControllerIdentity(response, gatewayId) {
+    if (
+      !response
+      || typeof response !== "object"
+      || Array.isArray(response)
+      || response.schema_version !== 1
+      || response.gateway_id !== gatewayId
+      || !response.controller
+      || typeof response.controller !== "object"
+      || Array.isArray(response.controller)
+      || response.controller.public_key_copy_only !== true
+    ) throw { name: "PanelSchemaError", code: "invalid_format" };
+    return {
+      gateway_id: gatewayId,
+      node_id: this._requiredRemoteNodeId(response.controller.node_id),
+      short_name: this._optionalSettingText(response.controller.short_name, 64),
+      public_key: this._sanitizeControllerPublicKey(response.controller.public_key),
+    };
   }
 
   _remoteTargetLabel(target) {
@@ -2277,6 +2351,7 @@ class MeshNetPanel extends HTMLElement {
       "meshnet-remote-reboot-confirm",
       "meshnet-remote-reboot",
       "meshnet-controller-key-copy",
+      "meshnet-controller-key-load",
       "meshnet-traceroute-gateway",
       "meshnet-traceroute-target",
       "meshnet-traceroute-start",
@@ -2313,13 +2388,16 @@ class MeshNetPanel extends HTMLElement {
         "meshnet-view-mesh",
         "meshnet-view-messages",
         "meshnet-view-settings",
+        "meshnet-view-remote",
       ].includes(id);
     try {
       isSetting = isSetting
         || (typeof active.hasAttribute === "function"
           && (active.hasAttribute("data-setting-index")
             || active.hasAttribute("data-setting-clear-index")
-            || active.hasAttribute("data-remote-setting-index")));
+            || active.hasAttribute("data-remote-setting-index")
+            || active.hasAttribute("data-settings-sections")))
+        || (typeof active.tagName === "string" && active.tagName.toUpperCase() === "SUMMARY");
     } catch (_ignored) {
       // A disappearing browser control is not an active settings editor.
     }
@@ -2395,12 +2473,14 @@ class MeshNetPanel extends HTMLElement {
         <button id="meshnet-view-mesh" class="view-tab${this._activeView === "mesh" ? " active" : ""}" type="button" data-meshnet-view="mesh"${this._activeView === "mesh" ? ' aria-current="page"' : ""}>Mesh</button>
         <button id="meshnet-view-messages" class="view-tab${this._activeView === "messages" ? " active" : ""}" type="button" data-meshnet-view="messages"${this._activeView === "messages" ? ' aria-current="page"' : ""}>Messages</button>
         <button id="meshnet-view-settings" class="view-tab${this._activeView === "settings" ? " active" : ""}" type="button" data-meshnet-view="settings"${this._activeView === "settings" ? ' aria-current="page"' : ""}>Gateway settings</button>
+        <button id="meshnet-view-remote" class="view-tab${this._activeView === "remote" ? " active" : ""}" type="button" data-meshnet-view="remote"${this._activeView === "remote" ? ' aria-current="page"' : ""}>Remote nodes</button>
       </nav>
     `;
   }
 
   _bindViewControls() {
     this._bindFieldTips();
+    this._bindSettingsSections();
     this.querySelectorAll("[data-meshnet-view]").forEach((button) => {
       button.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
       button.addEventListener("click", () => {
@@ -2412,7 +2492,7 @@ class MeshNetPanel extends HTMLElement {
   }
 
   _switchView(view) {
-    const next = ["mesh", "messages", "settings"].includes(view) ? view : "mesh";
+    const next = ["mesh", "messages", "settings", "remote"].includes(view) ? view : "mesh";
     if (this._activeView === next) return;
     if (this._activeView === "mesh" && next !== "mesh") this._stopGraphAnimation();
     this._activeView = next;
@@ -2434,6 +2514,216 @@ class MeshNetPanel extends HTMLElement {
     const busy = this._settingsBusy != null;
     this.innerHTML = `
       <style>
+        ${this._editorCss()}
+      </style>
+      <div class="settings-wrap">
+        <div class="toolbar">
+          <div>
+            <h1>MeshNet</h1>
+            <div class="label">Administrator gateway controls</div>
+          </div>
+          <span class="${snapshot && snapshot.connected ? "good" : "warn"}">${snapshot ? snapshot.connected ? "Gateway online" : "Gateway offline" : "Settings not loaded"}</span>
+        </div>
+        ${this._viewTabs()}
+        <section class="settings-card">
+          <div class="settings-heading">
+            <div>
+              <h2>Gateway settings</h2>
+              <div class="label">Changes stay in this browser tab until you preview them. MeshNet never stores a settings draft in browser storage.</div>
+            </div>
+            <label>
+              <span class="label">Gateway</span>
+              <select class="gateway-select" id="meshnet-settings-gateway"${busy ? " disabled" : ""}>
+                ${this._settingsGatewayOptions()}
+              </select>
+            </label>
+            <button class="settings-button" id="meshnet-settings-reload" type="button"${busy ? " disabled" : ""}>Reload live values</button>
+          </div>
+          ${!snapshot && this._settingsBusy !== "get" && !this._settingsStatus ? '<div class="settings-status warn">Choose a gateway to load its supported settings.</div>' : ""}
+          ${snapshot ? `
+            <div class="field-help">${this._escape(`${snapshot.name} · ${snapshot.protocol} over ${snapshot.transport} · revision ${snapshot.revision}`)}</div>
+            <div class="settings-status ${editableCount > 0 ? "good" : "warn"}">${editableCount} editable · ${readOnlyCount} read-only</div>
+            ${editableCount === 0 ? `<div class="settings-status warn">${fields.length > 0 ? "No settings can be edited safely right now." : "This gateway did not report any settings."}${snapshot.read_only_reason ? ` ${this._escape(snapshot.read_only_reason)}` : ""}</div>` : ""}
+            ${this._settingsWarningList(snapshot.warnings)}
+            <form id="meshnet-settings-form">
+              ${snapshot.categories.length ? this._settingsSectionTools("local") : ""}
+              ${this._settingsCategoryGroups(snapshot.categories).map((group) => `
+                ${group.label ? `<h3 class="settings-group">${this._escape(group.label)}</h3>` : ""}
+                ${group.categories.map((category) => this._settingsSectionHtml("local", category, {
+                  editable: snapshot.writable ? category.fields.filter((field) => field.writable).length : 0,
+                  readOnly: snapshot.writable ? category.fields.filter((field) => !field.writable).length : category.fields.length,
+                  changed: category.fields.some((field) => Object.hasOwn(this._settingsDraft, field.path)),
+                  body: `
+                    ${category.description ? `<div class="field-help">${this._escape(category.description)}</div>` : ""}
+                    <div class="settings-grid">
+                      ${category.fields.map((field) => this._settingsField(
+                        field,
+                        fields.findIndex((candidate) => candidate.path === field.path),
+                        snapshot,
+                      )).join("") || '<div class="label">No settings in this category.</div>'}
+                    </div>
+                  `,
+                })).join("")}
+              `).join("") || '<div class="settings-status warn">This gateway did not report any settings categories.</div>'}
+              <div class="settings-actions">
+                <button class="settings-button primary" id="meshnet-settings-preview" type="submit"${busy || !snapshot.writable || !hasChanges || this._settingsPreview ? " disabled" : ""}>${this._settingsBusy === "preview" ? "Preparing preview…" : "Preview changes"}</button>
+                <span class="label">Preview is required before Apply. A stale revision is rejected by Home Assistant.</span>
+              </div>
+            </form>
+            ${this._settingsPreviewHtml()}
+          ` : ""}
+          ${this._settingsWarningList(this._settingsResultWarnings)}
+          <div id="meshnet-settings-status" class="settings-status ${this._settingsStatusClass()}" role="status" aria-live="polite">${this._escape(this._settingsStatus ? this._settingsStatus.text : "")}</div>
+        </section>
+      </div>
+    `;
+    this._safeStep("bind_views", "binding", () => this._bindViewControls());
+    this._safeStep("bind_settings", "binding", () => this._bindSettingsControls());
+    this._safeStep("restore_focus", "focus", () => this._restoreComposerFocus(focusState));
+  }
+
+  _fieldTipCss() {
+    return `
+        .field-tip { position: relative; display: inline-block; vertical-align: middle; margin-left: 4px; }
+        .field-tip-button {
+          width: 18px;
+          height: 18px;
+          padding: 0;
+          border: 1px solid var(--secondary-text-color);
+          border-radius: 50%;
+          color: var(--secondary-text-color);
+          background: transparent;
+          font-family: inherit;
+          font-size: 11px;
+          font-weight: 600;
+          line-height: 16px;
+          cursor: help;
+        }
+        .field-tip-text {
+          display: none;
+          position: absolute;
+          z-index: 20;
+          left: 0;
+          top: calc(100% + 4px);
+          width: min(320px, calc(100vw - 48px));
+          padding: 8px 10px;
+          border: 1px solid var(--divider-color);
+          border-radius: 6px;
+          color: var(--primary-text-color);
+          background: var(--card-background-color);
+          box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+          font-size: 12px;
+          font-weight: 400;
+          line-height: 1.4;
+          text-align: left;
+          white-space: normal;
+        }
+        .field-tip-text span { display: block; }
+        .field-tip-text span + span { margin-top: 4px; }
+        .field-tip:hover .field-tip-text,
+        .field-tip:focus-within .field-tip-text,
+        .field-tip[data-open="true"] .field-tip-text { display: block; }
+    `;
+  }
+
+  _operatorCss() {
+    return `
+        .operator-controls {
+          display: grid;
+          gap: 9px;
+        }
+        .operator-controls label {
+          display: grid;
+          gap: 4px;
+          color: var(--secondary-text-color);
+          font-size: 12px;
+        }
+        .operator-controls select,
+        .operator-controls input[type="text"],
+        .operator-controls input[type="number"] {
+          width: 100%;
+          box-sizing: border-box;
+          border: 1px solid var(--divider-color);
+          border-radius: 6px;
+          padding: 7px;
+          color: var(--primary-text-color);
+          background: var(--card-background-color);
+          font: inherit;
+        }
+        .operator-actions {
+          display: flex;
+          flex-wrap: wrap;
+          align-items: center;
+          gap: 7px;
+        }
+        .operator-button {
+          border: 1px solid var(--primary-color);
+          border-radius: 6px;
+          padding: 7px 10px;
+          color: var(--primary-color);
+          background: transparent;
+          cursor: pointer;
+          font: inherit;
+        }
+        .operator-button.primary {
+          color: var(--text-primary-color, #fff);
+          background: var(--primary-color);
+        }
+        .operator-button:disabled {
+          cursor: default;
+          opacity: 0.55;
+        }
+        .operator-status {
+          min-height: 17px;
+          overflow-wrap: anywhere;
+          font-size: 12px;
+        }
+        .operator-card {
+          display: grid;
+          gap: 8px;
+          margin-top: 10px;
+          padding-top: 10px;
+          border-top: 1px solid var(--divider-color);
+        }
+        .operator-card h3 {
+          margin: 0;
+          font-size: 14px;
+          font-weight: 500;
+        }
+        .operator-field {
+          display: grid;
+          gap: 4px;
+        }
+        .controller-key {
+          display: block;
+          padding: 7px;
+          border: 1px solid var(--divider-color);
+          border-radius: 6px;
+          overflow-wrap: anywhere;
+          user-select: all;
+          font: 11px var(--code-font-family, monospace);
+        }
+        .confirmation-box {
+          display: grid;
+          grid-template-columns: auto 1fr;
+          align-items: start;
+          gap: 7px;
+          padding: 8px;
+          border: 1px solid var(--warning-color, #b26a00);
+          border-radius: 6px;
+          color: var(--primary-text-color);
+          font-size: 12px;
+        }
+        .route-list {
+          margin: 2px 0 0;
+          padding-left: 20px;
+          font-size: 12px;
+        }
+    `;
+  }
+
+  _editorCss() {
+    return `
         :host {
           display: block;
           min-height: 100vh;
@@ -2506,45 +2796,7 @@ class MeshNetPanel extends HTMLElement {
         }
         .label, .field-help { color: var(--secondary-text-color); font-size: 12px; }
         .field-help { overflow-wrap: anywhere; }
-        .field-tip { position: relative; display: inline-block; vertical-align: middle; margin-left: 4px; }
-        .field-tip-button {
-          width: 18px;
-          height: 18px;
-          padding: 0;
-          border: 1px solid var(--secondary-text-color);
-          border-radius: 50%;
-          color: var(--secondary-text-color);
-          background: transparent;
-          font-family: inherit;
-          font-size: 11px;
-          font-weight: 600;
-          line-height: 16px;
-          cursor: help;
-        }
-        .field-tip-text {
-          display: none;
-          position: absolute;
-          z-index: 20;
-          left: 0;
-          top: calc(100% + 4px);
-          width: min(320px, calc(100vw - 48px));
-          padding: 8px 10px;
-          border: 1px solid var(--divider-color);
-          border-radius: 6px;
-          color: var(--primary-text-color);
-          background: var(--card-background-color);
-          box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
-          font-size: 12px;
-          font-weight: 400;
-          line-height: 1.4;
-          text-align: left;
-          white-space: normal;
-        }
-        .field-tip-text span { display: block; }
-        .field-tip-text span + span { margin-top: 4px; }
-        .field-tip:hover .field-tip-text,
-        .field-tip:focus-within .field-tip-text,
-        .field-tip[data-open="true"] .field-tip-text { display: block; }
+        ${this._fieldTipCss()}
         .badge { display: inline-block; margin-right: 5px; font-size: 11px; }
         .warn { color: var(--warning-color, #b26a00); }
         .bad { color: var(--error-color, #d32f2f); }
@@ -2556,65 +2808,132 @@ class MeshNetPanel extends HTMLElement {
           .settings-field { grid-template-columns: 1fr; gap: 7px; }
           .settings-heading { display: grid; }
         }
-      </style>
-      <div class="settings-wrap">
-        <div class="toolbar">
-          <div>
-            <h1>MeshNet</h1>
-            <div class="label">Administrator gateway controls</div>
-          </div>
-          <span class="${snapshot && snapshot.connected ? "good" : "warn"}">${snapshot ? snapshot.connected ? "Gateway online" : "Gateway offline" : "Settings not loaded"}</span>
-        </div>
-        ${this._viewTabs()}
-        <section class="settings-card">
-          <div class="settings-heading">
-            <div>
-              <h2>Gateway settings</h2>
-              <div class="label">Changes stay in this browser tab until you preview them. MeshNet never stores a settings draft in browser storage.</div>
-            </div>
-            <label>
-              <span class="label">Gateway</span>
-              <select class="gateway-select" id="meshnet-settings-gateway"${busy ? " disabled" : ""}>
-                ${this._settingsGatewayOptions()}
-              </select>
-            </label>
-            <button class="settings-button" id="meshnet-settings-reload" type="button"${busy ? " disabled" : ""}>Reload live values</button>
-          </div>
-          ${!snapshot && this._settingsBusy !== "get" && !this._settingsStatus ? '<div class="settings-status warn">Choose a gateway to load its supported settings.</div>' : ""}
-          ${snapshot ? `
-            <div class="field-help">${this._escape(`${snapshot.name} · ${snapshot.protocol} over ${snapshot.transport} · revision ${snapshot.revision}`)}</div>
-            <div class="settings-status ${editableCount > 0 ? "good" : "warn"}">${editableCount} editable · ${readOnlyCount} read-only</div>
-            ${editableCount === 0 ? `<div class="settings-status warn">${fields.length > 0 ? "No settings can be edited safely right now." : "This gateway did not report any settings."}${snapshot.read_only_reason ? ` ${this._escape(snapshot.read_only_reason)}` : ""}</div>` : ""}
-            ${this._settingsWarningList(snapshot.warnings)}
-            <form id="meshnet-settings-form">
-              ${snapshot.categories.map((category) => `
-                <section class="settings-card">
-                  <h3>${this._escape(category.label)}</h3>
-                  ${category.description ? `<div class="field-help">${this._escape(category.description)}</div>` : ""}
-                  <div class="settings-grid">
-                    ${category.fields.map((field) => this._settingsField(
-                      field,
-                      fields.findIndex((candidate) => candidate.path === field.path),
-                      snapshot,
-                    )).join("") || '<div class="label">No settings in this category.</div>'}
-                  </div>
-                </section>
-              `).join("") || '<div class="settings-status warn">This gateway did not report any settings categories.</div>'}
-              <div class="settings-actions">
-                <button class="settings-button primary" id="meshnet-settings-preview" type="submit"${busy || !snapshot.writable || !hasChanges || this._settingsPreview ? " disabled" : ""}>${this._settingsBusy === "preview" ? "Preparing preview…" : "Preview changes"}</button>
-                <span class="label">Preview is required before Apply. A stale revision is rejected by Home Assistant.</span>
-              </div>
-            </form>
-            ${this._settingsPreviewHtml()}
-          ` : ""}
-          ${this._settingsWarningList(this._settingsResultWarnings)}
-          <div id="meshnet-settings-status" class="settings-status ${this._settingsStatusClass()}" role="status" aria-live="polite">${this._escape(this._settingsStatus ? this._settingsStatus.text : "")}</div>
-        </section>
+        .history-manage { margin-top: 14px; border-top: 1px solid var(--divider-color); padding-top: 8px; }
+        .history-manage summary { cursor: pointer; }
+        .settings-group {
+          margin: 20px 0 0;
+          color: var(--secondary-text-color);
+          font-size: 12px;
+          font-weight: 600;
+          letter-spacing: 0.06em;
+          text-transform: uppercase;
+        }
+        .settings-section-tools { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+        .settings-section {
+          margin-top: 10px;
+          border: 1px solid var(--divider-color);
+          border-radius: 9px;
+          background: var(--card-background-color);
+        }
+        .settings-section > summary {
+          display: flex;
+          flex-wrap: wrap;
+          align-items: center;
+          justify-content: space-between;
+          gap: 8px;
+          padding: 10px 14px;
+          cursor: pointer;
+          list-style: none;
+        }
+        .settings-section > summary::-webkit-details-marker { display: none; }
+        .settings-section-title { font-size: 15px; font-weight: 500; }
+        .settings-section-title::before {
+          content: "▸";
+          display: inline-block;
+          width: 16px;
+          color: var(--secondary-text-color);
+        }
+        .settings-section[open] > summary .settings-section-title::before { content: "▾"; }
+        .settings-section-meta { color: var(--secondary-text-color); font-size: 12px; }
+        .settings-section-meta .badge { margin-right: 8px; }
+        .settings-section-body { padding: 0 14px 14px; }
+    `;
+  }
+
+  _settingsCategoryGroups(categories) {
+    const groups = [
+      { label: "Radio configuration", match: (key) => key === "owner" || key.startsWith("config.") },
+      { label: "Channels", match: (key) => key.startsWith("channel.") },
+      { label: "Modules", match: (key) => key.startsWith("module.") },
+      { label: "Device information", match: () => true },
+    ];
+    const buckets = groups.map((group) => ({ label: group.label, categories: [] }));
+    (Array.isArray(categories) ? categories : []).forEach((category) => {
+      const key = typeof category.key === "string" ? category.key : "";
+      buckets[groups.findIndex((group) => group.match(key))].categories.push(category);
+    });
+    const populated = buckets.filter((bucket) => bucket.categories.length);
+    // A provider whose sections match none of the Meshtastic prefixes (for
+    // example MeshCore) keeps its own flat order without an invented heading.
+    if (!populated.some((bucket) => bucket.label !== "Device information")) {
+      return populated.length ? [{ label: "", categories: populated[0].categories }] : [];
+    }
+    return populated;
+  }
+
+  _settingsSectionKey(scope, category) {
+    return `${scope}:${category.key}`;
+  }
+
+  _settingsSectionHtml(scope, category, { editable, readOnly, changed, body }) {
+    const key = this._settingsSectionKey(scope, category);
+    const open = this._openSettingsSections.has(key);
+    const meta = `${editable} editable · ${readOnly} read-only`;
+    return `
+      <details class="settings-section" data-settings-section="${this._escape(key)}"${open ? " open" : ""}>
+        <summary>
+          <span class="settings-section-title">${this._escape(category.label)}</span>
+          <span class="settings-section-meta">${changed ? '<span class="badge warn">Changed</span>' : ""}${this._escape(meta)}</span>
+        </summary>
+        <div class="settings-section-body">${body}</div>
+      </details>
+    `;
+  }
+
+  _settingsSectionTools(scope) {
+    return `
+      <div class="settings-section-tools">
+        <button class="settings-button" type="button" data-settings-sections="expand" data-settings-scope="${this._escape(scope)}">Expand all</button>
+        <button class="settings-button" type="button" data-settings-sections="collapse" data-settings-scope="${this._escape(scope)}">Collapse all</button>
       </div>
     `;
-    this._safeStep("bind_views", "binding", () => this._bindViewControls());
-    this._safeStep("bind_settings", "binding", () => this._bindSettingsControls());
-    this._safeStep("restore_focus", "focus", () => this._restoreComposerFocus(focusState));
+  }
+
+  _bindSettingsSections() {
+    this.querySelectorAll("[data-settings-section]").forEach((details) => {
+      if (details.getAttribute("data-settings-section-bound") === "true") return;
+      details.setAttribute("data-settings-section-bound", "true");
+      details.addEventListener("toggle", () => {
+        const key = details.getAttribute("data-settings-section");
+        if (typeof key !== "string") return;
+        if (details.open === true) this._openSettingsSections.add(key);
+        else this._openSettingsSections.delete(key);
+      });
+    });
+    this.querySelectorAll("[data-settings-sections]").forEach((button) => {
+      if (button.getAttribute("data-settings-sections-bound") === "true") return;
+      button.setAttribute("data-settings-sections-bound", "true");
+      button.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
+      button.addEventListener("click", () => {
+        this._safeStep("settings_event", "binding", () => {
+          this._setSettingsSectionsOpen(
+            button.getAttribute("data-settings-scope"),
+            button.getAttribute("data-settings-sections") === "expand",
+          );
+        });
+      });
+    });
+  }
+
+  _setSettingsSectionsOpen(scope, open) {
+    const prefix = `${scope}:`;
+    this.querySelectorAll("[data-settings-section]").forEach((details) => {
+      const key = details.getAttribute("data-settings-section");
+      if (typeof key !== "string" || !key.startsWith(prefix)) return;
+      if (open) this._openSettingsSections.add(key);
+      else this._openSettingsSections.delete(key);
+      details.open = open;
+    });
   }
 
   _settingsGatewayOptions() {
@@ -4401,7 +4720,7 @@ class MeshNetPanel extends HTMLElement {
     });
   }
 
-  _bindAdvancedControls() {
+  _bindRemoteAdminControls() {
     const remoteGateway = this.querySelector("#meshnet-remote-gateway");
     const remoteTarget = this.querySelector("#meshnet-remote-target");
     const remoteLoad = this.querySelector("#meshnet-remote-load");
@@ -4409,18 +4728,7 @@ class MeshNetPanel extends HTMLElement {
     const remoteConfirm = this.querySelector("#meshnet-remote-confirm");
     const remoteApply = this.querySelector("#meshnet-remote-apply");
     const copyKey = this.querySelector("#meshnet-controller-key-copy");
-    const traceGateway = this.querySelector("#meshnet-traceroute-gateway");
-    const traceTarget = this.querySelector("#meshnet-traceroute-target");
-    const traceStart = this.querySelector("#meshnet-traceroute-start");
-    const traceStatusReload = this.querySelector("#meshnet-traceroute-status-reload");
-    const traceConfirm = this.querySelector("#meshnet-traceroute-confirm");
-    const traceCancel = this.querySelector("#meshnet-traceroute-cancel");
-    const neighborGateway = this.querySelector("#meshnet-neighbor-info-gateway");
-    const neighborTarget = this.querySelector("#meshnet-neighbor-info-target");
-    const neighborStatusLoad = this.querySelector("#meshnet-neighbor-info-status-load");
-    const neighborStart = this.querySelector("#meshnet-neighbor-info-start");
-    const neighborConfirm = this.querySelector("#meshnet-neighbor-info-confirm");
-    const neighborCancel = this.querySelector("#meshnet-neighbor-info-cancel");
+    const loadKey = this.querySelector("#meshnet-controller-key-load");
     [
       remoteGateway,
       remoteTarget,
@@ -4428,24 +4736,14 @@ class MeshNetPanel extends HTMLElement {
       remoteConfirm,
       remoteApply,
       copyKey,
-      traceGateway,
-      traceTarget,
-      traceStart,
-      traceStatusReload,
-      traceConfirm,
-      traceCancel,
-      neighborGateway,
-      neighborTarget,
-      neighborStatusLoad,
-      neighborStart,
-      neighborConfirm,
-      neighborCancel,
+      loadKey,
     ].filter(Boolean).forEach((control) => {
       control.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
     });
     if (remoteGateway) {
       remoteGateway.addEventListener("change", () => {
         this._resetRemoteSelection(remoteGateway.value, remoteTarget && remoteTarget.value || "");
+        this._controllerIdentityStatus = null;
         this._safeRender("render");
       });
     }
@@ -4462,6 +4760,15 @@ class MeshNetPanel extends HTMLElement {
             remoteGateway && remoteGateway.value || "",
             remoteTarget && remoteTarget.value || "",
           );
+        });
+      });
+    }
+    if (loadKey) {
+      loadKey.addEventListener("click", () => {
+        this._safeStep("remote_control_event", "binding", () => {
+          this._controllerIdentityAttemptedFor = "";
+          void this._loadControllerIdentity(remoteGateway && remoteGateway.value || "");
+          this._safeRender("render");
         });
       });
     }
@@ -4529,6 +4836,37 @@ class MeshNetPanel extends HTMLElement {
         });
       });
     }
+  }
+
+  _bindAdvancedControls() {
+    const traceGateway = this.querySelector("#meshnet-traceroute-gateway");
+    const traceTarget = this.querySelector("#meshnet-traceroute-target");
+    const traceStart = this.querySelector("#meshnet-traceroute-start");
+    const traceStatusReload = this.querySelector("#meshnet-traceroute-status-reload");
+    const traceConfirm = this.querySelector("#meshnet-traceroute-confirm");
+    const traceCancel = this.querySelector("#meshnet-traceroute-cancel");
+    const neighborGateway = this.querySelector("#meshnet-neighbor-info-gateway");
+    const neighborTarget = this.querySelector("#meshnet-neighbor-info-target");
+    const neighborStatusLoad = this.querySelector("#meshnet-neighbor-info-status-load");
+    const neighborStart = this.querySelector("#meshnet-neighbor-info-start");
+    const neighborConfirm = this.querySelector("#meshnet-neighbor-info-confirm");
+    const neighborCancel = this.querySelector("#meshnet-neighbor-info-cancel");
+    [
+      traceGateway,
+      traceTarget,
+      traceStart,
+      traceStatusReload,
+      traceConfirm,
+      traceCancel,
+      neighborGateway,
+      neighborTarget,
+      neighborStatusLoad,
+      neighborStart,
+      neighborConfirm,
+      neighborCancel,
+    ].filter(Boolean).forEach((control) => {
+      control.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
+    });
     if (traceGateway) {
       traceGateway.addEventListener("change", () => {
         this._tracerouteGatewayId = traceGateway.value;
@@ -4679,10 +5017,10 @@ class MeshNetPanel extends HTMLElement {
   }
 
   async _copyControllerPublicKey() {
-    const snapshot = this._remoteSettingsSnapshot;
+    const identity = this._controllerIdentityFor(this._selectedRemoteGatewayId());
     const clipboard = typeof navigator !== "undefined" && navigator.clipboard;
-    if (!snapshot || !clipboard || typeof clipboard.writeText !== "function") {
-      this._remoteSettingsStatus = {
+    if (!identity || !clipboard || typeof clipboard.writeText !== "function") {
+      this._controllerIdentityStatus = {
         kind: "warn",
         text: "Clipboard access is unavailable. Select and copy the displayed value manually.",
       };
@@ -4690,11 +5028,11 @@ class MeshNetPanel extends HTMLElement {
       return;
     }
     try {
-      await clipboard.writeText(snapshot.controller.public_key);
-      this._remoteSettingsStatus = { kind: "good", text: "Controller public key copied." };
+      await clipboard.writeText(identity.public_key);
+      this._controllerIdentityStatus = { kind: "good", text: "Controller public key copied." };
     } catch (error) {
       this._recordFailure("remote_control_event", "lifecycle", error);
-      this._remoteSettingsStatus = {
+      this._controllerIdentityStatus = {
         kind: "warn",
         text: "Clipboard access was denied. Select and copy the displayed value manually.",
       };
@@ -5072,6 +5410,9 @@ class MeshNetPanel extends HTMLElement {
     }
     if (phase === "reboot") {
       return "The reboot outcome is unknown. Wait a few minutes and load the node again before sending another.";
+    }
+    if (phase === "controller") {
+      return "The gateway public key could not be read. Confirm the Bluetooth gateway is connected, then press Show gateway public key.";
     }
     return "Remote settings could not be loaded. Verify the gateway and target, then try one explicit load.";
   }

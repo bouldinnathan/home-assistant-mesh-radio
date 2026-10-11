@@ -13,6 +13,7 @@ PANEL = Path("custom_components/meshnet/frontend/meshnet-panel.js")
 def test_remote_admin_and_traceroute_are_visible_explicit_controls_only() -> None:
     source = PANEL.read_text(encoding="utf-8")
     for command in (
+        'type: "meshnet/remote_admin/controller"',
         'type: "meshnet/remote_settings/get"',
         'type: "meshnet/remote_settings/preview"',
         'type: "meshnet/remote_settings/apply"',

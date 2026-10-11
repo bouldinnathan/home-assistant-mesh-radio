@@ -77,6 +77,8 @@ def test_gateway_settings_view_is_explicit_and_keeps_drafts_in_memory() -> None:
     source = _source()
 
     assert 'data-meshnet-view="settings"' in source
+    assert 'data-meshnet-view="remote"' in source
+    assert "Remote nodes" in source
     assert "Gateway settings" in source
     assert "Administrator gateway controls" in source
     assert 'type: "meshnet/settings/get"' in source
@@ -3121,5 +3123,234 @@ def test_setting_tooltips_explain_purpose_limits_and_read_only_reasons() -> None
   const badUnit = JSON.parse(JSON.stringify(response));
   badUnit.categories[0].fields[1].unit = { not: "text" };
   assert.throws(() => panel._sanitizeRemoteSettingsSnapshot(badUnit, "ble-gateway", "!1234abcd"), (error) => error.name === "PanelSchemaError");
+"""
+    )
+
+
+def test_settings_sections_are_collapsible_grouped_and_remember_state() -> None:
+    """Every category is a collapsed section with counts; groups break up the list."""
+    source = _source()
+    assert 'class="settings-section"' in source
+    assert 'data-settings-sections="expand"' in source
+    assert 'data-settings-sections="collapse"' in source
+    _run_panel_script(
+        r"""
+  panel._bindViewControls = () => {};
+  panel._bindSettingsControls = () => {};
+  panel._restoreComposerFocus = () => {};
+  panel.querySelectorAll = () => [];
+  panel.querySelector = () => null;
+  const category = (key, label, fields) => ({ key, label, fields });
+  const text = (path, label, writable = true) => ({ path, label, type: "string", value: "x", max_length: 16, writable, ...(writable ? {} : { read_only_reason: "fixed" }) });
+  const snapshot = panel._sanitizeSettingsSnapshot({
+    schema_version: 1,
+    gateway_id: "gateway-1",
+    name: "Test gateway",
+    protocol: "meshtastic",
+    transport: "bluetooth",
+    connected: true,
+    writable: true,
+    revision: "c".repeat(64),
+    fetched_at: "2026-07-30T12:00:00Z",
+    categories: [
+      category("metadata", "Metadata", [text("metadata.firmware_version", "Firmware", false)]),
+      category("module.mqtt", "Mqtt", [text("module.mqtt.address", "Address"), text("module.mqtt.root", "Root")]),
+      category("channel.0", "Channel 0", [text("channel.0.settings.name", "Name")]),
+      category("owner", "Owner", [text("owner.short_name", "Short name")]),
+      category("config.device", "Device", [text("config.device.tzdef", "Tzdef"), text("config.device.serial", "Serial", false)]),
+    ],
+    warnings: [],
+  });
+  panel._settingsSnapshot = snapshot;
+  panel._settingsGateways = [{ gateway_id: "gateway-1", name: "Test gateway", protocol: "meshtastic", transport: "bluetooth", connected: true }];
+  panel._settingsGatewayId = "gateway-1";
+  panel._renderSettings();
+  let html = panel.innerHTML;
+
+  // Groups appear in a fixed order and carry their categories in server order.
+  const order = ["Radio configuration", "Owner", "Device", "Channels", "Channel 0", "Modules", "Mqtt", "Device information", "Metadata"]
+    .map((label) => html.indexOf(`>${label}<`));
+  assert.ok(order.every((index) => index >= 0), `missing heading or title: ${order}`);
+  assert.deepEqual(order, [...order].sort((a, b) => a - b));
+  assert.equal((html.match(/class="settings-group"/g) || []).length, 4);
+
+  // Every category is a details element, collapsed by default, with counts.
+  assert.equal((html.match(/<details class="settings-section"/g) || []).length, 5);
+  assert.equal((html.match(/<details class="settings-section"[^>]* open>/g) || []).length, 0);
+  assert.ok(html.includes('data-settings-section="local:config.device"'));
+  assert.ok(html.includes("1 editable · 1 read-only"));
+  assert.ok(html.includes("2 editable · 0 read-only"));
+  assert.ok(html.includes("0 editable · 1 read-only"));
+  assert.ok(html.includes('data-settings-sections="expand" data-settings-scope="local"'));
+  assert.ok(html.includes('data-settings-sections="collapse" data-settings-scope="local"'));
+  assert.equal(html.includes(">Changed<"), false);
+
+  // A draft marks its section even while the section stays collapsed.
+  panel._settingsDraft["module.mqtt.root"] = "changed";
+  panel._renderSettings();
+  html = panel.innerHTML;
+  const mqtt = html.slice(html.indexOf('data-settings-section="local:module.mqtt"'), html.indexOf('data-settings-section="local:metadata"'));
+  assert.ok(mqtt.includes(">Changed<"));
+  assert.equal((html.match(/>Changed</g) || []).length, 1);
+
+  // Expand all / collapse all act through the in-memory set and survive a re-render.
+  const fakeDetails = (key) => ({
+    open: false,
+    attributes: {},
+    listeners: {},
+    getAttribute(name) { return name === "data-settings-section" ? key : this.attributes[name] || null; },
+    setAttribute(name, value) { this.attributes[name] = value; },
+    addEventListener(name, handler) { this.listeners[name] = handler; },
+  });
+  const details = ["local:metadata", "local:module.mqtt", "local:channel.0", "local:owner", "local:config.device"].map(fakeDetails);
+  panel.querySelectorAll = (selector) => selector === "[data-settings-section]" ? details : [];
+  panel._setSettingsSectionsOpen("local", true);
+  assert.ok(details.every((item) => item.open === true));
+  panel._renderSettings();
+  assert.equal((panel.innerHTML.match(/<details class="settings-section"[^>]* open>/g) || []).length, 5);
+  panel._setSettingsSectionsOpen("local", false);
+  panel._renderSettings();
+  assert.equal((panel.innerHTML.match(/<details class="settings-section"[^>]* open>/g) || []).length, 0);
+
+  // A user toggle is remembered the same way; other scopes are untouched.
+  panel._bindSettingsSections();
+  details[4].open = true;
+  details[4].listeners.toggle();
+  assert.ok(panel._openSettingsSections.has("local:config.device"));
+  panel._openSettingsSections.add("remote:owner");
+  panel._setSettingsSectionsOpen("local", false);
+  assert.equal(panel._openSettingsSections.has("local:config.device"), false);
+  assert.ok(panel._openSettingsSections.has("remote:owner"));
+
+  // Providers whose sections match no Meshtastic prefix keep a flat list.
+  const flat = panel._settingsCategoryGroups([category("access", "Settings access", []), category("device", "Device", [])]);
+  assert.equal(flat.length, 1);
+  assert.equal(flat[0].label, "");
+  assert.deepEqual(flat[0].categories.map((item) => item.key), ["access", "device"]);
+  assert.deepEqual(panel._settingsCategoryGroups([]), []);
+"""
+    )
+
+
+def test_remote_nodes_view_shows_gateway_key_before_any_remote_load() -> None:
+    """The Remote nodes tab reads the gateway key locally and shows it first."""
+    source = _source()
+    assert 'id="meshnet-remote-gateway-card"' in source
+    assert 'id="meshnet-controller-key-load"' in source
+    assert "data-mesh-card=\"remote-admin\"" not in source
+    _run_panel_script(
+        r"""
+  const KEY = "base64:AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
+  const identity = {
+    schema_version: 1,
+    gateway_id: "ble-gateway",
+    controller: { node_id: "!01020304", short_name: "CTRL", public_key: KEY, public_key_copy_only: true },
+  };
+  const snapshot = {
+    nodes: {
+      "meshtastic:!1234abcd": {
+        node_key: "meshtastic:!1234abcd", protocol: "meshtastic", node_id: "!1234abcd", identity_valid: true,
+        long_name: "Remote", short_name: "RMT", online: true, last_heard: new Date().toISOString(),
+      },
+    },
+    gateways: {
+      "ble-gateway": { gateway_id: "ble-gateway", name: "Garage", protocol: "meshtastic", transport: "bluetooth", connected: true, local_node_id: "!01020304" },
+      "other": { gateway_id: "other", name: "Other", protocol: "meshtastic", transport: "bluetooth", connected: true },
+      "serial": { gateway_id: "serial", name: "Serial", protocol: "meshtastic", transport: "serial", connected: true },
+    },
+    recent_messages: [],
+  };
+  const settle = async () => { for (let i = 0; i < 4; i += 1) await new Promise((resolve) => setImmediate(resolve)); };
+  const makePanel = (respond) => {
+    const built = new PanelClass();
+    built.querySelectorAll = () => [];
+    built.querySelector = () => null;
+    built.contains = () => false;
+    built._connected = true;
+    built._snapshot = snapshot;
+    built.requests = [];
+    built._hass = { async callWS(payload) { built.requests.push(structuredClone(payload)); return respond(payload); } };
+    return built;
+  };
+  const keyRequests = (built) => built.requests.filter((payload) => payload.type === "meshnet/remote_admin/controller");
+
+  const good = makePanel((payload) => {
+    if (payload.type === "meshnet/remote_admin/controller") return { ...identity, gateway_id: payload.gateway_id };
+    throw new Error("unexpected request");
+  });
+  assert.equal(good._isMeshCardId("remote-admin"), false);
+  good._switchView("mesh");
+  good._safeRender("render");
+  assert.equal(good.innerHTML.includes("meshnet-remote-admin-panel"), false, "the mesh view no longer hosts the remote editor");
+  assert.equal(keyRequests(good).length, 0, "the mesh view never reads the key");
+
+  good._switchView("remote");
+  assert.equal(good._activeView, "remote");
+  assert.deepEqual(keyRequests(good), [{ type: "meshnet/remote_admin/controller", gateway_id: "ble-gateway" }]);
+  assert.ok(good.innerHTML.includes("Reading the gateway radio’s public key"));
+  await settle();
+  assert.deepEqual(good._controllerIdentity, { gateway_id: "ble-gateway", node_id: "!01020304", short_name: "CTRL", public_key: KEY });
+  let html = good.innerHTML;
+  assert.ok(html.includes('data-meshnet-view="remote" aria-current="page"'));
+  assert.ok(html.includes('id="meshnet-remote-gateway-card"'));
+  assert.ok(html.includes(`id="meshnet-controller-public-key">${KEY}<`));
+  assert.ok(html.includes('id="meshnet-controller-key-copy"'));
+  assert.ok(html.includes('id="meshnet-remote-authorize-help"'));
+  assert.ok(html.includes('id="meshnet-remote-admin-panel"'));
+  assert.ok(html.includes('id="meshnet-remote-target"'));
+  assert.ok(html.includes('id="meshnet-remote-load"'));
+  assert.ok(html.includes('<option value="ble-gateway" selected>'));
+  assert.equal(html.includes('value="serial"'), false, "serial gateways cannot administer remote nodes");
+  assert.equal(html.includes('id="meshnet-controller-key-load"'), false);
+
+  // Polling re-renders never repeat the read; a gateway change reads once more.
+  good._safeRender("render");
+  good._safeRender("render");
+  assert.equal(keyRequests(good).length, 1);
+  good._resetRemoteSelection("other", "");
+  good._safeRender("render");
+  await settle();
+  assert.equal(keyRequests(good).length, 2);
+  assert.equal(keyRequests(good)[1].gateway_id, "other");
+  assert.equal(good._controllerIdentity.gateway_id, "other");
+
+  // Copying uses the identity card, with no remote load required.
+  let copied = null;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: { clipboard: { async writeText(value) { copied = value; } } } });
+  await good._copyControllerPublicKey();
+  assert.equal(copied, KEY);
+  assert.equal(good._controllerIdentityStatus.kind, "good");
+  assert.equal(good._remoteSettingsSnapshot, null);
+
+  // A malformed key fails closed: nothing is shown and nothing retries by itself.
+  const bad = makePanel((payload) => ({ ...identity, gateway_id: payload.gateway_id, controller: { ...identity.controller, public_key: "base64:short" } }));
+  bad._switchView("remote");
+  await settle();
+  assert.equal(bad._controllerIdentity, null);
+  assert.equal(bad._controllerIdentityStatus.kind, "bad");
+  assert.equal(bad.innerHTML.includes("AQIDBAUGBwgJ"), false);
+  assert.ok(bad.innerHTML.includes('id="meshnet-controller-key-load"'));
+  bad._safeRender("render");
+  await settle();
+  assert.equal(keyRequests(bad).length, 1, "a failed read waits for the operator");
+  bad._controllerIdentityAttemptedFor = "";
+  await bad._loadControllerIdentity("ble-gateway");
+  assert.equal(keyRequests(bad).length, 2);
+
+  // Server error codes map to fixed local text.
+  const denied = makePanel(() => { throw { code: "remote_admin_requires_bluetooth" }; });
+  denied._switchView("remote");
+  await settle();
+  assert.match(denied._controllerIdentityStatus.text, /Bluetooth gateway/);
+  assert.ok(denied.innerHTML.includes("Choose a connected Meshtastic Bluetooth gateway"));
+
+  // Without a compatible gateway the tab explains instead of requesting.
+  const none = makePanel(() => { throw new Error("must not request"); });
+  none._snapshot = { nodes: {}, gateways: { serial: snapshot.gateways.serial }, recent_messages: [] };
+  none._switchView("remote");
+  await settle();
+  assert.equal(keyRequests(none).length, 0);
+  assert.ok(none.innerHTML.includes("Connect a Meshtastic Bluetooth gateway to see its public key"));
+  assert.ok(none.innerHTML.includes("No connected Meshtastic Bluetooth gateway"));
 """
     )
