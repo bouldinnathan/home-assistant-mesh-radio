@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -302,7 +303,7 @@ def test_real_meshtastic_power_mask_obeys_server_frontend_integer_contract() -> 
     assert power_mask["value"] == 0
     assert power_mask["max"] == 2**53 - 1
     assert power_mask["read_only_reason"] == (
-        "This setting needs dedicated validation before MeshNet can edit it."
+        "This bitmask needs a dedicated editor before MeshNet can edit it."
     )
     assert snapshot["writable"] is True
 
@@ -330,7 +331,7 @@ def test_real_meshtastic_power_mask_obeys_server_frontend_integer_contract() -> 
   assert.equal(powerMask.value, 0);
   assert.equal(powerMask.max, Number.MAX_SAFE_INTEGER);
   assert.equal(powerMask.writable, false);
-  assert.match(panel._settingsField(powerMask, 2, response.selected), /dedicated validation/);
+  assert.match(panel._settingsField(powerMask, 2, response.selected), /dedicated editor/);
   const ownerShortName = response.selected.categories
     .flatMap((category) => category.fields)
     .find((field) => field.path === "owner.short_name");
@@ -2883,5 +2884,121 @@ def test_remote_reboot_is_collapsed_confirmed_and_validated() -> None:
     "The reboot outcome is unknown. Wait a few minutes and load the node again before sending another.",
   );
   assert.equal(panel._safeOperation("remote_reboot", ["remote_reboot"]), "remote_reboot");
+"""
+    )
+
+
+def test_remote_allowlist_in_panel_matches_the_contract_table() -> None:
+    """The panel copy of the remote allowlist must never drift from Python."""
+    from custom_components.meshnet.settings_contracts import REMOTE_WRITABLE_PATHS
+
+    source = _source()
+    begin = source.index("// remote-allowlist-begin")
+    end = source.index("// remote-allowlist-end")
+    listed = re.findall(r'"([a-z0-9_.N]+)"', source[begin:end])
+    assert listed == sorted(listed)
+    assert set(listed) == set(REMOTE_WRITABLE_PATHS)
+    assert "config.security" not in source[begin:end]
+    assert "psk" not in source[begin:end]
+    assert "private_key" not in source[begin:end]
+
+
+def test_remote_editor_sanitizes_read_only_rows_and_contract_bounds() -> None:
+    """Read-only rows render without inputs; writable rows honour the contract."""
+    source = _source()
+    assert 'id="meshnet-remote-authorize-help"' in source
+    assert "Radio configuration → Security" in source
+    _run_panel_script(
+        r"""
+  const response = {
+    schema_version: 1,
+    gateway_id: "ble-gateway",
+    target_node: "!1234abcd",
+    revision: "a".repeat(64),
+    controller: { node_id: "!01020304", short_name: "CTRL", public_key: "base64:" + "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=", public_key_copy_only: true },
+    target: { node_id: "!1234abcd", long_name: "Remote", short_name: "RMT", public_key_available: true, remote_admin_eligible: true },
+    categories: [
+      {
+        key: "config.lora",
+        label: "Lora",
+        fields: [
+          { path: "config.lora.hop_limit", label: "Hop Limit", type: "integer", value: 3, min: 1, max: 7, critical: true, warning: "hop_limit_changes_how_far_this_node_reaches", writable: true },
+          { path: "config.lora.region", label: "Region", type: "select", value: "US", value_label: "US", writable: false, read_only_reason: "radio_parameters_can_isolate_the_node_from_the_mesh" },
+        ],
+      },
+      {
+        key: "config.position",
+        label: "Position",
+        fields: [
+          { path: "config.position.position_broadcast_secs", label: "Interval", type: "integer", value: 900, min: 0, max: 4294967295, minimum_nonzero: 32, writable: true },
+        ],
+      },
+      {
+        key: "config.device",
+        label: "Device",
+        fields: [
+          { path: "config.device.tzdef", label: "Tzdef", type: "string", value: "", max_length: 64, allow_empty: true, writable: true },
+        ],
+      },
+      {
+        key: "channel.2",
+        label: "2",
+        fields: [
+          { path: "channel.2.settings.name", label: "Name", type: "string", value: "alpha", max_length: 11, allow_empty: true, writable: true },
+        ],
+      },
+    ],
+  };
+  const snapshot = panel._sanitizeRemoteSettingsSnapshot(response, "ble-gateway", "!1234abcd");
+  const fields = new Map(panel._remoteSettingsFields(snapshot).map((field) => [field.path, field]));
+  assert.equal(fields.get("config.lora.region").writable, false);
+  assert.equal(fields.get("config.lora.region").read_only_reason, "radio_parameters_can_isolate_the_node_from_the_mesh");
+  assert.equal(fields.get("config.lora.hop_limit").critical, true);
+  assert.equal(fields.get("config.lora.hop_limit").warning, "hop_limit_changes_how_far_this_node_reaches");
+  assert.equal(fields.get("config.device.tzdef").allow_empty, true);
+  assert.equal(fields.get("channel.2.settings.name").max_length, 11);
+
+  const interval = fields.get("config.position.position_broadcast_secs");
+  assert.equal(panel._coerceRemoteSettingValue(interval, "0"), 0);
+  assert.equal(panel._coerceRemoteSettingValue(interval, "900"), 900);
+  assert.throws(() => panel._coerceRemoteSettingValue(interval, "10"), (error) => error.name === "ValidationError");
+  assert.equal(panel._coerceRemoteSettingValue(fields.get("config.device.tzdef"), ""), "");
+  assert.throws(() => panel._coerceRemoteSettingValue(fields.get("config.lora.hop_limit"), "8"), (error) => error.name === "ValidationError");
+  assert.throws(() => panel._coerceRemoteSettingValue(fields.get("channel.2.settings.name"), "twelve-chars"), (error) => error.name === "ValidationError");
+
+  const rendered = panel._remoteCategoryBody(snapshot.categories[0], panel._remoteSettingsFields(snapshot));
+  assert.ok(rendered.includes("Read-only here (1)"));
+  assert.ok(rendered.includes("Radio parameters can isolate the node from the mesh"));
+  assert.ok(!rendered.includes('data-remote-setting-index="1"'));
+  assert.ok(rendered.includes('data-remote-setting-index="0"'));
+
+  // A provider claiming an unreviewed path is writable fails closed.
+  const tampered = JSON.parse(JSON.stringify(response));
+  tampered.categories[0].fields[1].writable = true;
+  assert.throws(() => panel._sanitizeRemoteSettingsSnapshot(tampered, "ble-gateway", "!1234abcd"), (error) => error.name === "PanelSchemaError");
+  const wrongCategory = JSON.parse(JSON.stringify(response));
+  wrongCategory.categories[0].fields[0].path = "config.device.role";
+  assert.throws(() => panel._sanitizeRemoteSettingsSnapshot(wrongCategory, "ble-gateway", "!1234abcd"), (error) => error.name === "PanelSchemaError");
+
+  const preview = panel._validateRemoteSettingsPreview(
+    {
+      schema_version: 1,
+      gateway_id: "ble-gateway",
+      target_node: "!1234abcd",
+      revision: "a".repeat(64),
+      preview_id: "p".repeat(43),
+      requires_confirmation: true,
+      changes: [{ path: "config.lora.hop_limit", label: "Hop Limit" }],
+      warnings: ["hop_limit_changes_how_far_this_node_reaches", "change_can_affect_mesh_reachability"],
+      expires_at: new Date().toISOString(),
+    },
+    snapshot,
+    { "config.lora.hop_limit": 5 },
+  );
+  assert.deepEqual(preview.warnings, ["hop_limit_changes_how_far_this_node_reaches", "change_can_affect_mesh_reachability"]);
+  panel._remoteSettingsPreview = preview;
+  const html = panel._remoteSettingsPreviewPanel();
+  assert.ok(html.includes("Hop limit changes how far this node reaches"));
+  assert.ok(html.includes("reboot once"));
 """
     )

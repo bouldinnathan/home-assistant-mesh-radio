@@ -34,13 +34,13 @@ from google.protobuf.json_format import MessageToDict
 from google.protobuf.message import DecodeError
 from meshtastic.protobuf import admin_pb2, mesh_pb2, portnums_pb2, telemetry_pb2
 
-from ..const import REMOTE_ADMIN_WRITABLE_PATHS
 from ..meshtastic_settings import (
     MeshtasticSettingsState,
     MeshtasticSettingsValidationError,
 )
 from ..node_identity import canonical_meshtastic_node_id
 from ..sensitive_logging import suppress_sensitive_library_logs
+from ..settings_contracts import remote_write_allowed
 from .bluetooth import BluetoothConnection
 from .errors import (
     MeshtasticAsyncError,
@@ -61,12 +61,20 @@ _SETTINGS_READBACK_TIMEOUT = 70.0
 # Firmware sessions live for 300 seconds. Refresh at half-life so transport
 # latency can never make MeshNet use a passkey beyond the firmware lifetime.
 _REMOTE_ADMIN_SESSION_SECONDS = 150.0
-_REMOTE_ADMIN_TIMEOUT_SECONDS = 105.0
+_REMOTE_ADMIN_TIMEOUT_SECONDS = 240.0
 _REBOOT_DELAY_MIN_SECONDS = 1
 _REBOOT_DELAY_MAX_SECONDS = 300
+# One get_config round trip per section; security, session-key, and device-UI
+# configuration are never requested.  The order matches the panel categories.
 _REMOTE_CONFIG_TYPES = (
     "SESSIONKEY_CONFIG",
+    "DEVICE_CONFIG",
+    "POSITION_CONFIG",
+    "POWER_CONFIG",
+    "NETWORK_CONFIG",
     "DISPLAY_CONFIG",
+    "LORA_CONFIG",
+    "BLUETOOTH_CONFIG",
 )
 _REMOTE_ROUTING_ERRORS = {
     "PKI_SEND_FAIL_PUBLIC_KEY": (
@@ -937,6 +945,7 @@ class MeshtasticBluetoothClient:
                         changes,
                         transport="bluetooth",
                         admin_message_factory=admin_pb2.AdminMessage,
+                        remote=True,
                     )
                     if plan.blocked_paths or not plan.operations:
                         raise self._remote_error("remote_admin_command_forbidden")
@@ -1182,6 +1191,7 @@ class MeshtasticBluetoothClient:
             transport="bluetooth",
             write_supported=self.connected,
             apply_reason="remote_admin_is_not_available",
+            remote=True,
         )
         # Unlike the local settings manager, this result crosses the adapter
         # boundary directly. Never return even the repr-redacted internal
@@ -1283,7 +1293,7 @@ class MeshtasticBluetoothClient:
         if not isinstance(changes, Mapping) or not 1 <= len(changes) <= 64:
             raise MeshtasticBluetoothClient._remote_error("remote_admin_command_forbidden")
         for path in changes:
-            if not isinstance(path, str) or path not in REMOTE_ADMIN_WRITABLE_PATHS:
+            if not isinstance(path, str) or not remote_write_allowed(path):
                 raise MeshtasticBluetoothClient._remote_error("remote_admin_command_forbidden")
 
     @staticmethod

@@ -106,6 +106,17 @@ it automatically. Reload and inspect live state before deciding on any next
 write. An integration removal or HACS uninstall cannot safely infer or reverse
 an intentional change stored by radio firmware.
 
+### Remote settings scope
+
+Remote settings writes are limited to the reviewed contract table in
+`settings_contracts.py`. The table never includes SecurityConfig, admin or
+channel keys, Wi-Fi or MQTT credentials, LoRa radio parameters, shutdown
+timers, or hardware pins, so a remote write cannot change who administers a
+node, cannot move it off the mesh, and cannot leave it unreachable until
+someone presses a button. The panel keeps a copy of the remote allowlist for
+early validation and a test asserts it matches the table; the backend remains
+the boundary.
+
 ### Radio reboots
 
 `meshnet.reboot_gateway_radio` is the only reboot an automation can trigger,

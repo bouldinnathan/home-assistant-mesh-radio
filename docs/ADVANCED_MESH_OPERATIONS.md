@@ -164,19 +164,46 @@ The remote editor follows the same safe shape as the local gateway editor:
 - A write uses the target's eight-byte session passkey only in memory, for at
   most the firmware's session lifetime, and never returns it to the UI.
 - The write is sent once. MeshNet then requests the changed section again and
-  reports Verified, Mismatch, Rejected, or Unknown outcome.
+  reports Verified, Mismatch, Rejected, or Unknown outcome. Most sections make
+  the node reboot once after the commit; an Unknown outcome after an
+  acknowledged write usually means the readback raced that reboot, so load
+  the node again a minute later before deciding anything.
 
-The safe initial allowlist covers the owner long/short name and reviewed
-non-secret DisplayConfig preferences that the existing settings planner can
-represent and verify. Bluetooth configuration is intentionally excluded from
-the first remote editor because changing another node's pairing behavior can
-create an avoidable local-access lockout. The following remain excluded even
-when the firmware offers them:
+The write allowlist is the reviewed contract table in
+`settings_contracts.py`, shared with the local gateway editor. Each entry
+records the scope (local gateway, remote node, or both), numeric bounds, the
+string byte limit the firmware buffer allows, whether an empty value or zero
+("use the firmware default") is accepted, and a warning code shown in the
+preview. The remote editor loads the owner record and the device, position,
+power, network, display, LoRa, and Bluetooth sections and offers:
+
+| Section | Editable over the mesh | Read-only with a reason |
+| --- | --- | --- |
+| Owner | long and short name, unmessagable flag | licensed (ham) mode |
+| Device | role, rebroadcast mode, node-info interval (minimum one hour), serial console, button and LED behavior, time zone | button and buzzer pins, deprecated managed flag |
+| Position | broadcast interval and smart broadcast, GPS mode and update interval, fixed-position flag | position flags bitmask, GPS pins, deprecated GPS fields |
+| Power | power saving, light-sleep and wake timers, Bluetooth wait, ADC multiplier | shutdown and super-deep-sleep timers, battery sensor address |
+| Network | Wi-Fi on/off and SSID, Ethernet, address mode, NTP and syslog servers, IPv6 | Wi-Fi password, static addresses, protocol bitmask |
+| Display | every preference including display mode and OLED type | none |
+| LoRa | hop limit (1 to 7), transmit power (0 to 30), duty-cycle override, RX boosted gain, PA fan, MQTT flags | region, preset, bandwidth, spreading factor, coding rate, frequency offset and override, channel number, transmit enable |
+| Bluetooth | enabled, pairing mode | fixed PIN |
+
+Module configuration and channels are not loaded over the mesh in this
+release. On the local gateway the same table also opens telemetry, neighbor
+info, store and forward, range test, external notification, canned message,
+audio, ambient lighting, detection sensor, paxcounter, status message, traffic
+management, and TAK module fields, plus channel names, uplink and downlink
+flags, position precision, and mute, while MQTT and serial module fields stay
+blocked over the gateway's own Bluetooth link. The following remain excluded
+everywhere even when the firmware offers them:
 
 - every SecurityConfig write, including public/private/admin keys, Managed
   Mode, legacy admin, serial security, and debug-security controls;
-- channel PSKs and arbitrary channel replacement;
-- factory reset, node database reset, shutdown, reboot, and device deletion;
+- channel PSKs, channel roles, and arbitrary channel replacement;
+- LoRa radio parameters that can move a node off the mesh;
+- shutdown timers that can only be undone with physical access;
+- hardware pin assignments and GPIO access grants;
+- factory reset, node database reset, shutdown, and device deletion;
 - OTA/DFU, filesystem operations, backup/restore, and firmware mutation;
 - fixed-position commands that could publish a home's precise location;
 - contacts, key verification, ignored-node lists, and arbitrary protobufs;

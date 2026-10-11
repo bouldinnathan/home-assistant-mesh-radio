@@ -309,6 +309,14 @@ excluded destructive operations.
 
 ### Advanced local mesh tools
 
+Version 0.13.0 opens the settings editors. A reviewed contract table shared
+by the gateway settings tab and the remote node editor makes device, position,
+power, network, display, LoRa reach, and Bluetooth settings editable with
+bounds and preview warnings, while region, preset, keys, shutdown timers, and
+hardware pins stay read-only with the reason shown. Remote nodes accept the
+gateway after its public key is added once to their admin key list; the panel
+explains how.
+
 Version 0.12.1 adds a `meshnet.reboot_gateway_radio` action and a blueprint
 that schedules it, a confirmed **Reboot this node** control for remote nodes
 in the panel, a gateway offline notification blueprint, and gateway repairs

@@ -308,7 +308,16 @@ def test_remote_get_copies_controller_public_key_without_secret_projection(
                         admin.get_config_request
                     )
                 )
-        assert config_requests == ["SESSIONKEY_CONFIG", "DISPLAY_CONFIG"]
+        assert config_requests == [
+            "SESSIONKEY_CONFIG",
+            "DEVICE_CONFIG",
+            "POSITION_CONFIG",
+            "POWER_CONFIG",
+            "NETWORK_CONFIG",
+            "DISPLAY_CONFIG",
+            "LORA_CONFIG",
+            "BLUETOOTH_CONFIG",
+        ]
 
     asyncio.run(run())
 
@@ -422,8 +431,12 @@ def test_expired_remote_sessions_are_dropped_before_the_next_operation() -> None
         "config.security.admin_key",
         "config.security.is_managed",
         "config.bluetooth.fixed_pin",
-        "config.bluetooth.enabled",
-        "config.device.role",
+        "config.lora.region",
+        "config.lora.modem_preset",
+        "config.lora.tx_enabled",
+        "config.power.on_battery_shutdown_after_secs",
+        "config.power.sds_secs",
+        "config.network.wifi_psk",
         "channel.0.settings.psk",
         "admin.factory_reset_device",
         "admin.nodedb_reset",

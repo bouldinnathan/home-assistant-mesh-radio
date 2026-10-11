@@ -509,3 +509,133 @@ def test_disabled_bluetooth_state_blocks_pin_setter_over_ble() -> None:
             "the_active_bluetooth_transport_cannot_preserve_a_disabled_state"
         )
     }
+
+
+def _real_state() -> tuple[MeshtasticSettingsState, Any]:
+    """Capture a state from the installed Meshtastic protobufs."""
+    pytest.importorskip("meshtastic")
+    from meshtastic.protobuf import admin_pb2, config_pb2, mesh_pb2, module_config_pb2
+
+    state = MeshtasticSettingsState()
+    state.begin_refresh()
+    for name in ("device", "position", "power", "network", "display", "lora", "bluetooth"):
+        record = mesh_pb2.FromRadio()
+        getattr(record.config, name).SetInParent()
+        state.capture_from_radio(record, my_node_num=1)
+    for name in ("mqtt", "telemetry", "neighbor_info"):
+        record = mesh_pb2.FromRadio()
+        getattr(record.moduleConfig, name).SetInParent()
+        state.capture_from_radio(record, my_node_num=1)
+    record = mesh_pb2.FromRadio()
+    record.channel.index = 1
+    record.channel.settings.name = "alpha"
+    record.channel.settings.psk = b"\x01"
+    state.capture_from_radio(record, my_node_num=1)
+    record = mesh_pb2.FromRadio()
+    record.node_info.num = 1
+    record.node_info.user.short_name = "GW"
+    state.capture_from_radio(record, my_node_num=1)
+    state._configs["lora"].hop_limit = 3
+    state._configs["bluetooth"].enabled = True
+    state.mark_complete()
+    assert isinstance(config_pb2.Config, type) and isinstance(module_config_pb2.ModuleConfig, type)
+    return state, admin_pb2.AdminMessage
+
+
+def _writable(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        field["path"]: field
+        for category in snapshot["categories"]
+        for field in category["fields"]
+        if field.get("writable")
+    }
+
+
+def test_remote_policy_opens_reviewed_fields_the_bluetooth_link_blocks() -> None:
+    state, _ = _real_state()
+    local = _writable(state.public_snapshot(transport="bluetooth", write_supported=True))
+    remote = _writable(state.public_snapshot(transport="bluetooth", write_supported=True, remote=True))
+
+    for path in ("config.device.role", "config.lora.hop_limit", "module.telemetry.device_update_interval"):
+        assert path in local and path in remote
+    for path in ("config.bluetooth.enabled", "config.network.wifi_enabled", "module.mqtt.enabled"):
+        assert path not in local and path in remote
+    for path in ("config.lora.tx_enabled", "config.bluetooth.fixed_pin"):
+        assert path in local and path not in remote
+    for path in ("config.lora.region", "config.lora.modem_preset", "config.power.sds_secs", "channel.1.settings.psk"):
+        assert path not in local and path not in remote
+    assert remote["config.lora.hop_limit"]["min"] == 1
+    assert remote["config.lora.hop_limit"]["max"] == 7
+    assert remote["config.position.position_broadcast_secs"]["min"] == 0
+    assert remote["config.position.position_broadcast_secs"]["minimum_nonzero"] == 32
+    assert remote["channel.1.settings.name"]["max_length"] == 11
+    assert remote["channel.1.settings.name"]["allow_empty"] is True
+    assert remote["config.device.role"]["warning"]
+    assert "config.security" not in {field["path"].rsplit(".", 2)[0] for field in remote.values()}
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        ("config.lora.hop_limit", 0),
+        ("config.lora.hop_limit", 8),
+        ("config.lora.tx_power", 31),
+        ("config.position.position_broadcast_secs", 10),
+        ("config.device.node_info_broadcast_secs", 0),
+        ("config.device.tzdef", "x" * 65),
+        ("channel.1.settings.name", "twelve-chars"),
+        ("owner.short_name", ""),
+    ],
+)
+def test_reviewed_bounds_reject_out_of_range_values(path: str, value: Any) -> None:
+    state, AdminMessage = _real_state()
+    with pytest.raises(MeshtasticSettingsValidationError):
+        state.build_plan({path: value}, transport="bluetooth", admin_message_factory=AdminMessage, remote=True)
+
+
+def test_reviewed_bounds_accept_zero_as_default_and_in_range_values() -> None:
+    state, AdminMessage = _real_state()
+    plan = state.build_plan(
+        {
+            "config.position.position_broadcast_secs": 0,
+            "config.lora.hop_limit": 5,
+            "config.device.tzdef": "",
+            "channel.1.settings.name": "",
+            "config.bluetooth.enabled": False,
+        },
+        transport="bluetooth",
+        admin_message_factory=AdminMessage,
+        remote=True,
+    )
+    assert plan.blocked_paths == {}
+    operations = [operation.operation for operation in plan.operations]
+    assert operations[0] == "begin_edit_settings"
+    assert operations[-1] == "commit_edit_settings"
+    assert "set_channel" in operations
+    assert "config.lora.hop_limit" in plan.connection_critical_paths
+    assert "channel.1.settings.name" in plan.connection_critical_paths
+    assert "config.bluetooth.enabled" not in plan.connection_critical_paths
+
+
+def test_local_bluetooth_plan_still_blocks_link_hazards_the_remote_policy_allows() -> None:
+    state, AdminMessage = _real_state()
+    plan = state.build_plan(
+        {
+            "config.bluetooth.enabled": False,
+            "config.network.wifi_enabled": True,
+            "config.power.is_power_saving": True,
+            "module.mqtt.enabled": True,
+            "config.lora.region": 1,
+        },
+        transport="bluetooth",
+        admin_message_factory=AdminMessage,
+    )
+    assert plan.operations == ()
+    assert set(plan.blocked_paths) == {
+        "config.bluetooth.enabled",
+        "config.network.wifi_enabled",
+        "config.power.is_power_saving",
+        "module.mqtt.enabled",
+        "config.lora.region",
+    }
+    assert plan.blocked_paths["config.lora.region"] == "radio_parameters_can_isolate_the_node_from_the_mesh"

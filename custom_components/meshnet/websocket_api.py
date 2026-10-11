@@ -244,7 +244,9 @@ def _validated_remote_preview_message(
             if not isinstance(path, str) or not 1 <= len(path) <= 256:
                 raise ValueError
             if isinstance(value, str):
-                if not 1 <= len(value.encode("utf-8")) <= 128:
+                # Empty is a valid replacement for fields whose contract
+                # allows it (time zone, channel name); the manager decides.
+                if len(value.encode("utf-8")) > 128:
                     raise ValueError
             elif isinstance(value, bool) or isinstance(value, int):
                 pass

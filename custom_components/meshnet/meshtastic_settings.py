@@ -21,6 +21,15 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from .settings_contracts import (
+    LOCAL_WRITABLE_PATHS,
+    POLICY_REMOTE,
+    REASON_POWER_SAVING_LOCAL,
+    REASON_WIFI_LOCAL,
+    explicit_read_only_reason,
+    write_contract,
+)
+
 _MAX_STRING_LENGTH = 1024
 _MAX_REPEATED_VALUES = 128
 _MAX_NESTING_DEPTH = 8
@@ -90,26 +99,10 @@ _MY_INFO_ALLOWLIST = frozenset(
     }
 )
 # Every setter replaces a complete protobuf section.  Only fields with a
-# deliberately reviewed, path-specific contract are writable.  New firmware
-# fields therefore fail closed until their semantics and recovery behavior are
-# understood.
-_WRITABLE_SETTINGS_PATHS = frozenset(
-    {
-        "owner.long_name",
-        "owner.short_name",
-        "config.bluetooth.fixed_pin",
-        "config.display.compass_north_top",
-        "config.display.compass_orientation",
-        "config.display.enable_message_bubbles",
-        "config.display.flip_screen",
-        "config.display.gps_format",
-        "config.display.heading_bold",
-        "config.display.units",
-        "config.display.use_12h_clock",
-        "config.display.use_long_node_name",
-        "config.display.wake_on_tap_or_motion",
-    }
-)
+# deliberately reviewed, path-specific contract in settings_contracts.py are
+# writable.  New firmware fields therefore fail closed until their semantics
+# and recovery behavior are understood.
+_WRITABLE_SETTINGS_PATHS = LOCAL_WRITABLE_PATHS
 _PATH_COMPONENT_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9_]*\Z")
 
 
@@ -470,7 +463,8 @@ def _read_only_reason(
     # apparently harmless field therefore needs a separate recovery workflow.
     if path.startswith("config.security."):
         return "security_settings_require_a_recovery_workflow"
-    if transport.casefold() == "bluetooth":
+    policy = transport.casefold()
+    if policy == "bluetooth":
         # Firmware can disable Bluetooth immediately for these setters, before
         # commit/readback can establish what was applied.
         if path.startswith(("module.mqtt.", "module.serial.")):
@@ -479,9 +473,11 @@ def _read_only_reason(
             return "the_active_bluetooth_transport_cannot_disable_itself"
         if path == "config.display.displaymode":
             return "display_mode_can_disable_bluetooth_on_supported_hardware"
-    if path not in _WRITABLE_SETTINGS_PATHS:
-        return "setting_requires_dedicated_semantic_validation"
-    return None
+        if path in {"config.network.wifi_enabled", "config.network.eth_enabled"}:
+            return REASON_WIFI_LOCAL
+        if path == "config.power.is_power_saving":
+            return REASON_POWER_SAVING_LOCAL
+    return explicit_read_only_reason(path, field_name, policy=policy)
 
 
 def _project_message_fields(
@@ -625,6 +621,22 @@ def _project_message_fields(
             safe_limit = 2**53 - 1
             projected["min"] = max(numeric_bounds[0], -safe_limit)
             projected["max"] = min(numeric_bounds[1], safe_limit)
+        contract = write_contract(path)
+        if contract is not None:
+            if projected["type"] in {"integer", "number"}:
+                if contract.minimum is not None:
+                    projected["min"] = 0 if contract.allow_zero else contract.minimum
+                    if contract.allow_zero and contract.minimum > 0:
+                        projected["minimum_nonzero"] = contract.minimum
+                if contract.maximum is not None:
+                    projected["max"] = contract.maximum
+            if projected["type"] in {"string", "secret"}:
+                if contract.max_bytes is not None:
+                    projected["max_length"] = contract.max_bytes
+                if contract.allow_empty:
+                    projected["allow_empty"] = True
+            if contract.warning is not None:
+                projected["warning"] = contract.warning
         if path == "owner.short_name":
             projected["max_length"] = 4
         elif path == "owner.long_name":
@@ -745,6 +757,8 @@ def _connection_critical(path: str, transport: str) -> bool:
     normalized = transport.casefold()
     if path.startswith("config.security."):
         return True
+    if normalized == POLICY_REMOTE:
+        return False
     if normalized == "bluetooth":
         return path.startswith("config.bluetooth.") or path.startswith(
             ("module.mqtt.", "module.serial.")
@@ -952,12 +966,40 @@ def _set_message_path(message: Any, components: Sequence[str], request: Any, pat
         raise MeshtasticSettingsValidationError(
             f"{path} requires an empty, preset, 128-bit, or 256-bit key"
         )
+    _enforce_contract(path, normalized)
     if _is_repeated(field_descriptor):
         target = getattr(current, name)
         del target[:]
         target.extend(normalized)
     else:
         setattr(current, name, normalized)
+
+
+def _enforce_contract(path: str, normalized: Any) -> None:
+    """Apply the reviewed bounds for a path without echoing the value."""
+    contract = write_contract(path)
+    if contract is None:
+        return
+    if isinstance(normalized, bool):
+        return
+    if isinstance(normalized, (int, float)):
+        if (
+            contract.minimum is not None
+            and normalized < contract.minimum
+            and not (contract.allow_zero and normalized == 0)
+        ):
+            raise MeshtasticSettingsValidationError(f"{path} is below its reviewed minimum")
+        if contract.maximum is not None and normalized > contract.maximum:
+            raise MeshtasticSettingsValidationError(f"{path} is above its reviewed maximum")
+        return
+    if isinstance(normalized, str):
+        encoded = normalized.encode("utf-8")
+        if contract.max_bytes is not None and len(encoded) > contract.max_bytes:
+            raise MeshtasticSettingsValidationError(f"{path} is longer than the radio allows")
+        if not encoded and not contract.allow_empty:
+            raise MeshtasticSettingsValidationError(f"{path} cannot be empty")
+        if any(ord(character) < 32 for character in normalized):
+            raise MeshtasticSettingsValidationError(f"{path} contains control characters")
 
 
 def _admin_message(factory: Callable[[], Any], field_name: str, payload: Any = True) -> Any:
@@ -1018,6 +1060,18 @@ class MeshtasticSettingsState:
         lora = self._configs.get("lora")
         value = getattr(lora, "hop_limit", 0) if lora is not None else 0
         return int(value) if isinstance(value, int) and 0 <= value <= 7 else 0
+
+    def loaded_sections(self) -> list[str]:
+        """Return the section keys currently held, in display order."""
+        sections: list[str] = []
+        if self._owner is not None:
+            sections.append("owner")
+        if self._metadata is not None:
+            sections.append("metadata")
+        sections.extend(f"config.{name}" for name in sorted(self._configs))
+        sections.extend(f"module.{name}" for name in sorted(self._modules))
+        sections.extend(f"channel.{index}" for index in sorted(self._channels))
+        return sections
 
     def begin_refresh(self) -> None:
         """Discard the prior partial download before one new want_config."""
@@ -1145,11 +1199,19 @@ class MeshtasticSettingsState:
         transport: str,
         write_supported: bool = False,
         apply_reason: str = "confirmed_admin_write_and_verification_not_available",
+        remote: bool = False,
     ) -> dict[str, Any]:
-        """Return a detached JSON-safe settings projection."""
+        """Return a detached JSON-safe settings projection.
+
+        ``remote`` selects the over-the-mesh write policy: the transport named
+        in ``transport`` is the controller's own link, which the target node's
+        settings cannot sever, so the Bluetooth-specific blocks do not apply
+        while the mesh-isolation blocks do.
+        """
         if self.managed:
             write_supported = False
             apply_reason = "managed_mode_rejects_local_admin_changes"
+        policy = POLICY_REMOTE if remote else transport
         categories: list[dict[str, Any]] = []
         if self._owner is not None:
             categories.append(
@@ -1158,7 +1220,7 @@ class MeshtasticSettingsState:
                     self._owner,
                     write_supported=write_supported,
                     allowed_root_fields=_OWNER_ALLOWLIST,
-                    transport=transport,
+                    transport=policy,
                 )
             )
         for name, message in sorted(self._configs.items()):
@@ -1167,7 +1229,7 @@ class MeshtasticSettingsState:
                     f"config.{name}",
                     message,
                     write_supported=write_supported,
-                    transport=transport,
+                    transport=policy,
                 )
             )
         for name, message in sorted(self._modules.items()):
@@ -1176,7 +1238,7 @@ class MeshtasticSettingsState:
                     f"module.{name}",
                     message,
                     write_supported=write_supported,
-                    transport=transport,
+                    transport=policy,
                 )
             )
         for index, message in sorted(self._channels.items()):
@@ -1185,7 +1247,7 @@ class MeshtasticSettingsState:
                     f"channel.{index}",
                     message,
                     write_supported=write_supported,
-                    transport=transport,
+                    transport=policy,
                 )
             )
         if self._device_ui is not None:
@@ -1194,7 +1256,7 @@ class MeshtasticSettingsState:
                     "device_ui",
                     self._device_ui,
                     write_supported=write_supported,
-                    transport=transport,
+                    transport=policy,
                 )
             )
         if self._my_info is not None:
@@ -1205,7 +1267,7 @@ class MeshtasticSettingsState:
                     write_supported=False,
                     metadata=True,
                     allowed_root_fields=_MY_INFO_ALLOWLIST,
-                    transport=transport,
+                    transport=policy,
                 )
             )
         if self._metadata is not None:
@@ -1216,7 +1278,7 @@ class MeshtasticSettingsState:
                     write_supported=False,
                     metadata=True,
                     allowed_root_fields=_METADATA_ALLOWLIST,
-                    transport=transport,
+                    transport=policy,
                 )
             )
         secret_revision_material: dict[str, Any] = {}
@@ -1262,7 +1324,7 @@ class MeshtasticSettingsState:
             )
         for category in categories:
             for projected_field in category["fields"]:
-                critical = _critical_change(projected_field["path"], transport)
+                critical = _critical_change(projected_field["path"], policy)
                 projected_field["critical"] = critical
                 if projected_field.get("multiple"):
                     projected_field["writable"] = False
@@ -1325,10 +1387,12 @@ class MeshtasticSettingsState:
         *,
         transport: str,
         admin_message_factory: Callable[[], Any],
+        remote: bool = False,
     ) -> SettingsPlan:
         """Validate flat path changes and build ordered AdminMessages."""
         if not isinstance(changes, Mapping) or not changes:
             raise MeshtasticSettingsValidationError("settings changes cannot be empty")
+        policy = POLICY_REMOTE if remote else transport
         if not self._complete:
             raise MeshtasticSettingsStaleError(
                 "the local radio settings download is not complete"
@@ -1348,7 +1412,7 @@ class MeshtasticSettingsState:
                 transport=transport,
                 changed_paths=tuple(paths),
                 connection_critical_paths=tuple(
-                    path for path in paths if _critical_change(path, transport)
+                    path for path in paths if _critical_change(path, policy)
                 ),
                 operations=(),
                 blocked_paths={
@@ -1390,13 +1454,13 @@ class MeshtasticSettingsState:
                 path,
                 final_name,
                 metadata=False,
-                transport=transport,
+                transport=policy,
             )
             if reason is not None:
                 blocked[path] = reason
                 continue
             grouped.setdefault(group, []).append((path, remainder, replacement))
-            if _critical_change(path, transport):
+            if _critical_change(path, policy):
                 critical_paths.append(path)
 
         regular: list[SettingsOperation] = []
@@ -1417,7 +1481,7 @@ class MeshtasticSettingsState:
                     blocked[path] = "settings_section_was_not_received_from_radio"
                 continue
             if (
-                transport.casefold() == "bluetooth"
+                policy.casefold() == "bluetooth"
                 and kind == "config"
                 and section == "bluetooth"
                 and not bool(getattr(source, "enabled", False))
@@ -1428,7 +1492,7 @@ class MeshtasticSettingsState:
                     )
                 continue
             if (
-                transport.casefold() == "bluetooth"
+                policy.casefold() == "bluetooth"
                 and kind == "config"
                 and section == "display"
             ):

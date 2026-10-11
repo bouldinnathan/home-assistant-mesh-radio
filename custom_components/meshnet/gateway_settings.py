@@ -140,6 +140,53 @@ _SAFE_READ_ONLY_REASON_MESSAGES = {
     "setting_requires_dedicated_semantic_validation": (
         "This setting needs dedicated validation before MeshNet can edit it."
     ),
+    "radio_parameters_can_isolate_the_node_from_the_mesh": (
+        "Radio parameters can isolate the node from the mesh; set them with the official app."
+    ),
+    "can_shut_the_node_down_until_physically_woken": (
+        "This timer can shut the node down until someone physically wakes it."
+    ),
+    "hardware_pin_assignments_require_physical_access": (
+        "Hardware pin assignments are set with physical access to the board."
+    ),
+    "bitmask_requires_a_dedicated_editor": (
+        "This bitmask needs a dedicated editor before MeshNet can edit it."
+    ),
+    "deprecated_field_is_superseded_by_a_newer_setting": (
+        "This deprecated field is superseded by a newer setting."
+    ),
+    "channel_keys_require_local_access": "Channel keys are set with local access.",
+    "channel_roles_require_the_official_app": "Channel roles are set with the official app.",
+    "channel_identity_is_derived_from_its_settings": (
+        "The channel identity is derived from its other settings."
+    ),
+    "grants_arbitrary_gpio_access_over_the_mesh": (
+        "This would grant arbitrary GPIO access over the mesh."
+    ),
+    "licensed_ham_mode_requires_local_setup": "Licensed (ham) mode is set up locally.",
+    "static_addresses_require_a_dedicated_editor": (
+        "Static addresses need a dedicated editor before MeshNet can edit them."
+    ),
+    "setting_is_only_editable_on_the_physically_connected_gateway": (
+        "This setting is only editable on the physically connected gateway."
+    ),
+    "setting_can_disable_the_active_transport_of_this_gateway": (
+        "This setting can disable the transport this gateway is using."
+    ),
+    "a_node_that_cannot_transmit_cannot_answer_over_the_mesh": (
+        "A node that cannot transmit cannot answer over the mesh."
+    ),
+    "bluetooth_pin_is_set_with_local_access": "The Bluetooth PIN is set with local access.",
+    "credentials_are_set_with_local_access": "Credentials are set with local access.",
+    "pairing_mode_change_can_break_the_active_bond": (
+        "Changing the pairing mode can break the active Bluetooth bond."
+    ),
+    "power_saving_can_sleep_the_active_bluetooth_transport": (
+        "Power saving can put the active Bluetooth transport to sleep."
+    ),
+    "wifi_can_disable_the_active_bluetooth_transport": (
+        "Wi-Fi or Ethernet can disable the active Bluetooth transport."
+    ),
 }
 _CAPABILITY_REASON_CODES = frozenset(
     {

@@ -62,12 +62,21 @@ set follows the installed Meshtastic protobuf schema. Repeated/list fields,
 hardware identity and metadata, managed-mode configuration, and security key
 administration remain read-only or are omitted.
 
-The reviewed Meshtastic Bluetooth write allowlist currently contains the owner
-long and short names, the fixed Bluetooth PIN, and selected display preferences.
-The Bluetooth enable switch cannot disable the connection currently carrying
-the settings transaction. Other displayed fields remain read-only until they
-have path-specific validation, bounded command behavior, recovery analysis,
-and verified live readback.
+The reviewed Meshtastic Bluetooth write allowlist is the contract table in
+`settings_contracts.py`, shared with the remote node editor. It covers the
+owner names, device role and behavior, position and GPS intervals, power
+timers, network servers and Wi-Fi credentials (write-only), display
+preferences, hop limit and transmit power, the fixed Bluetooth PIN, most
+module settings, and channel names, uplink/downlink flags, position precision,
+and mute. Each entry carries bounds, the firmware's string byte limit, and a
+preview warning where a change alters mesh behavior. Over the gateway's own
+Bluetooth link the planner additionally blocks anything that can sever that
+link: the Bluetooth enable switch and pairing mode, display mode on colour
+hardware, Wi-Fi and Ethernet, power saving, and the MQTT and serial modules.
+LoRa region, preset, bandwidth, spreading factor, coding rate, frequency and
+channel number, shutdown timers, hardware pins, channel keys and roles, and
+SecurityConfig remain read-only with a stated reason; see
+[Advanced Mesh Operations](ADVANCED_MESH_OPERATIONS.md) for the table.
 
 MeshCore local companion connections can expose validated changes such as the
 device name, coordinates and position advertisement policy, bounded transmit

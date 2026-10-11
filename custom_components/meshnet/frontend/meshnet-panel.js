@@ -1670,6 +1670,10 @@ class MeshNetPanel extends HTMLElement {
       <section class="panel" id="meshnet-remote-admin-panel" data-mesh-card="remote-admin">
         <h2>Remote node administration</h2>
         <div class="field-help">Explicit Meshtastic Bluetooth requests only. Loading is read-only; every write requires a preview and a separate confirmation.</div>
+        <details class="history-manage" id="meshnet-remote-authorize-help">
+          <summary>How a remote node authorizes this gateway</summary>
+          <div class="field-help">The gateway radio has exactly one key pair. A remote node keeps a list of up to three admin public keys and accepts changes only from a radio whose key is on that list. One time, with the Meshtastic app connected to the remote node: load the node here, copy the controller public key, then in the app open <strong>Radio configuration → Security</strong>, paste the key into a free <strong>Admin key</strong> slot, and save. Load the node again afterwards; a successful load proves the authorization.</div>
+        </details>
         <div class="operator-controls">
           <label>Gateway
             <select id="meshnet-remote-gateway"${compatibleGateways.length ? "" : " disabled"}>
@@ -1698,12 +1702,9 @@ class MeshNetPanel extends HTMLElement {
             ${this._remoteRebootCard(snapshot)}
             <form class="operator-card" id="meshnet-remote-settings-form">
               ${snapshot.categories.map((category) => `
-                <section class="operator-card">
+                <section class="operator-card" data-remote-category="${this._escape(category.key)}">
                   <h3>${this._escape(category.label)}</h3>
-                  ${category.fields.map((field) => this._remoteSettingsField(
-                    field,
-                    fields.findIndex((candidate) => candidate.path === field.path),
-                  )).join("")}
+                  ${this._remoteCategoryBody(category, fields)}
                 </section>
               `).join("")}
               <div class="operator-actions">
@@ -1738,11 +1739,50 @@ class MeshNetPanel extends HTMLElement {
     return snapshot.categories.flatMap((category) => category.fields);
   }
 
+  _remoteReadOnlyRow(field) {
+    const shown = field.value_label != null
+      ? field.value_label
+      : this._formatSettingValue(field.value);
+    return `
+      <div class="operator-field remote-read-only">
+        <span>${this._escape(field.label)}</span>
+        <code>${this._escape(shown)}</code>
+        <span class="field-help">${this._escape(field.path)} · ${this._escape(this._humanizeReasonCode(field.read_only_reason))}</span>
+      </div>
+    `;
+  }
+
+  _humanizeReasonCode(code) {
+    if (typeof code !== "string" || !code) return "";
+    const text = code.replace(/_/g, " ");
+    return text.charAt(0).toUpperCase() + text.slice(1);
+  }
+
+  _remoteCategoryBody(category, fields) {
+    const writable = category.fields.filter((field) => field.writable);
+    const readOnly = category.fields.filter((field) => !field.writable);
+    const inputs = writable.map((field) => this._remoteSettingsField(
+      field,
+      fields.findIndex((candidate) => candidate.path === field.path),
+    )).join("");
+    const details = readOnly.length ? `
+      <details class="history-manage">
+        <summary>Read-only here (${readOnly.length})</summary>
+        ${readOnly.map((field) => this._remoteReadOnlyRow(field)).join("")}
+      </details>
+    ` : "";
+    return `${inputs || '<div class="field-help">No reviewed editable setting in this section.</div>'}${details}`;
+  }
+
   _remoteSettingsField(field, index) {
     const value = Object.hasOwn(this._remoteSettingsDraft, field.path)
       ? this._remoteSettingsDraft[field.path]
       : field.value;
     const common = `id="meshnet-remote-setting-${index}" data-remote-setting-index="${index}"${this._remoteSettingsBusy != null || !field.writable ? " disabled" : ""}`;
+    const badges = [
+      field.critical ? '<span class="badge warn">Mesh reach</span>' : "",
+      field.warning ? `<span class="badge warn">${this._escape(this._humanizeReasonCode(field.warning))}</span>` : "",
+    ].join("");
     let input;
     if (field.type === "boolean") {
       input = `<input ${common} type="checkbox"${value === true ? " checked" : ""}>`;
@@ -1763,7 +1803,7 @@ class MeshNetPanel extends HTMLElement {
     }
     return `
       <label class="operator-field" for="meshnet-remote-setting-${index}">
-        <span>${this._escape(field.label)}</span>
+        <span>${this._escape(field.label)} ${badges}</span>
         ${input}
         <span class="field-help">${this._escape(field.path)}</span>
       </label>
@@ -1780,6 +1820,8 @@ class MeshNetPanel extends HTMLElement {
         <ul class="route-list">
           ${preview.changes.map((change) => `<li>${this._escape(change.label)} <span class="field-help">${this._escape(change.path)}</span></li>`).join("")}
         </ul>
+        ${Array.isArray(preview.warnings) && preview.warnings.length ? `<ul class="warnings warn">${preview.warnings.map((code) => `<li>${this._escape(this._humanizeReasonCode(code))}</li>`).join("")}</ul>` : ""}
+        <div class="field-help">Most sections make the node reboot once after the write is committed. If the readback cannot be verified, wait a minute and load the node again before deciding anything.</div>
         <label class="confirmation-box">
           <input id="meshnet-remote-confirm" type="checkbox"${this._remoteSettingsConfirmed ? " checked" : ""}>
           <span>I confirm one remote RF write to this exact node. A timeout can have an unknown outcome and will not be retried.</span>
@@ -4539,6 +4581,7 @@ class MeshNetPanel extends HTMLElement {
         || (field.type === "integer" && !Number.isSafeInteger(number))
         || (field.min != null && number < field.min)
         || (field.max != null && number > field.max)
+        || (field.minimum_nonzero != null && number > 0 && number < field.minimum_nonzero)
       ) throw { name: "ValidationError", code: "invalid_format" };
       return number;
     }
@@ -4553,7 +4596,7 @@ class MeshNetPanel extends HTMLElement {
     }
     const byteLength = new TextEncoder().encode(value).length;
     if (
-      byteLength < 1
+      byteLength < (field.allow_empty ? 0 : 1)
       || byteLength > field.max_length
       || [...value].some((character) => character.codePointAt(0) < 32)
     ) throw { name: "ValidationError", code: "invalid_format" };
@@ -4580,14 +4623,14 @@ class MeshNetPanel extends HTMLElement {
     this._remoteSettingsConfirmed = false;
     this._remoteRebootConfirmed = false;
     this._remoteSettingsBusy = "get";
-    this._remoteSettingsStatus = { kind: "warn", text: "Loading remote settings with one read-only request…" };
+    this._remoteSettingsStatus = { kind: "warn", text: "Loading remote settings with read-only requests, one per section. Over several hops this can take a minute or two…" };
     this._safeRender("render");
     try {
       const response = await this._withTimeout(this._hass.callWS({
         type: "meshnet/remote_settings/get",
         gateway_id: gatewayId,
         target_node: targetNode,
-      }), 65000);
+      }), 250000);
       if (generation !== this._remoteRequestGeneration) return;
       this._remoteSettingsSnapshot = this._sanitizeRemoteSettingsSnapshot(
         response,
@@ -4935,21 +4978,181 @@ class MeshNetPanel extends HTMLElement {
     return "websocket";
   }
 
+  _remoteContractPath(path) {
+    return String(path).replace(/^channel\.[0-9]+\./, "channel.N.");
+  }
+
   _remoteAllowedSettingPaths() {
+    // Mirrors REMOTE_WRITABLE_PATHS in settings_contracts.py; a test keeps
+    // the two lists identical. The backend remains the security boundary.
     return new Set([
-      "owner.long_name",
-      "owner.short_name",
+      // remote-allowlist-begin
+      "channel.N.settings.downlink_enabled",
+      "channel.N.settings.module_settings.is_muted",
+      "channel.N.settings.module_settings.position_precision",
+      "channel.N.settings.name",
+      "channel.N.settings.uplink_enabled",
+      "config.bluetooth.enabled",
+      "config.bluetooth.mode",
+      "config.device.buzzer_mode",
+      "config.device.disable_triple_click",
+      "config.device.double_tap_as_button_press",
+      "config.device.led_heartbeat_disabled",
+      "config.device.node_info_broadcast_secs",
+      "config.device.rebroadcast_mode",
+      "config.device.role",
+      "config.device.serial_enabled",
+      "config.device.tzdef",
+      "config.display.auto_screen_carousel_secs",
       "config.display.compass_north_top",
       "config.display.compass_orientation",
+      "config.display.displaymode",
       "config.display.enable_message_bubbles",
       "config.display.flip_screen",
       "config.display.gps_format",
       "config.display.heading_bold",
+      "config.display.oled",
+      "config.display.screen_on_secs",
       "config.display.units",
       "config.display.use_12h_clock",
       "config.display.use_long_node_name",
       "config.display.wake_on_tap_or_motion",
+      "config.lora.config_ok_to_mqtt",
+      "config.lora.hop_limit",
+      "config.lora.ignore_mqtt",
+      "config.lora.override_duty_cycle",
+      "config.lora.pa_fan_disabled",
+      "config.lora.sx126x_rx_boosted_gain",
+      "config.lora.tx_power",
+      "config.network.address_mode",
+      "config.network.eth_enabled",
+      "config.network.ipv6_enabled",
+      "config.network.ntp_server",
+      "config.network.rsyslog_server",
+      "config.network.wifi_enabled",
+      "config.network.wifi_ssid",
+      "config.position.broadcast_smart_minimum_distance",
+      "config.position.broadcast_smart_minimum_interval_secs",
+      "config.position.fixed_position",
+      "config.position.gps_mode",
+      "config.position.gps_update_interval",
+      "config.position.position_broadcast_secs",
+      "config.position.position_broadcast_smart_enabled",
+      "config.power.adc_multiplier_override",
+      "config.power.is_power_saving",
+      "config.power.ls_secs",
+      "config.power.min_wake_secs",
+      "config.power.wait_bluetooth_secs",
+      "module.ambient_lighting.blue",
+      "module.ambient_lighting.current",
+      "module.ambient_lighting.green",
+      "module.ambient_lighting.led_state",
+      "module.ambient_lighting.red",
+      "module.audio.bitrate",
+      "module.audio.codec2_enabled",
+      "module.canned_message.allow_input_source",
+      "module.canned_message.enabled",
+      "module.canned_message.inputbroker_event_ccw",
+      "module.canned_message.inputbroker_event_cw",
+      "module.canned_message.inputbroker_event_press",
+      "module.canned_message.rotary1_enabled",
+      "module.canned_message.send_bell",
+      "module.canned_message.updown1_enabled",
+      "module.detection_sensor.detection_trigger_type",
+      "module.detection_sensor.enabled",
+      "module.detection_sensor.minimum_broadcast_secs",
+      "module.detection_sensor.name",
+      "module.detection_sensor.send_bell",
+      "module.detection_sensor.state_broadcast_secs",
+      "module.detection_sensor.use_pullup",
+      "module.external_notification.active",
+      "module.external_notification.alert_bell",
+      "module.external_notification.alert_bell_buzzer",
+      "module.external_notification.alert_bell_vibra",
+      "module.external_notification.alert_message",
+      "module.external_notification.alert_message_buzzer",
+      "module.external_notification.alert_message_vibra",
+      "module.external_notification.enabled",
+      "module.external_notification.nag_timeout",
+      "module.external_notification.output_ms",
+      "module.external_notification.use_i2s_as_buzzer",
+      "module.external_notification.use_pwm",
+      "module.mqtt.address",
+      "module.mqtt.enabled",
+      "module.mqtt.encryption_enabled",
+      "module.mqtt.json_enabled",
+      "module.mqtt.map_report_settings.position_precision",
+      "module.mqtt.map_report_settings.publish_interval_secs",
+      "module.mqtt.map_report_settings.should_report_location",
+      "module.mqtt.map_reporting_enabled",
+      "module.mqtt.proxy_to_client_enabled",
+      "module.mqtt.root",
+      "module.mqtt.tls_enabled",
+      "module.neighbor_info.enabled",
+      "module.neighbor_info.transmit_over_lora",
+      "module.neighbor_info.update_interval",
+      "module.paxcounter.ble_threshold",
+      "module.paxcounter.enabled",
+      "module.paxcounter.paxcounter_update_interval",
+      "module.paxcounter.wifi_threshold",
+      "module.range_test.clear_on_reboot",
+      "module.range_test.enabled",
+      "module.range_test.save",
+      "module.range_test.sender",
+      "module.remote_hardware.enabled",
+      "module.serial.baud",
+      "module.serial.echo",
+      "module.serial.enabled",
+      "module.serial.mode",
+      "module.serial.override_console_serial_port",
+      "module.serial.timeout",
+      "module.statusmessage.node_status",
+      "module.store_forward.enabled",
+      "module.store_forward.heartbeat",
+      "module.store_forward.history_return_max",
+      "module.store_forward.history_return_window",
+      "module.store_forward.is_server",
+      "module.store_forward.records",
+      "module.tak.role",
+      "module.tak.team",
+      "module.telemetry.air_quality_enabled",
+      "module.telemetry.air_quality_interval",
+      "module.telemetry.air_quality_screen_enabled",
+      "module.telemetry.device_telemetry_enabled",
+      "module.telemetry.device_update_interval",
+      "module.telemetry.environment_display_fahrenheit",
+      "module.telemetry.environment_measurement_enabled",
+      "module.telemetry.environment_screen_enabled",
+      "module.telemetry.environment_update_interval",
+      "module.telemetry.health_measurement_enabled",
+      "module.telemetry.health_screen_enabled",
+      "module.telemetry.health_update_interval",
+      "module.telemetry.power_measurement_enabled",
+      "module.telemetry.power_screen_enabled",
+      "module.telemetry.power_update_interval",
+      "module.traffic_management.drop_unknown_enabled",
+      "module.traffic_management.enabled",
+      "module.traffic_management.exhaust_hop_position",
+      "module.traffic_management.exhaust_hop_telemetry",
+      "module.traffic_management.nodeinfo_direct_response",
+      "module.traffic_management.nodeinfo_direct_response_max_hops",
+      "module.traffic_management.position_dedup_enabled",
+      "module.traffic_management.position_min_interval_secs",
+      "module.traffic_management.position_precision_bits",
+      "module.traffic_management.rate_limit_enabled",
+      "module.traffic_management.rate_limit_max_packets",
+      "module.traffic_management.rate_limit_window_secs",
+      "module.traffic_management.router_preserve_hops",
+      "module.traffic_management.unknown_packet_threshold",
+      "owner.is_unmessagable",
+      "owner.long_name",
+      "owner.short_name",
+      // remote-allowlist-end
     ]);
+  }
+
+  _remoteCategoryKeyValid(key) {
+    return /^(owner|metadata|config\.[a-z_]{1,32}|module\.[a-z_]{1,32}|channel\.[0-7])$/.test(key);
   }
 
   _sanitizeRemoteSettingsSnapshot(response, gatewayId, targetNode) {
@@ -4970,12 +5173,11 @@ class MeshNetPanel extends HTMLElement {
       || typeof response.target !== "object"
       || Array.isArray(response.target)
       || !Array.isArray(response.categories)
-      || response.categories.length > 8
+      || response.categories.length > 48
     ) throw { name: "PanelSchemaError", code: "invalid_format" };
     const controllerNode = this._requiredRemoteNodeId(response.controller.node_id);
     const targetId = this._requiredRemoteNodeId(response.target.node_id);
     if (targetId !== targetNode) throw { name: "PanelSchemaError", code: "invalid_format" };
-    const allowedCategories = new Set(["owner", "config.display"]);
     const seenCategories = new Set();
     const seenPaths = new Set();
     let fieldCount = 0;
@@ -4985,16 +5187,16 @@ class MeshNetPanel extends HTMLElement {
         || typeof category !== "object"
         || Array.isArray(category)
         || !Array.isArray(category.fields)
-        || category.fields.length > 32
+        || category.fields.length > 96
       ) throw { name: "PanelSchemaError", code: "invalid_format" };
       const key = this._requiredSettingPath(category.key);
-      if (!allowedCategories.has(key) || seenCategories.has(key)) {
+      if (!this._remoteCategoryKeyValid(key) || seenCategories.has(key)) {
         throw { name: "PanelSchemaError", code: "invalid_format" };
       }
       seenCategories.add(key);
       const fields = category.fields.map((field) => {
         fieldCount += 1;
-        if (fieldCount > 32) throw { name: "PanelSchemaError", code: "invalid_format" };
+        if (fieldCount > 384) throw { name: "PanelSchemaError", code: "invalid_format" };
         const sanitized = this._sanitizeRemoteSettingsField(field, key);
         if (seenPaths.has(sanitized.path)) {
           throw { name: "PanelSchemaError", code: "invalid_format" };
@@ -5056,22 +5258,48 @@ class MeshNetPanel extends HTMLElement {
     return value;
   }
 
+  _sanitizeRemoteReadOnlyField(field, path, type) {
+    const value = field.value;
+    const scalar = (
+      (type === "boolean" && typeof value === "boolean")
+      || (["integer", "number", "select"].includes(type) && typeof value === "number" && Number.isFinite(value))
+      || (["string", "select"].includes(type) && typeof value === "string" && value.length <= 128)
+    );
+    if (!scalar) throw { name: "PanelSchemaError", code: "invalid_format" };
+    const reason = typeof field.read_only_reason === "string" && /^[a-z0-9_]{1,128}$/.test(field.read_only_reason)
+      ? field.read_only_reason
+      : "setting_requires_dedicated_semantic_validation";
+    return {
+      path,
+      label: this._requiredSettingText(field.label, 96),
+      type,
+      value,
+      value_label: this._optionalSettingText(field.value_label, 96),
+      writable: false,
+      read_only_reason: reason,
+      options: [],
+    };
+  }
+
   _sanitizeRemoteSettingsField(field, categoryKey) {
     if (!field || typeof field !== "object" || Array.isArray(field)) {
       throw { name: "PanelSchemaError", code: "invalid_format" };
     }
     const path = this._requiredSettingPath(field.path);
-    const allowed = this._remoteAllowedSettingPaths();
-    if (
-      !allowed.has(path)
-      || (categoryKey === "owner" && !path.startsWith("owner."))
-      || (categoryKey === "config.display" && !path.startsWith("config.display."))
-      || field.writable !== true
-    ) throw { name: "PanelSchemaError", code: "invalid_format" };
+    if (!path.startsWith(`${categoryKey}.`)) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
     const type = ["boolean", "integer", "number", "select", "string"].includes(field.type)
       ? field.type
       : null;
     if (!type) throw { name: "PanelSchemaError", code: "invalid_format" };
+    if (field.writable !== true) {
+      return this._sanitizeRemoteReadOnlyField(field, path, type);
+    }
+    const allowed = this._remoteAllowedSettingPaths();
+    if (!allowed.has(this._remoteContractPath(path))) {
+      throw { name: "PanelSchemaError", code: "invalid_format" };
+    }
     const numeric = (name) => {
       if (field[name] == null) return null;
       return typeof field[name] === "number" && Number.isFinite(field[name])
@@ -5081,15 +5309,23 @@ class MeshNetPanel extends HTMLElement {
     const min = numeric("min");
     const max = numeric("max");
     const step = numeric("step");
+    const minimumNonzero = numeric("minimum_nonzero");
     if (
-      [min, max, step].some(Number.isNaN)
+      [min, max, step, minimumNonzero].some(Number.isNaN)
       || (min != null && max != null && min > max)
       || (step != null && step <= 0)
+      || (minimumNonzero != null && minimumNonzero <= 0)
     ) throw { name: "PanelSchemaError", code: "invalid_format" };
     const options = type === "select"
       ? this._sanitizeRemoteOptions(field.options)
       : [];
-    const maxLength = path === "owner.short_name" ? 4 : path === "owner.long_name" ? 40 : 128;
+    const defaultLength = path === "owner.short_name" ? 4 : path === "owner.long_name" ? 40 : 128;
+    const maxLength = Number.isSafeInteger(field.max_length) && field.max_length >= 1 && field.max_length <= 128
+      ? Math.min(field.max_length, defaultLength)
+      : defaultLength;
+    const warning = typeof field.warning === "string" && /^[a-z0-9_]{1,96}$/.test(field.warning)
+      ? field.warning
+      : null;
     const sanitized = {
       path,
       label: this._requiredSettingText(field.label, 96),
@@ -5100,7 +5336,11 @@ class MeshNetPanel extends HTMLElement {
       min,
       max,
       step,
+      minimum_nonzero: minimumNonzero,
       max_length: maxLength,
+      allow_empty: field.allow_empty === true,
+      critical: field.critical === true,
+      warning,
     };
     try {
       const validatedValue = this._coerceRemoteSettingValue(sanitized, field.value);
@@ -5156,7 +5396,14 @@ class MeshNetPanel extends HTMLElement {
       || response.changes.length > 32
       || typeof response.expires_at !== "string"
       || !Number.isFinite(Date.parse(response.expires_at))
+      || (response.warnings != null && (!Array.isArray(response.warnings) || response.warnings.length > 16))
     ) throw { name: "PanelSchemaError", code: "invalid_format" };
+    const warnings = (response.warnings || []).map((code) => {
+      if (typeof code !== "string" || !/^[a-z0-9_]{1,96}$/.test(code)) {
+        throw { name: "PanelSchemaError", code: "invalid_format" };
+      }
+      return code;
+    });
     const fields = new Map(
       this._remoteSettingsFields(snapshot).map((field) => [field.path, field]),
     );
@@ -5183,6 +5430,7 @@ class MeshNetPanel extends HTMLElement {
       target_node: snapshot.target_node,
       revision: snapshot.revision,
       changes: previewChanges,
+      warnings,
       requires_confirmation: true,
       expires_at: response.expires_at,
     };

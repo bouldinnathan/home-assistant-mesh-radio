@@ -1,5 +1,28 @@
 # Upgrade Guide
 
+## From 0.12.1
+
+0.13.0 replaces the small fixed write allowlist with a reviewed contract
+table shared by the gateway settings tab and the remote node editor. Many
+more settings become editable on both: device role and behavior, position and
+GPS intervals, power timers, network servers, every display preference, hop
+limit and transmit power, and on the local gateway most module settings and
+channel names. Each editable field shows its bounds, and the preview lists
+review warnings before the single confirmed write. Region, modem preset,
+frequency and channel number, shutdown timers, hardware pins, channel keys
+and roles, and SecurityConfig stay read-only with the reason shown.
+
+Remote loads now fetch eight sections instead of two (owner plus device,
+position, power, network, display, LoRa, and Bluetooth configuration), one
+read-only request each, so **Load / test access** can take a minute or two
+over several hops. Module configuration and channels are not loaded over the
+mesh yet. The remote card gains a collapsed note explaining that the remote
+node, not the gateway, holds the list of up to three admin keys and how to
+add the gateway's public key to it once.
+
+Hard-refresh the browser once so the 0.13.0 panel module loads. No
+config-entry or radio setting change is required.
+
 ## From 0.12.0
 
 0.12.1 adds radio reboots and actionable gateway repairs. The

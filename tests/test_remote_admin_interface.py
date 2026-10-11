@@ -370,3 +370,162 @@ def test_remote_reboot_requires_bluetooth_confirmation_and_clears_cached_state()
         assert offline.value.code == "remote_admin_requires_bluetooth"
 
     asyncio.run(run())
+
+
+def _wide_snapshot() -> dict:
+    snapshot = _snapshot()
+    snapshot["categories"].append(
+        {
+            "key": "config.lora",
+            "label": "Lora",
+            "fields": [
+                {
+                    "path": "config.lora.hop_limit",
+                    "label": "Hop Limit",
+                    "type": "integer",
+                    "value": 3,
+                    "min": 1,
+                    "max": 7,
+                    "critical": True,
+                    "writable": True,
+                },
+                {
+                    "path": "config.lora.region",
+                    "label": "Region",
+                    "type": "select",
+                    "value": "US",
+                    "options": [{"value": "US", "label": "US"}, {"value": "EU_868", "label": "EU 868"}],
+                    "writable": False,
+                    "read_only_reason": "radio_parameters_can_isolate_the_node_from_the_mesh",
+                },
+                {
+                    "path": "config.lora.ignore_incoming",
+                    "label": "Ignore Incoming",
+                    "type": "string",
+                    "value": "",
+                    "multiple": True,
+                    "writable": False,
+                    "read_only_reason": "Repeated settings require a dedicated validated editor.",
+                },
+            ],
+        }
+    )
+    snapshot["categories"].append(
+        {
+            "key": "config.position",
+            "label": "Position",
+            "fields": [
+                {
+                    "path": "config.position.position_broadcast_secs",
+                    "label": "Position Broadcast Secs",
+                    "type": "integer",
+                    "value": 900,
+                    "min": 0,
+                    "max": 4294967295,
+                    "minimum_nonzero": 32,
+                    "writable": True,
+                },
+                {
+                    "path": "config.position.gps_mode",
+                    "label": "Gps Mode",
+                    "type": "select",
+                    "value": "ENABLED",
+                    "options": [{"value": "DISABLED", "label": "DISABLED"}, {"value": "ENABLED", "label": "ENABLED"}],
+                    "writable": True,
+                },
+            ],
+        }
+    )
+    snapshot["categories"].append(
+        {
+            "key": "config.device",
+            "label": "Device",
+            "fields": [
+                {
+                    "path": "config.device.role",
+                    "label": "Role",
+                    "type": "select",
+                    "value": "CLIENT",
+                    "options": [{"value": "CLIENT", "label": "CLIENT"}, {"value": "ROUTER", "label": "ROUTER"}],
+                    "writable": True,
+                },
+                {
+                    "path": "config.device.tzdef",
+                    "label": "Tzdef",
+                    "type": "string",
+                    "value": "UTC0",
+                    "max_length": 64,
+                    "allow_empty": True,
+                    "writable": True,
+                },
+                {
+                    "path": "config.device.button_gpio",
+                    "label": "Button Gpio",
+                    "type": "integer",
+                    "value": 0,
+                    "writable": True,
+                },
+            ],
+        }
+    )
+    return snapshot
+
+
+def test_remote_get_projects_read_only_fields_and_keeps_unreviewed_ones_read_only() -> None:
+    async def run() -> None:
+        manager, gateway = _manager()
+        gateway.async_get_remote_settings_snapshot = AsyncMock(return_value=_wide_snapshot())
+        loaded = await manager.async_get(GATEWAY_ID, TARGET)
+        fields = {field["path"]: field for category in loaded["categories"] for field in category["fields"]}
+
+        assert fields["config.lora.hop_limit"]["writable"] is True
+        assert fields["config.lora.hop_limit"]["critical"] is True
+        assert fields["config.lora.hop_limit"]["warning"] == "hop_limit_changes_how_far_this_node_reaches"
+        region = fields["config.lora.region"]
+        assert region["writable"] is False
+        assert region["value"] == "US"
+        assert region["value_label"] == "US"
+        assert region["read_only_reason"] == "radio_parameters_can_isolate_the_node_from_the_mesh"
+        assert "config.lora.ignore_incoming" not in fields
+        # The provider claimed a hardware pin was writable; the contract wins.
+        pin = fields["config.device.button_gpio"]
+        assert pin["writable"] is False
+        assert fields["config.device.tzdef"]["allow_empty"] is True
+        assert fields["config.device.tzdef"]["max_length"] == 64
+        assert fields["config.position.position_broadcast_secs"]["minimum_nonzero"] == 32
+
+        with pytest.raises(RemoteAdminError) as raised:
+            await manager.async_preview(GATEWAY_ID, TARGET, loaded["revision"], {"config.device.button_gpio": 4})
+        assert raised.value.code == "remote_admin_changes_invalid"
+        for bad in (
+            {"config.lora.hop_limit": 8},
+            {"config.position.position_broadcast_secs": 10},
+            {"config.device.tzdef": "x" * 65},
+            {"config.lora.region": "EU_868"},
+        ):
+            with pytest.raises(RemoteAdminError):
+                await manager.async_preview(GATEWAY_ID, TARGET, loaded["revision"], bad)
+
+        preview = await manager.async_preview(
+            GATEWAY_ID,
+            TARGET,
+            loaded["revision"],
+            {
+                "config.lora.hop_limit": 5,
+                "config.position.position_broadcast_secs": 0,
+                "config.device.tzdef": "",
+                "config.device.role": "ROUTER",
+            },
+        )
+        assert {change["path"] for change in preview["changes"]} == {
+            "config.lora.hop_limit",
+            "config.position.position_broadcast_secs",
+            "config.device.tzdef",
+            "config.device.role",
+        }
+        assert "hop_limit_changes_how_far_this_node_reaches" in preview["warnings"]
+        assert "role_change_alters_sleep_and_rebroadcast_behavior" in preview["warnings"]
+        assert "change_can_affect_mesh_reachability" in preview["warnings"]
+        assert "ROUTER" not in json.dumps(preview)
+
+    asyncio.run(run())

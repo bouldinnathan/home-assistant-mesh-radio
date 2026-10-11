@@ -25,15 +25,18 @@ from typing import Any
 
 from .const import (
     PROTOCOL_MESHTASTIC,
-    REMOTE_ADMIN_WRITABLE_PATHS,
     TRANSPORT_BLUETOOTH,
 )
+from .settings_contracts import preview_warning, remote_write_allowed
 
 _TARGET_RE = re.compile(r"^![0-9a-f]{8}$")
 _REVISION_RE = re.compile(r"^[0-9a-f]{64}$")
 _PREVIEW_TTL_SECONDS = 90
 _MAX_CHANGES = 32
 _MAX_STRING_BYTES = 128
+_MAX_CATEGORIES = 48
+_MAX_FIELDS = 384
+_SCALAR_FIELD_TYPES = frozenset({"boolean", "integer", "number", "select", "string"})
 _QUIESCE_TIMEOUT_SECONDS = 5.0
 
 _PUBLIC_ERROR_MESSAGES = {
@@ -211,6 +214,7 @@ class RemoteAdminManager:
                 "target_node": target_node,
                 "revision": revision,
                 "changes": [{"path": path, "label": labels[path]} for path in validated],
+                "warnings": self._preview_warnings(validated, cached.fields),
                 "requires_confirmation": True,
                 "expires_at": (datetime.now(UTC) + timedelta(seconds=_PREVIEW_TTL_SECONDS)).isoformat(),
             }
@@ -455,7 +459,8 @@ class RemoteAdminManager:
         raw_categories = snapshot.get("categories")
         if not isinstance(raw_categories, Sequence) or isinstance(raw_categories, (str, bytes, bytearray)):
             raise RemoteAdminError("remote_admin_snapshot_invalid")
-        for category in raw_categories:
+        total_fields = 0
+        for category in raw_categories[:_MAX_CATEGORIES]:
             if not isinstance(category, Mapping):
                 continue
             projected_fields: list[dict[str, Any]] = []
@@ -466,11 +471,19 @@ class RemoteAdminManager:
                 if not isinstance(source_field, Mapping):
                     continue
                 path = source_field.get("path")
-                if path not in REMOTE_ADMIN_WRITABLE_PATHS or source_field.get("writable") is not True:
+                if not isinstance(path, str) or path in fields:
                     continue
-                public_field = self._public_field(path, source_field)
-                fields[path] = public_field
+                if total_fields >= _MAX_FIELDS:
+                    break
+                if remote_write_allowed(path) and source_field.get("writable") is True:
+                    public_field = self._public_field(path, source_field)
+                    fields[path] = public_field
+                else:
+                    public_field = self._read_only_field(path, source_field)
+                    if public_field is None:
+                        continue
                 projected_fields.append(dict(public_field))
+                total_fields += 1
             if projected_fields:
                 categories.append(
                     {
@@ -479,7 +492,7 @@ class RemoteAdminManager:
                         "fields": projected_fields,
                     }
                 )
-        if not fields:
+        if not categories:
             raise RemoteAdminError("remote_admin_snapshot_invalid")
 
         public = {
@@ -517,10 +530,9 @@ class RemoteAdminManager:
             "path": path,
             "label": self._safe_label(source.get("label"), path),
             "type": field_type,
-            "value": self._validated_value(path, value, field_type, source),
             "writable": True,
         }
-        for name in ("min", "max", "step"):
+        for name in ("min", "max", "step", "minimum_nonzero"):
             candidate = source.get(name)
             if (
                 isinstance(candidate, (int, float))
@@ -528,6 +540,18 @@ class RemoteAdminManager:
                 and math.isfinite(float(candidate))
             ):
                 public[name] = candidate
+        if field_type == "string":
+            max_length = source.get("max_length")
+            public["max_length"] = (
+                max_length
+                if isinstance(max_length, int) and not isinstance(max_length, bool) and 1 <= max_length <= _MAX_STRING_BYTES
+                else _MAX_STRING_BYTES
+            )
+            public["allow_empty"] = source.get("allow_empty") is True
+        public["critical"] = source.get("critical") is True
+        warning = preview_warning(path)
+        if warning is not None:
+            public["warning"] = warning
         options = source.get("options")
         if isinstance(options, Sequence) and not isinstance(options, (str, bytes, bytearray)):
             safe_options = []
@@ -541,7 +565,65 @@ class RemoteAdminManager:
                     safe_options.append({"value": option, "label": str(option)})
             if safe_options:
                 public["options"] = safe_options
+        public["value"] = self._validated_value(path, value, field_type, public)
         return public
+
+    def _read_only_field(self, path: str, source: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Project one non-writable scalar for display; secrets are dropped."""
+        field_type = source.get("type")
+        if field_type == "enum":
+            field_type = "select"
+        if field_type not in _SCALAR_FIELD_TYPES or source.get("multiple") is True:
+            return None
+        value = source.get("value")
+        if isinstance(value, bool):
+            if field_type != "boolean":
+                return None
+        elif isinstance(value, (int, float)):
+            if field_type not in {"integer", "number", "select"} or not math.isfinite(float(value)):
+                return None
+        elif isinstance(value, str):
+            if field_type not in {"string", "select"} or len(value.encode("utf-8")) > _MAX_STRING_BYTES:
+                return None
+            if any(ord(character) < 32 for character in value):
+                return None
+        else:
+            return None
+        reason = self._safe_text(source.get("read_only_reason"), 128)
+        public: dict[str, Any] = {
+            "path": path,
+            "label": self._safe_label(source.get("label"), path),
+            "type": field_type,
+            "value": value,
+            "writable": False,
+            "read_only_reason": reason or "setting_requires_dedicated_semantic_validation",
+        }
+        options = source.get("options")
+        if field_type == "select" and isinstance(options, Sequence) and not isinstance(options, (str, bytes, bytearray)):
+            labels = {
+                option.get("value"): self._safe_text(option.get("label"), 96)
+                for option in options[:64]
+                if isinstance(option, Mapping)
+            }
+            label = labels.get(value)
+            if isinstance(label, str):
+                public["value_label"] = label
+        return public
+
+    @staticmethod
+    def _preview_warnings(
+        validated: Mapping[str, Any],
+        fields: Mapping[str, Mapping[str, Any]],
+    ) -> list[str]:
+        warnings: list[str] = []
+        for path in validated:
+            meta = fields.get(path, {})
+            code = meta.get("warning")
+            if isinstance(code, str) and code not in warnings:
+                warnings.append(code)
+            if meta.get("critical") is True and "change_can_affect_mesh_reachability" not in warnings:
+                warnings.append("change_can_affect_mesh_reachability")
+        return warnings
 
     def _validate_changes(
         self,
@@ -552,7 +634,7 @@ class RemoteAdminManager:
             raise RemoteAdminError("remote_admin_changes_invalid")
         validated: dict[str, Any] = {}
         for path, value in changes.items():
-            if not isinstance(path, str) or path not in REMOTE_ADMIN_WRITABLE_PATHS:
+            if not isinstance(path, str) or not remote_write_allowed(path):
                 raise RemoteAdminError("remote_admin_changes_invalid")
             field_meta = fields.get(path)
             if not isinstance(field_meta, Mapping):
@@ -585,8 +667,11 @@ class RemoteAdminManager:
             if not isinstance(value, str):
                 raise RemoteAdminError("remote_admin_changes_invalid")
             byte_length = len(value.encode("utf-8"))
-            maximum = 4 if path == "owner.short_name" else 40 if path == "owner.long_name" else _MAX_STRING_BYTES
-            if not 1 <= byte_length <= maximum or any(ord(character) < 32 for character in value):
+            maximum = field_meta.get("max_length")
+            if not isinstance(maximum, int) or isinstance(maximum, bool) or not 1 <= maximum <= _MAX_STRING_BYTES:
+                maximum = 4 if path == "owner.short_name" else 40 if path == "owner.long_name" else _MAX_STRING_BYTES
+            minimum_length = 0 if field_meta.get("allow_empty") is True else 1
+            if not minimum_length <= byte_length <= maximum or any(ord(character) < 32 for character in value):
                 raise RemoteAdminError("remote_admin_changes_invalid")
             return value
         if field_type in {"integer", "number"}:
@@ -601,6 +686,9 @@ class RemoteAdminManager:
             if isinstance(minimum, (int, float)) and value < minimum:
                 raise RemoteAdminError("remote_admin_changes_invalid")
             if isinstance(maximum, (int, float)) and value > maximum:
+                raise RemoteAdminError("remote_admin_changes_invalid")
+            nonzero = field_meta.get("minimum_nonzero")
+            if isinstance(nonzero, (int, float)) and 0 < value < nonzero:
                 raise RemoteAdminError("remote_admin_changes_invalid")
             return value
         if field_type == "select":

@@ -177,23 +177,45 @@ request** before one request can leave the radio.
 
 ## Remote Node Administration
 
-For a non-critical Meshtastic node that should accept this controller:
+Meshtastic authorizes remote administration with keys, not passwords. The
+gateway radio has exactly one key pair, and each remote node keeps a list of
+up to three **admin keys**: the public keys of the radios it will accept
+changes from. The list lives on the remote node, so the one-time setup is to
+put the gateway's public key on that list:
 
 1. Open **MeshNet** in the Home Assistant sidebar and use its **Remote node
-   administration** card with a connected Meshtastic Bluetooth gateway.
-2. Select the exact target and press **Load / Test access**.
+   administration** card with a connected Meshtastic Bluetooth gateway. The
+   collapsed **How a remote node authorizes this gateway** note repeats these
+   steps.
+2. Select the exact target and press **Load / test access**. The first load
+   fails with "has not authorized this controller public key"; that is
+   expected.
 3. Copy the displayed controller public key. It is copy-only; MeshNet never
    handles the controller private key.
-4. Connect the official Meshtastic app or CLI locally to the target and place
-   that public key in a free Security Admin Key slot.
-5. Reconnect MeshNet, load the target again, edit an offered owner/display
-   field, Preview, review the warning, confirm, and Apply once.
+4. With the Meshtastic app connected to the remote node, open **Radio
+   configuration -> Security**, paste the key into a free **Admin key** slot,
+   and save. The CLI equivalent is `meshtastic --set security.admin_key
+   base64:<key>`.
+5. Load the target again. A successful load proves the authorization and
+   shows its settings.
 
-The target must have a valid public key in the controller NodeDB. Bluetooth
-configuration, channel keys, SecurityConfig, admin-key slots, resets, firmware,
-files, position mutation, and raw admin commands are excluded. A timeout is an
-unknown outcome: inspect the radio locally instead of pressing Apply again.
-The full trust model and recovery table are in
+Loading fetches the owner record and the device, position, power, network,
+display, LoRa, and Bluetooth configuration, one read-only request each, so it
+can take a minute or two over several hops. Each setting is either editable
+with reviewed bounds or shown read-only with the reason. Editable settings
+include the role, rebroadcast mode, broadcast intervals, GPS mode, power
+saving, Wi-Fi, display preferences, hop limit, transmit power, duty-cycle
+override, and the Bluetooth radio. Region, modem preset, frequency and
+channel number, shutdown timers, hardware pins, keys, and anything in
+SecurityConfig stay read-only because a wrong value can only be fixed with
+physical access. Edit, **Preview**, read the warnings, confirm, and **Apply
+once**. Module settings and channels are editable on the local gateway only;
+use the Meshtastic app for those on remote nodes.
+
+A remote node usually reboots once after a committed change, so a readback
+that cannot be verified is reported as an unknown outcome. Wait a minute and
+load the node again instead of pressing Apply a second time. The full trust
+model and recovery table are in
 [Advanced Mesh Operations](ADVANCED_MESH_OPERATIONS.md).
 
 ## Messages, Telemetry, And History

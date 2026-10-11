@@ -593,3 +593,25 @@ def test_remote_reboot_is_admin_only_confirmed_and_delegates_exactly() -> None:
         assert "!1234abcd" not in text
 
     asyncio.run(run())
+
+
+def test_remote_preview_message_accepts_empty_strings_and_bounds_long_ones() -> None:
+    """Clearing a text field is a valid draft; oversized text is not."""
+    from custom_components.meshnet.websocket_api import _validated_remote_preview_message
+
+    base = {
+        "id": 5,
+        "type": "meshnet/remote_settings/preview",
+        "gateway_id": "ble-gateway",
+        "target_node": "!1234abcd",
+        "revision": "a" * 64,
+    }
+    gateway_id, target_node, revision, changes = _validated_remote_preview_message(
+        {**base, "changes": {"config.device.tzdef": "", "config.lora.hop_limit": 5}}
+    )
+    assert (gateway_id, target_node, revision) == ("ble-gateway", "!1234abcd", "a" * 64)
+    assert changes == {"config.device.tzdef": "", "config.lora.hop_limit": 5}
+    with pytest.raises(RemoteAdminError) as raised:
+        _validated_remote_preview_message({**base, "changes": {"config.device.tzdef": "x" * 129}})
+    assert raised.value.code == "remote_admin_changes_invalid"
+    assert "x" * 129 not in str(raised.value)

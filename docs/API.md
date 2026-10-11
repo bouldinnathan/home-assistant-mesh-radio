@@ -291,9 +291,19 @@ Load and test access:
 }
 ```
 
-The result contains a copy-only controller public key, target identity,
-reviewed owner/display fields, and a server revision. It contains no private
-key, session passkey, channel PSK, SecurityConfig, or raw protobuf.
+The load sends one read-only request per section: the session key, the owner
+record, and the device, position, power, network, display, LoRa, and
+Bluetooth configuration. Over several hops it can take a minute or two. The
+result contains a copy-only controller public key, target identity, every
+scalar field of those sections, and a server revision. Fields with a reviewed
+write contract carry `writable: true` plus their bounds (`min`, `max`,
+`minimum_nonzero` when zero means "firmware default", `max_length`,
+`allow_empty`), a `critical` flag when the change can affect mesh reach, and
+an optional `warning` code. Every other field is `writable: false` with a
+`read_only_reason` code. The result contains no private key, session passkey,
+channel PSK, SecurityConfig, or raw protobuf; secret fields are omitted
+entirely. Module configuration and channels are not loaded over the mesh in
+this release; they remain editable on the local gateway only.
 
 Preview one typed draft:
 
@@ -320,9 +330,16 @@ Apply the exact single-use preview:
 }
 ```
 
-The preview expires after 90 seconds and is consumed before any possible RF
-write. A failed/timeout write cannot be blindly replayed with the same token.
-There is no Home Assistant service or generic admin command for this feature.
+The preview response lists the changed paths with labels only, never values,
+plus `warnings`: review codes such as
+`role_change_alters_sleep_and_rebroadcast_behavior` or
+`change_can_affect_mesh_reachability` that the panel shows before the
+confirmation. The preview expires after 90 seconds and is consumed before any
+possible RF write. A failed/timeout write cannot be blindly replayed with the
+same token. Most sections make the node reboot once after the commit, so a
+readback that cannot be verified is reported as an unknown outcome; load the
+node again a minute later instead of repeating the write. There is no Home
+Assistant service or generic admin command for this feature.
 
 ## Remote Node Reboot
 

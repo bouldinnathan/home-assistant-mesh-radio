@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from typing import Final
 
+from .settings_contracts import REMOTE_WRITABLE_PATHS
+
 DOMAIN: Final = "meshnet"
 NAME: Final = "MeshNet"
-VERSION: Final = "0.12.1"
+VERSION: Final = "0.13.0"
 DATA_BLUETOOTH_PAIRING: Final = f"{DOMAIN}_bluetooth_pairing"
 
 PLATFORMS: Final = ["sensor", "binary_sensor", "device_tracker"]
@@ -131,25 +133,10 @@ EVENT_MESSAGE_SENT: Final = "meshnet_message_sent"
 EVENT_MESSAGE_STATUS: Final = "meshnet_message_status"
 EVENT_GATEWAY_STATUS: Final = "meshnet_gateway_status"
 
-# The same positive allowlist is enforced independently by the Home Assistant
-# manager and the radio protocol boundary. New firmware fields remain remote
-# read/write-inaccessible until their lockout and recovery behavior is reviewed.
-REMOTE_ADMIN_WRITABLE_PATHS: Final = frozenset(
-    {
-        "owner.long_name",
-        "owner.short_name",
-        "config.display.compass_north_top",
-        "config.display.compass_orientation",
-        "config.display.enable_message_bubbles",
-        "config.display.flip_screen",
-        "config.display.gps_format",
-        "config.display.heading_bold",
-        "config.display.units",
-        "config.display.use_12h_clock",
-        "config.display.use_long_node_name",
-        "config.display.wake_on_tap_or_motion",
-    }
-)
+# Remote-writable paths come from the reviewed contract table shared with the
+# local gateway editor.  New firmware fields remain remote read/write-
+# inaccessible until their lockout and recovery behavior is reviewed there.
+REMOTE_ADMIN_WRITABLE_PATHS: Final = REMOTE_WRITABLE_PATHS
 
 STORAGE_SCHEMA_VERSION: Final = 1
 
