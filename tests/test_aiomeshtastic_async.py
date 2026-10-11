@@ -1264,3 +1264,76 @@ def test_cleanup_never_disconnects_while_session_io_owners_resist_cancellation()
         assert client._heartbeat_task is None
 
     asyncio.run(run())
+
+
+def test_local_reboot_is_sent_once_and_reports_a_lost_ack_as_unconfirmed() -> None:
+    """A reboot is one admin write; a lost ACK is unknown, never retried."""
+    pytest.importorskip("meshtastic")
+    from meshtastic.protobuf import admin_pb2
+
+    async def run() -> None:
+        client, connection = _active_settings_client(behavior="ack")
+
+        result = await client.async_reboot_local(delay_seconds=3)
+
+        assert result == {"status": "acknowledged", "delay_seconds": 3, "scope": "local"}
+        assert connection.operations == ["reboot_seconds"]
+        admin = admin_pb2.AdminMessage()
+        admin.ParseFromString(bytes(connection.admin_packets[-1].decoded.payload))
+        assert admin.reboot_seconds == 3
+        assert client.diagnostic_snapshot()["reboot_request_count"] == 1
+        assert client.diagnostic_snapshot()["last_reboot_outcome"] == "acknowledged"
+
+        # Lost ACK: the radio may already be rebooting, so the write is not repeated.
+        silent_client, silent_connection = _active_settings_client(
+            behavior="ack",
+            admin_response_timeout=0.01,
+        )
+        sends: list[bytes] = []
+
+        async def swallow(payload: bytes, *, force_read: bool = False) -> None:
+            sends.append(payload)
+
+        silent_connection.async_send = swallow  # type: ignore[assignment]
+        result = await silent_client.async_reboot_local()
+        assert result["status"] == "unconfirmed"
+        assert len(sends) == 1
+        assert silent_client.diagnostic_snapshot()["last_reboot_outcome"] == "unconfirmed"
+
+        for delay in (0, 301, True, "5"):
+            with pytest.raises(MeshtasticConfigurationError):
+                await client.async_reboot_local(delay_seconds=delay)  # type: ignore[arg-type]
+        assert connection.operations == ["reboot_seconds"]
+
+    asyncio.run(run())
+
+
+def test_local_reboot_rejection_and_disconnect_never_resend() -> None:
+    pytest.importorskip("meshtastic")
+    from meshtastic.protobuf import mesh_pb2
+
+    async def run() -> None:
+        client, connection = _active_settings_client(behavior="ack")
+        original = connection.async_send
+
+        async def reject(payload: bytes, *, force_read: bool = False) -> None:
+            to_radio = mesh_pb2.ToRadio()
+            to_radio.ParseFromString(payload)
+            connection.operations.append("reboot_seconds")
+            connection._routing_response(to_radio.packet, error=1)
+
+        connection.async_send = reject  # type: ignore[assignment]
+        with pytest.raises(MeshtasticConfigurationError):
+            await client.async_reboot_local()
+        assert connection.operations == ["reboot_seconds"]
+        assert client.diagnostic_snapshot()["last_reboot_outcome"] is None
+
+        connection.async_send = original  # type: ignore[assignment]
+        client._connected = False
+        from custom_components.meshnet.aiomeshtastic.errors import MeshtasticNotConnectedError
+
+        with pytest.raises(MeshtasticNotConnectedError):
+            await client.async_reboot_local()
+        assert connection.operations == ["reboot_seconds"]
+
+    asyncio.run(run())

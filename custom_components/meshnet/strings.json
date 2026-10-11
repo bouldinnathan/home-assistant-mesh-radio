@@ -378,6 +378,20 @@
           "description": "Optional advanced gateway override. Leave empty to refresh all configured gateways."
         }
       }
+    },
+    "reboot_gateway_radio": {
+      "name": "Reboot gateway radio",
+      "description": "Sends one reboot command to the Meshtastic radio connected over Bluetooth to a MeshNet gateway. The gateway reconnects on its own once the radio is back. Use it on a schedule to clear a hung Bluetooth stack before it causes an outage.",
+      "fields": {
+        "gateway_id": {
+          "name": "Gateway ID",
+          "description": "Optional. Leave empty when only one gateway is configured."
+        },
+        "delay_seconds": {
+          "name": "Delay",
+          "description": "Seconds the radio waits before it reboots (1 to 300)."
+        }
+      }
     }
   },
   "issues": {

@@ -305,6 +305,47 @@ class RemoteAdminManager:
                 "unverified": normalized["unverified"],
             }
 
+    async def async_reboot(
+        self,
+        gateway_id: str,
+        target_node: str,
+        *,
+        confirm_remote: bool,
+    ) -> dict[str, Any]:
+        """Send one confirmed reboot command to an exact remote node."""
+        async with self._operation(gateway_id):
+            gateway_id = self._validate_gateway_id(gateway_id)
+            target_node = self._validate_target(target_node)
+            if confirm_remote is not True:
+                raise RemoteAdminError("remote_admin_confirmation_required")
+            gateway = self._gateway(gateway_id)
+            key = (gateway_id, target_node)
+            async with self._locks.setdefault(key, asyncio.Lock()):
+                # A reboot invalidates any loaded revision and pending preview.
+                self._snapshots.pop(key, None)
+                self._invalidate_target_previews(key)
+                reboot = getattr(gateway, "async_reboot_remote_node", None)
+                if not callable(reboot):
+                    raise RemoteAdminError("remote_admin_unavailable")
+                try:
+                    provider_result = await reboot(target_node)
+                except RemoteAdminError:
+                    raise
+                except Exception as err:
+                    code = getattr(err, "code", None)
+                    if isinstance(code, str) and code in _PASSTHROUGH_PROVIDER_CODES:
+                        raise RemoteAdminError(code) from None
+                    raise RemoteAdminError("remote_admin_unknown_outcome") from None
+            status = provider_result.get("status") if isinstance(provider_result, Mapping) else None
+            if status not in ("acknowledged", "unconfirmed"):
+                raise RemoteAdminError("remote_admin_unknown_outcome")
+            return {
+                "schema_version": 1,
+                "status": status,
+                "gateway_id": gateway_id,
+                "target_node": target_node,
+            }
+
     def invalidate(self) -> None:
         """Destroy cached drafts and revisions during reload/unload."""
         for preview_id in tuple(self._previews):

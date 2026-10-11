@@ -12,6 +12,7 @@ from typing import Any
 
 from .const import (
     ATTR_CHANNEL,
+    ATTR_DELAY_SECONDS,
     ATTR_GATEWAY_ID,
     ATTR_MESSAGE,
     ATTR_MESSAGE_TYPE,
@@ -37,6 +38,7 @@ SERVICE_SEND_MESSAGE = "send_message"
 SERVICE_BROADCAST_MESSAGE = "broadcast_message"
 SERVICE_SCHEDULE_MESSAGE = "schedule_message"
 SERVICE_REFRESH_GATEWAY = "refresh_gateway"
+SERVICE_REBOOT_GATEWAY_RADIO = "reboot_gateway_radio"
 _SCHEDULED_CANCELS_ATTR = "_meshnet_scheduled_message_cancels"
 _SCHEDULED_UNLOAD_REGISTERED_ATTR = "_meshnet_scheduled_unload_registered"
 _MESSAGE_TYPES = (
@@ -266,6 +268,12 @@ def _async_register_services(hass) -> None:
         }
     )
     service_refresh_schema = vol.Schema({vol.Optional(ATTR_GATEWAY_ID): cv.string})
+    service_reboot_schema = vol.Schema(
+        {
+            vol.Optional(ATTR_GATEWAY_ID): cv.string,
+            vol.Optional(ATTR_DELAY_SECONDS, default=5): _coerce_delay_seconds,
+        }
+    )
 
     async def send_message(call) -> dict[str, Any] | None:
         coordinator = _get_coordinator(hass)
@@ -295,6 +303,14 @@ def _async_register_services(hass) -> None:
         coordinator = _get_coordinator(hass)
         await coordinator.async_gateway_refresh(call.data.get(ATTR_GATEWAY_ID))
 
+    async def reboot_gateway_radio(call) -> dict[str, Any] | None:
+        coordinator = _get_coordinator(hass)
+        response = await coordinator.async_reboot_gateway_radio(
+            call.data.get(ATTR_GATEWAY_ID) or None,
+            delay_seconds=call.data.get(ATTR_DELAY_SECONDS, 5),
+        )
+        return response if getattr(call, "return_response", True) else None
+
     hass.services.async_register(
         DOMAIN,
         SERVICE_SEND_MESSAGE,
@@ -321,6 +337,31 @@ def _async_register_services(hass) -> None:
         refresh_gateway,
         schema=service_refresh_schema,
     )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_REBOOT_GATEWAY_RADIO,
+        reboot_gateway_radio,
+        schema=service_reboot_schema,
+        supports_response=response_mode,
+    )
+
+
+def _coerce_delay_seconds(value: Any) -> int:
+    """Accept a whole number of seconds from 1 to 300 without booleans."""
+    if isinstance(value, bool):
+        raise ValueError("delay_seconds must be a whole number of seconds")
+    if isinstance(value, str):
+        value = value.strip()
+        if not value.isdigit():
+            raise ValueError("delay_seconds must be a whole number of seconds")
+        value = int(value)
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError("delay_seconds must be a whole number of seconds")
+        value = int(value)
+    if not isinstance(value, int) or not 1 <= value <= 300:
+        raise ValueError("delay_seconds must be between 1 and 300")
+    return value
 
 
 def _coerce_target_node(value: Any) -> str:

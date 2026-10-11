@@ -184,6 +184,8 @@ _BLUETOOTH_FAILURE_DIAGNOSTIC_FIELDS = frozenset(
         "resolution_attempts",
         "resolution_successes",
         "last_resolution_result",
+        "reboot_request_count",
+        "last_reboot_outcome",
         "snapshot_error_type",
         # Test transports use these same identity-free lifecycle counters.
         "active",
@@ -480,6 +482,23 @@ class MeshtasticClient(MeshGateway):
     def start_pending(self) -> bool:
         """Return whether this client already has a transport start in flight."""
         return self._start_task is not None and not self._start_task.done()
+
+    def start_failure_context(self) -> dict[str, str | None]:
+        """Return identity-free facts about the last failed start for repair text."""
+        failure = self._last_bluetooth_failure if isinstance(self._last_bluetooth_failure, dict) else {}
+        transport = failure.get("transport") if isinstance(failure.get("transport"), dict) else {}
+        validation = self._bluetooth_adapter_validation if isinstance(self._bluetooth_adapter_validation, dict) else {}
+
+        def text(value: Any) -> str | None:
+            return value if isinstance(value, str) and value.isidentifier() and len(value) <= 64 else None
+
+        return {
+            "transport": text(self.config.transport),
+            "phase": text(self._last_start_failed_phase),
+            "error_subtype": text(self._last_start_error_subtype),
+            "resolution_result": text(transport.get("last_resolution_result")),
+            "adapter_validation": text(validation.get("status")),
+        }
 
     @property
     def local_node_id(self) -> str | None:
@@ -1352,6 +1371,40 @@ class MeshtasticClient(MeshGateway):
                 "Remote administration is unavailable",
             )
         return await self._async_run_bluetooth_operation(apply_plan(target_node, changes))
+
+    async def async_reboot_radio(self, *, delay_seconds: int = 5) -> dict[str, Any]:
+        """Delegate one explicit reboot of the connected radio to the BLE client.
+
+        Serial, TCP, and MQTT stay read-only for the same reason settings
+        writes do: the official SDK write helpers log full AdminMessages.
+        """
+        if self.config.transport != TRANSPORT_BLUETOOTH:
+            raise RuntimeError("Radio reboot requires a Meshtastic Bluetooth gateway")
+        transport = self._ble_transport
+        client = getattr(transport, "_client", None)
+        reboot = getattr(client, "async_reboot_local", None)
+        if not callable(reboot):
+            raise RuntimeError("Radio reboot is unavailable")
+        return await self._async_run_bluetooth_operation(reboot(delay_seconds=delay_seconds))
+
+    async def async_reboot_remote_node(self, target_node: str, *, delay_seconds: int = 5) -> dict[str, Any]:
+        """Delegate one explicit remote reboot only over BLE."""
+        from .aiomeshtastic.errors import MeshtasticRemoteAdminError
+
+        if self.config.transport != TRANSPORT_BLUETOOTH:
+            raise MeshtasticRemoteAdminError(
+                "remote_admin_requires_bluetooth",
+                "Remote administration requires a Meshtastic Bluetooth gateway",
+            )
+        transport = self._ble_transport
+        client = getattr(transport, "_client", None)
+        reboot = getattr(client, "async_reboot_remote", None)
+        if not callable(reboot):
+            raise MeshtasticRemoteAdminError(
+                "remote_admin_unavailable",
+                "Remote administration is unavailable",
+            )
+        return await self._async_run_bluetooth_operation(reboot(target_node, delay_seconds=delay_seconds))
 
     async def async_apply_settings_plan(self, changes: dict[str, Any]) -> dict[str, Any]:
         """Apply through the verified BLE backend or reject unsupported transports.

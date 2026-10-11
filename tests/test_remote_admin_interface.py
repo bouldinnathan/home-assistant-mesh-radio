@@ -325,3 +325,48 @@ def test_remote_admin_has_no_service_or_automatic_callsite() -> None:
     integration = open("custom_components/meshnet/__init__.py", encoding="utf-8").read()
     assert "remote_admin:" not in services
     assert "SERVICE_REMOTE_ADMIN" not in integration
+
+
+def test_remote_reboot_requires_bluetooth_confirmation_and_clears_cached_state() -> None:
+    """Remote reboot is panel-only, confirmed, one-shot, and never echoes providers."""
+
+    async def run() -> None:
+        manager, gateway = _manager()
+        gateway.async_reboot_remote_node = AsyncMock(
+            return_value={"status": "acknowledged", "delay_seconds": 5, "scope": "remote"}
+        )
+        await manager.async_get(GATEWAY_ID, TARGET)
+        assert manager._snapshots
+
+        with pytest.raises(RemoteAdminError) as unconfirmed:
+            await manager.async_reboot(GATEWAY_ID, TARGET, confirm_remote=False)
+        assert unconfirmed.value.code == "remote_admin_confirmation_required"
+        gateway.async_reboot_remote_node.assert_not_awaited()
+
+        result = await manager.async_reboot(GATEWAY_ID, TARGET, confirm_remote=True)
+        assert result == {
+            "schema_version": 1,
+            "status": "acknowledged",
+            "gateway_id": GATEWAY_ID,
+            "target_node": TARGET,
+        }
+        gateway.async_reboot_remote_node.assert_awaited_once_with(TARGET)
+        assert manager._snapshots == {}
+
+        gateway.async_reboot_remote_node = AsyncMock(side_effect=RuntimeError("provider detail !deadbeef"))
+        with pytest.raises(RemoteAdminError) as unknown:
+            await manager.async_reboot(GATEWAY_ID, TARGET, confirm_remote=True)
+        assert unknown.value.code == "remote_admin_unknown_outcome"
+        assert "deadbeef" not in str(unknown.value)
+
+        serial_manager, _serial_gateway = _manager(transport="serial")
+        with pytest.raises(RemoteAdminError) as transport:
+            await serial_manager.async_reboot(GATEWAY_ID, TARGET, confirm_remote=True)
+        assert transport.value.code == "remote_admin_requires_bluetooth"
+
+        offline_manager, _offline_gateway = _manager(connected=False)
+        with pytest.raises(RemoteAdminError) as offline:
+            await offline_manager.async_reboot(GATEWAY_ID, TARGET, confirm_remote=True)
+        assert offline.value.code == "remote_admin_requires_bluetooth"
+
+    asyncio.run(run())

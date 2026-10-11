@@ -87,6 +87,7 @@ from .const import (
     PROTOCOL_MESHTASTIC,
     TRANSPORT_BLUETOOTH,
     TRANSPORT_REST,
+    TRANSPORT_SERIAL,
 )
 from .dedupe import PacketDeduplicator
 from .diagnostic_safety import safe_node_metadata
@@ -1061,6 +1062,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
         self._node_cleanup_pending = 0
         self._entity_budget_state: dict[str, Any] = {}
         self._entity_budget_issue_signature: tuple[int, int] | None = None
+        self._radio_reboot_stats: dict[str, int] = {}
         self.store = MeshStore(Path(hass.config.path(DEFAULT_DATABASE_NAME)), executor=hass.async_add_executor_job)
         self.deduplicator = PacketDeduplicator()
         self.tx_limiter = TokenBucket(rate=0.5, capacity=5)
@@ -2801,6 +2803,153 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             confirm_remote=confirm_remote,
         )
 
+    async def async_remote_reboot(
+        self,
+        *,
+        gateway_id: str,
+        target_node: str,
+        confirm_remote: bool,
+    ) -> dict[str, Any]:
+        """Send one explicitly confirmed reboot command to an exact remote node."""
+        self._record_network_activity()
+        stats = self._reboot_stats()
+        stats["remote_requests"] = stats.get("remote_requests", 0) + 1
+        try:
+            result = await self.remote_admin.async_reboot(
+                gateway_id,
+                target_node,
+                confirm_remote=confirm_remote,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            stats["remote_failed"] = stats.get("remote_failed", 0) + 1
+            raise
+        status = result.get("status") if isinstance(result, Mapping) else None
+        key = "remote_acknowledged" if status == "acknowledged" else "remote_unconfirmed"
+        stats[key] = stats.get(key, 0) + 1
+        return result
+
+    async def async_reboot_gateway_radio(
+        self,
+        gateway_id: str | None = None,
+        *,
+        delay_seconds: int = 5,
+    ) -> dict[str, Any]:
+        """Send one reboot command to a gateway's own Bluetooth radio.
+
+        This is the only reboot path an automation may call. Remote nodes are
+        rebooted from the administrator panel with an explicit confirmation.
+        """
+        self._record_network_activity()
+        stats = self._reboot_stats()
+        stats["requests"] = stats.get("requests", 0) + 1
+        if (
+            not getattr(self, "_radio_operations_accepting", True)
+            or getattr(self, "_shutting_down", False)
+            or getattr(self, "_reconnect_suspended", False)
+        ):
+            stats["rejected"] = stats.get("rejected", 0) + 1
+            raise HomeAssistantError("MeshNet is not accepting radio operations right now")
+        if isinstance(delay_seconds, bool) or not isinstance(delay_seconds, int) or not 1 <= delay_seconds <= 300:
+            stats["rejected"] = stats.get("rejected", 0) + 1
+            raise HomeAssistantError("delay_seconds must be a whole number from 1 to 300")
+        try:
+            gateway = self._reboot_target_gateway(gateway_id)
+        except HomeAssistantError:
+            stats["rejected"] = stats.get("rejected", 0) + 1
+            raise
+        ordinal = self._gateway_ordinal(gateway.config.gateway_id)
+        reboot = getattr(gateway, "async_reboot_radio", None)
+        if not callable(reboot):
+            stats["rejected"] = stats.get("rejected", 0) + 1
+            raise HomeAssistantError(f"Gateway adapter {ordinal} cannot reboot its radio")
+        try:
+            result = await reboot(delay_seconds=delay_seconds)
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            stats["failed"] = stats.get("failed", 0) + 1
+            category = _diagnostic_error_category(str(err))
+            _LOGGER.warning(
+                "MeshNet could not reboot the radio behind gateway adapter %s (%s; %s)",
+                ordinal,
+                category,
+                _safe_error_type(err),
+            )
+            raise HomeAssistantError(
+                f"Gateway adapter {ordinal} radio reboot failed ({category}; {_safe_error_type(err)})"
+            ) from None
+        status = result.get("status") if isinstance(result, Mapping) else None
+        if status != "acknowledged":
+            status = "unconfirmed"
+        stats[status] = stats.get(status, 0) + 1
+        _LOGGER.info(
+            "MeshNet sent a reboot command to the radio behind gateway adapter %s (status=%s, delay=%ds)",
+            ordinal,
+            status,
+            delay_seconds,
+        )
+        return {
+            "schema_version": 1,
+            "gateway_id": gateway.config.gateway_id,
+            "status": status,
+            "delay_seconds": delay_seconds,
+        }
+
+    def _reboot_target_gateway(self, gateway_id: str | None) -> MeshGateway:
+        """Resolve the one Meshtastic Bluetooth gateway a reboot may target."""
+        gateways = getattr(self, "gateways", {})
+        if gateway_id:
+            if not isinstance(gateway_id, str) or len(gateway_id) > 128:
+                raise HomeAssistantError("gateway_id is invalid")
+            gateway = gateways.get(gateway_id)
+            if gateway is None:
+                raise HomeAssistantError(f"Unknown gateway: {gateway_id}")
+        else:
+            candidates = [
+                candidate
+                for candidate in gateways.values()
+                if _known_protocol(candidate.config.protocol) == PROTOCOL_MESHTASTIC
+                and candidate.config.transport == TRANSPORT_BLUETOOTH
+            ]
+            if len(candidates) != 1:
+                raise HomeAssistantError(
+                    f"Specify gateway_id: {len(candidates)} Meshtastic Bluetooth gateways are configured"
+                )
+            gateway = candidates[0]
+        ordinal = self._gateway_ordinal(gateway.config.gateway_id)
+        if (
+            _known_protocol(gateway.config.protocol) != PROTOCOL_MESHTASTIC
+            or gateway.config.transport != TRANSPORT_BLUETOOTH
+        ):
+            raise HomeAssistantError(f"Gateway adapter {ordinal} is not a Meshtastic Bluetooth gateway")
+        if not gateway.status.connected:
+            raise HomeAssistantError(f"Gateway adapter {ordinal} is not connected to its radio")
+        return gateway
+
+    def _reboot_stats(self) -> dict[str, int]:
+        stats = getattr(self, "_radio_reboot_stats", None)
+        if not isinstance(stats, dict):
+            stats = self._radio_reboot_stats = {}
+        return stats
+
+    def radio_reboot_diagnostics(self) -> dict[str, int]:
+        """Return identity-free reboot counters."""
+        stats = self._reboot_stats()
+        keys = (
+            "requests",
+            "acknowledged",
+            "unconfirmed",
+            "failed",
+            "rejected",
+            "remote_requests",
+            "remote_acknowledged",
+            "remote_unconfirmed",
+            "remote_failed",
+        )
+        return {key: int(stats.get(key, 0)) for key in keys}
+
     async def async_persist_gateway_connection_updates(
         self,
         gateway_id: str,
@@ -3042,6 +3191,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
 
         return {
             "node_window": self.node_window_diagnostics(),
+            "radio_reboots": self.radio_reboot_diagnostics(),
             "configuration": {
                 "node_timeout": self.node_timeout,
                 "history_days": self.history_days,
@@ -4094,13 +4244,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             if isinstance(result, BaseException):
                 self._create_issue(
                     issue_id=issue_id,
-                    message=(
-                        "Gateway adapter "
-                        f"{self._gateway_ordinal(gateway.config.gateway_id)} "
-                        "failed to start "
-                        f"({_diagnostic_error_category(str(result))}; "
-                        f"{_safe_error_type(result)})."
-                    ),
+                    message=self._gateway_start_failure_message(gateway, result),
                     severity=ir.IssueSeverity.WARNING,
                 )
                 # A pre-active Bluetooth failure never emits a connected-to-
@@ -4418,6 +4562,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
                 if self._shutting_down or self._reconnect_suspended:
                     return
                 await gateway._emit_error(f"Reconnect failed: {err}")
+                self._refresh_gateway_start_issue(gateway, err)
 
             if gateway.status.connected:
                 return
@@ -4772,6 +4917,89 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             translation_key="gateway_issue",
             translation_placeholders={"message": message},
         )
+
+    def _gateway_start_failure_message(self, gateway: Any, error: BaseException) -> str:
+        """Return the start-failure repair text plus the action it calls for."""
+        base = (
+            "Gateway adapter "
+            f"{self._gateway_ordinal(gateway.config.gateway_id)} "
+            "failed to start "
+            f"({_diagnostic_error_category(str(error))}; "
+            f"{_safe_error_type(error)})."
+        )
+        hint = self._gateway_start_hint(gateway)
+        return f"{base} {hint}" if hint else base
+
+    @staticmethod
+    def _gateway_start_hint(gateway: Any) -> str:
+        """Explain what the failed phase means and what to do, without identities.
+
+        The phase and the advertisement evidence separate a radio that is off
+        or out of range from one that is powered but refusing connections,
+        which only a reset or power cycle fixes.
+        """
+        getter = getattr(gateway, "start_failure_context", None)
+        if not callable(getter):
+            return ""
+        try:
+            context = getter()
+        except Exception:
+            return ""
+        if not isinstance(context, Mapping):
+            return ""
+        transport = context.get("transport")
+        phase = context.get("phase")
+        resolution = context.get("resolution_result")
+        validation = context.get("adapter_validation")
+        if transport == TRANSPORT_BLUETOOTH:
+            if validation not in (None, "passed"):
+                return (
+                    "The saved Bluetooth adapter on the Home Assistant host is missing, powered off, "
+                    "or ambiguous, so the radio was never contacted. Fix the host adapter first."
+                )
+            if phase == "bluetooth_resolving_device" or (
+                phase == "bluetooth_connecting" and resolution != "matched_verified_local_adapter"
+            ):
+                return (
+                    "The radio is not advertising to the local adapter, so it is probably powered off, "
+                    "out of battery, out of range, or has Bluetooth disabled (Wi-Fi disables Bluetooth "
+                    "on many boards). Check the radio; MeshNet reconnects on its own."
+                )
+            if phase == "bluetooth_connecting":
+                return (
+                    "The radio is advertising, so it is powered and in range, but it refuses the "
+                    "connection. This is usually a hung Bluetooth stack on the radio or another app "
+                    "holding its single connection. Close the Meshtastic app, then press the radio's "
+                    "reset button or power-cycle it; MeshNet keeps retrying on its own."
+                )
+            if phase in ("bluetooth_requesting_configuration", "bluetooth_synchronizing_configuration"):
+                return (
+                    "The radio accepted the connection but never finished its configuration exchange. "
+                    "Another client may hold the session, or the saved Bluetooth bond is stale. Close "
+                    "other apps first; if it keeps happening, use Configure -> Remove gateway with bond "
+                    "removal and pair again."
+                )
+            return ""
+        if transport == TRANSPORT_SERIAL:
+            return (
+                "Check that the USB device is still present under /dev/serial/by-id and that Home "
+                "Assistant can open it, then reload the entry."
+            )
+        return ""
+
+    def _refresh_gateway_start_issue(self, gateway: Any, error: BaseException) -> None:
+        """Update the start repair after a failed reconnect without breaking the loop."""
+        try:
+            self._create_issue(
+                issue_id=self._gateway_issue_id("gateway_start", gateway.config.gateway_id),
+                message=self._gateway_start_failure_message(gateway, error),
+                severity=ir.IssueSeverity.WARNING,
+            )
+        except Exception as err:
+            _LOGGER.debug(
+                "Could not refresh the MeshNet gateway start repair: %s",
+                type(err).__name__,
+            )
 
     def _gateway_issue_id(self, category: str, gateway_id: str) -> str:
         """Return a stable issue key that does not expose a gateway identifier."""

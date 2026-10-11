@@ -1,5 +1,26 @@
 # Upgrade Guide
 
+## From 0.12.0
+
+0.12.1 adds radio reboots and actionable gateway repairs. The
+`meshnet.reboot_gateway_radio` action sends one reboot command to the radio
+behind a Meshtastic Bluetooth gateway, and the **MeshNet scheduled gateway
+radio reboot** blueprint schedules it, which is the only way to get a periodic
+reboot because Meshtastic firmware has no such setting. Remote nodes gain a
+collapsed **Reboot this node** control in the panel's remote administration
+card; it needs the same authorization and confirmation as a remote settings
+write and has no Home Assistant service on purpose. Serial, TCP, and MQTT
+gateways stay read-only for reboots, like for settings.
+
+The **MeshNet gateway issue** repair now explains the failed Bluetooth phase
+and names the action: a radio that is not advertising is off or out of range,
+while one that advertises but refuses connections needs the Meshtastic app
+closed and a reset or power cycle. A **MeshNet gateway offline notification**
+blueprint is included for alerting.
+
+Hard-refresh the browser once so the 0.12.1 panel module loads. No
+config-entry or radio setting change is required.
+
 ## From 0.11.0
 
 0.12.0 adds a rolling window for cached node records. `node_limit` defaults to

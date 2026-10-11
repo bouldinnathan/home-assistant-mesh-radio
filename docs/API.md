@@ -323,3 +323,57 @@ Apply the exact single-use preview:
 The preview expires after 90 seconds and is consumed before any possible RF
 write. A failed/timeout write cannot be blindly replayed with the same token.
 There is no Home Assistant service or generic admin command for this feature.
+
+## Remote Node Reboot
+
+Administrator-only, Bluetooth gateway only, and panel only. The node must have
+been loaded with `meshnet/remote_settings/get` first, which proves the
+controller radio is authorized on the target.
+
+```json
+{
+  "type": "meshnet/remote_admin/reboot",
+  "gateway_id": "garage_radio",
+  "target_node": "!1234abcd",
+  "confirm_remote": true
+}
+```
+
+Result:
+
+```json
+{
+  "schema_version": 1,
+  "status": "acknowledged",
+  "gateway_id": "garage_radio",
+  "target_node": "!1234abcd"
+}
+```
+
+`status` is `acknowledged` when the target's routing ACK arrived and
+`unconfirmed` when the single command was written but no ACK came back. An
+unconfirmed reboot is never resent automatically; wait and load the node
+again. The target's cached session and loaded settings are dropped, because a
+reboot invalidates both. Errors use the same `remote_admin_*` codes as the
+settings commands. There is deliberately no Home Assistant service for remote
+reboots; only the gateway's own radio can be rebooted from an automation.
+
+## Reboot Gateway Radio Action
+
+`meshnet.reboot_gateway_radio` sends one reboot command to the Meshtastic radio
+behind a Bluetooth gateway. It is the only reboot path an automation may call
+and exists so a hung radio Bluetooth stack can be cleared on a schedule.
+
+```yaml
+action: meshnet.reboot_gateway_radio
+data:
+  gateway_id: garage_radio   # optional when one Bluetooth gateway is configured
+  delay_seconds: 5           # 1 to 300
+```
+
+The action returns `{"status": "acknowledged" | "unconfirmed", ...}` when
+called with a response variable. It is refused while MeshNet is reloading,
+when the gateway is not a connected Meshtastic Bluetooth gateway, or when
+more than one Bluetooth gateway is configured and no `gateway_id` is given.
+The gateway reconnects on its own once the radio is back, usually within a
+minute.

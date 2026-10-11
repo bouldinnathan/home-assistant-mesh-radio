@@ -402,6 +402,34 @@ If the gateway is offline, MeshNet queues the message and replays it when a conn
 
 ## Automations
 
+### Blueprints
+
+Two blueprints ship in the repository. Import each one in Home Assistant under
+**Settings -> Automations & scenes -> Blueprints -> Import blueprint** by
+pasting its URL:
+
+- Scheduled gateway radio reboot:
+  `https://github.com/bouldinnathan/home-assistant-mesh-radio/blob/main/blueprints/automation/meshnet/scheduled_gateway_radio_reboot.yaml`
+- Gateway offline notification:
+  `https://github.com/bouldinnathan/home-assistant-mesh-radio/blob/main/blueprints/automation/meshnet/gateway_offline_notification.yaml`
+
+The reboot blueprint calls `meshnet.reboot_gateway_radio` at a time you pick
+and skips the reboot while the gateway is offline. Meshtastic firmware has no
+periodic reboot setting of its own, so this is the way to clear a hung radio
+Bluetooth stack before it causes an outage. The notification blueprint sends
+a persistent notification, and optionally a Companion app push, after the
+gateway has been offline for a chosen time, and points you at the MeshNet
+repair, which names the action to take.
+
+### Reboot a radio by hand
+
+`meshnet.reboot_gateway_radio` reboots the radio behind a Bluetooth gateway
+from **Developer tools -> Actions** or any automation. Remote nodes are
+rebooted from the panel instead: open **Remote node administration**, load
+the node, expand **Reboot this node**, confirm, and send. Remote reboots need
+the same admin authorization as remote settings writes and are never
+available to automations.
+
 Example: alert when a gateway goes offline.
 
 ```yaml

@@ -527,3 +527,29 @@ def test_filter_redacts_history_delete_conversation_identity() -> None:
     assert rendered.count("<redacted by MeshNet>") == 1
     assert "permanently delete this data" in rendered
     assert command == original
+
+
+def test_filter_redacts_remote_reboot_target_identity() -> None:
+    command = {
+        "id": 12,
+        "type": "meshnet/remote_admin/reboot",
+        "gateway_id": "ble-gateway-secret",
+        "target_node": "!12345678",
+        "confirm_remote": True,
+    }
+    record = logging.LogRecord(
+        "homeassistant.components.websocket_api.http.connection",
+        logging.DEBUG,
+        __file__,
+        1,
+        "%s: Received %s",
+        ("connection", command),
+        None,
+    )
+
+    assert _MeshNetWebSocketRedactionFilter().filter(record) is True
+
+    rendered = record.getMessage()
+    assert "!12345678" not in rendered
+    assert "ble-gateway-secret" not in rendered
+    assert "meshnet/remote_admin/reboot" in rendered

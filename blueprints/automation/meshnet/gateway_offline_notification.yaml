@@ -1,0 +1,60 @@
+blueprint:
+  name: MeshNet gateway offline notification
+  description: >-
+    Notify when a MeshNet gateway has been offline for longer than a chosen
+    time. Sends a persistent notification in Home Assistant and, optionally,
+    a push notification to one Home Assistant Companion app device. The
+    message tells you to check the MeshNet repair, which names the action to
+    take, for example closing the phone app or power-cycling the radio.
+  domain: automation
+  source_url: https://github.com/bouldinnathan/home-assistant-mesh-radio/blob/main/blueprints/automation/meshnet/gateway_offline_notification.yaml
+  input:
+    gateway_online:
+      name: Gateway online sensor
+      description: The MeshNet gateway's Online binary sensor.
+      selector:
+        entity:
+          filter:
+            - integration: meshnet
+              domain: binary_sensor
+    offline_for:
+      name: Offline for
+      description: How long the gateway must be offline before you are notified.
+      default:
+        minutes: 15
+      selector:
+        duration: {}
+    notify_device:
+      name: Phone to notify (optional)
+      description: A device running the Home Assistant Companion app. Leave empty for the persistent notification only.
+      default: ""
+      selector:
+        device:
+          filter:
+            - integration: mobile_app
+mode: single
+triggers:
+  - trigger: state
+    entity_id: !input gateway_online
+    to: "off"
+    for: !input offline_for
+variables:
+  notify_device: !input notify_device
+actions:
+  - action: persistent_notification.create
+    data:
+      notification_id: meshnet_gateway_offline
+      title: MeshNet gateway offline
+      message: >-
+        A MeshNet gateway has been offline for longer than expected. Open
+        Settings > Repairs and read the MeshNet gateway issue; it says whether
+        the radio is unreachable or is refusing connections and what to do.
+  - if:
+      - condition: template
+        value_template: "{{ notify_device | default('') != '' }}"
+    then:
+      - device_id: !input notify_device
+        domain: mobile_app
+        type: notify
+        title: MeshNet gateway offline
+        message: Check Settings > Repairs for the MeshNet gateway issue and the action it names.

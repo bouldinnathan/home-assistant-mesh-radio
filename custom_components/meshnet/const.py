@@ -6,7 +6,7 @@ from typing import Final
 
 DOMAIN: Final = "meshnet"
 NAME: Final = "MeshNet"
-VERSION: Final = "0.12.0"
+VERSION: Final = "0.12.1"
 DATA_BLUETOOTH_PAIRING: Final = f"{DOMAIN}_bluetooth_pairing"
 
 PLATFORMS: Final = ["sensor", "binary_sensor", "device_tracker"]
@@ -122,6 +122,7 @@ ATTR_CHANNEL: Final = "channel"
 ATTR_PRIORITY: Final = "priority"
 ATTR_MESSAGE_TYPE: Final = "message_type"
 ATTR_WHEN: Final = "when"
+ATTR_DELAY_SECONDS: Final = "delay_seconds"
 ATTR_RAW: Final = "raw"
 
 EVENT_PACKET: Final = "meshnet_packet"

@@ -548,6 +548,40 @@ nodes, so if the repair stays at 25 the registry holds enabled entities that
 do not belong to cached nodes; remove or disable them under
 **Settings -> Devices & services -> Entities**.
 
+### Radio Advertises But Refuses Connections
+
+Since 0.12.1 the **MeshNet gateway issue** repair says what the failed phase
+means and what to do, for example:
+
+```text
+Gateway adapter 001 failed to start (bluetooth; MeshtasticConnectionError).
+The radio is advertising, so it is powered and in range, but it refuses the
+connection. ...
+```
+
+The four Bluetooth cases are:
+
+- **Host adapter problem**: the saved adapter is missing, off, or ambiguous.
+  The radio was never contacted; fix the host adapter.
+- **Radio not advertising**: it is off, out of battery, out of range, or has
+  Bluetooth disabled. Wi-Fi disables Bluetooth on many ESP32 boards.
+- **Radio advertising but refusing connections**: the GATT connect times out
+  even though the radio is visible. This is a hung Bluetooth stack on the
+  radio or another app holding its single connection. Close the Meshtastic
+  app, then press the radio's reset button or power-cycle it. MeshNet keeps
+  retrying on its own and clears the repair when it reconnects.
+- **Connected but no configuration**: another client holds the session or
+  the saved bond is stale. Close other apps; if it persists, use
+  **Configure -> Remove gateway** with bond removal and pair again.
+
+Diagnostics confirm the third case with
+`runtime.gateways[0].client.last_start_failed_phase: bluetooth_connecting`
+and `last_resolution_result: matched_verified_local_adapter`.
+
+To keep it from coming back, import the **MeshNet scheduled gateway radio
+reboot** blueprint (see Usage) so the radio reboots nightly, or move the
+gateway to USB serial, which does not use the radio's Bluetooth stack at all.
+
 ### No Nodes Appear
 
 Checks:

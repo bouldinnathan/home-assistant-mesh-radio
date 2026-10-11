@@ -538,3 +538,60 @@ def test_cached_reads_diagnostics_and_refresh_never_send_remote_admin() -> None:
         assert connection.packets == []
 
     asyncio.run(run())
+
+
+def test_remote_reboot_uses_session_passkey_and_drops_cached_state() -> None:
+    """One remote reboot: exact key evidence, a session, one write, no retry."""
+
+    from custom_components.meshnet.aiomeshtastic.errors import (
+        MeshtasticConfigurationError,
+        MeshtasticRemoteAdminError,
+    )
+
+    async def run() -> None:
+        client, connection = _active_remote_client()
+        await client.async_get_remote_settings_snapshot(TARGET_ID)
+        assert TARGET_NUM in client._remote_settings
+
+        result = await client.async_reboot_remote(TARGET_ID, delay_seconds=7)
+
+        assert result["status"] == "acknowledged"
+        assert result["scope"] == "remote"
+        assert result["delay_seconds"] == 7
+        assert result["target"] == {"node_id": TARGET_ID, "short_name": "OLD"}
+        assert connection.write_operations == ["reboot_seconds"]
+        assert connection.max_writes_in_flight == 1
+        # A reboot invalidates the target's session and loaded settings.
+        assert TARGET_NUM not in client._remote_admin_sessions
+        assert TARGET_NUM not in client._remote_settings
+        assert client.diagnostic_snapshot()["reboot_request_count"] == 1
+
+        # Without a cached session a fresh one is requested first.
+        connection.session_requests = 0
+        await client.async_reboot_remote(TARGET_ID)
+        assert connection.session_requests == 1
+        assert connection.write_operations == ["reboot_seconds", "reboot_seconds"]
+
+        with pytest.raises(MeshtasticRemoteAdminError) as unknown:
+            await client.async_reboot_remote("!0badf00d")
+        assert unknown.value.code == "remote_admin_target_unknown"
+        with pytest.raises(MeshtasticConfigurationError):
+            await client.async_reboot_remote(TARGET_ID, delay_seconds=0)
+        assert connection.write_operations == ["reboot_seconds", "reboot_seconds"]
+
+    asyncio.run(run())
+
+
+def test_remote_reboot_keeps_stable_codes_when_the_target_refuses() -> None:
+    from custom_components.meshnet.aiomeshtastic.errors import (
+        MeshtasticRemoteAdminError,
+    )
+
+    async def run() -> None:
+        client, connection = _active_remote_client(route_error="ADMIN_PUBLIC_KEY_UNAUTHORIZED")
+        with pytest.raises(MeshtasticRemoteAdminError) as err:
+            await client.async_reboot_remote(TARGET_ID)
+        assert err.value.code == "remote_admin_controller_unauthorized"
+        assert connection.write_operations == []
+
+    asyncio.run(run())

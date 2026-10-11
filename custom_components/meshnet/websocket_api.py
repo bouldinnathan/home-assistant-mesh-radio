@@ -173,6 +173,7 @@ async def async_register_websocket_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, websocket_remote_settings_get)
     websocket_api.async_register_command(hass, websocket_remote_settings_preview)
     websocket_api.async_register_command(hass, websocket_remote_settings_apply)
+    websocket_api.async_register_command(hass, websocket_remote_reboot)
 
 
 _GATEWAY_ID = vol.All(str, vol.Length(min=1, max=128))
@@ -506,6 +507,44 @@ async def websocket_remote_settings_apply(
             msg["id"],
             "remote_admin_unknown_outcome",
             "The remote write could not be verified; do not repeat it blindly",
+        )
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "meshnet/remote_admin/reboot",
+        vol.Required(ATTR_GATEWAY_ID): _GATEWAY_ID,
+        vol.Required(ATTR_TARGET_NODE): _REMOTE_TARGET,
+        vol.Required("confirm_remote"): bool,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_remote_reboot(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Send one explicitly confirmed reboot command to an exact remote node."""
+    coordinator = _get_coordinator(hass)
+
+    async def reboot_remote_node() -> None:
+        result = await coordinator.async_remote_reboot(
+            gateway_id=msg[ATTR_GATEWAY_ID],
+            target_node=msg[ATTR_TARGET_NODE],
+            confirm_remote=msg["confirm_remote"],
+        )
+        send_sensitive_result(connection, msg["id"], result)
+
+    try:
+        await _async_panel_operation(coordinator, "remote_reboot", reboot_remote_node)
+    except RemoteAdminError as err:
+        _send_remote_admin_error(connection, msg["id"], err)
+    except Exception:
+        connection.send_error(
+            msg["id"],
+            "remote_admin_unknown_outcome",
+            "The remote reboot could not be verified; do not repeat it blindly",
         )
 
 

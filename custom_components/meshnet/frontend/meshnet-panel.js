@@ -90,6 +90,7 @@ class MeshNetPanel extends HTMLElement {
     this._remoteSettingsStatus = null;
     this._remoteSettingsBusy = null;
     this._remoteSettingsConfirmed = false;
+    this._remoteRebootConfirmed = false;
     this._remoteRequestGeneration = 0;
     this._tracerouteGatewayId = "";
     this._tracerouteTargetNode = "";
@@ -179,6 +180,7 @@ class MeshNetPanel extends HTMLElement {
     this._remoteSettingsStatus = null;
     this._remoteSettingsBusy = null;
     this._remoteSettingsConfirmed = false;
+    this._remoteRebootConfirmed = false;
     this._tracerouteGatewayId = "";
     this._tracerouteTargetNode = "";
     this._tracerouteConfirmation = null;
@@ -469,6 +471,7 @@ class MeshNetPanel extends HTMLElement {
       "remote_settings_get",
       "remote_settings_preview",
       "remote_settings_apply",
+      "remote_reboot",
       "traceroute_event",
       "traceroute_request",
       "traceroute_status",
@@ -595,6 +598,7 @@ class MeshNetPanel extends HTMLElement {
       remote_settings_get: "remote_settings_get",
       remote_settings_preview: "remote_settings_preview",
       remote_settings_apply: "remote_settings_apply",
+      remote_reboot: "remote_reboot",
       traceroute_event: "event_handler",
       traceroute_request: "traceroute_request",
       traceroute_status: "traceroute_status",
@@ -1691,6 +1695,7 @@ class MeshNetPanel extends HTMLElement {
                 <button class="operator-button" id="meshnet-controller-key-copy" type="button">Copy controller public key</button>
               </div>
             </section>
+            ${this._remoteRebootCard(snapshot)}
             <form class="operator-card" id="meshnet-remote-settings-form">
               ${snapshot.categories.map((category) => `
                 <section class="operator-card">
@@ -1784,6 +1789,50 @@ class MeshNetPanel extends HTMLElement {
         </div>
       </section>
     `;
+  }
+
+  _remoteRebootCard(snapshot) {
+    const busy = this._remoteSettingsBusy != null;
+    return `
+      <details class="history-manage" id="meshnet-remote-reboot-manage">
+        <summary>Reboot this node</summary>
+        <section class="operator-card">
+          <div class="field-help">Sends one reboot command over the mesh to ${this._escape(this._remoteTargetLabel(snapshot.target))}. The node drops off for about a minute and keeps its settings. Use it when a remote radio stops answering or to clear a hung Bluetooth stack without a hike.</div>
+          <label class="confirmation-box">
+            <input id="meshnet-remote-reboot-confirm" type="checkbox"${this._remoteRebootConfirmed ? " checked" : ""}${busy ? " disabled" : ""}>
+            <span>I confirm one remote reboot of this exact node. A timeout has an unknown outcome and will not be retried.</span>
+          </label>
+          <div class="operator-actions">
+            <button class="operator-button danger" id="meshnet-remote-reboot" type="button"${busy || !this._remoteRebootConfirmed ? " disabled" : ""}>${this._remoteSettingsBusy === "reboot" ? "Sending reboot…" : "Reboot node once"}</button>
+          </div>
+        </section>
+      </details>
+    `;
+  }
+
+  _remoteRebootRequest(snapshot) {
+    if (!snapshot || typeof snapshot !== "object") return null;
+    if (!this._validOperatorGatewayId(snapshot.gateway_id)) return null;
+    if (!/^![0-9a-f]{8}$/.test(String(snapshot.target_node || ""))) return null;
+    return {
+      type: "meshnet/remote_admin/reboot",
+      gateway_id: snapshot.gateway_id,
+      target_node: snapshot.target_node,
+      confirm_remote: true,
+    };
+  }
+
+  _validateRemoteRebootResponse(response, snapshot) {
+    if (
+      !response
+      || typeof response !== "object"
+      || Array.isArray(response)
+      || response.schema_version !== 1
+      || !["acknowledged", "unconfirmed"].includes(response.status)
+      || response.gateway_id !== snapshot.gateway_id
+      || response.target_node !== snapshot.target_node
+    ) throw { name: "PanelSchemaError", code: "invalid_format" };
+    return { status: response.status };
   }
 
   _remoteSettingsStatusClass() {
@@ -2063,6 +2112,8 @@ class MeshNetPanel extends HTMLElement {
       "meshnet-remote-preview",
       "meshnet-remote-confirm",
       "meshnet-remote-apply",
+      "meshnet-remote-reboot-confirm",
+      "meshnet-remote-reboot",
       "meshnet-controller-key-copy",
       "meshnet-traceroute-gateway",
       "meshnet-traceroute-target",
@@ -4237,6 +4288,25 @@ class MeshNetPanel extends HTMLElement {
         }
       });
     }
+    const remoteRebootConfirm = this.querySelector("#meshnet-remote-reboot-confirm");
+    const remoteReboot = this.querySelector("#meshnet-remote-reboot");
+    if (remoteRebootConfirm) {
+      remoteRebootConfirm.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
+      remoteRebootConfirm.addEventListener("change", () => {
+        this._remoteRebootConfirmed = remoteRebootConfirm.checked === true;
+        if (remoteReboot) {
+          remoteReboot.disabled = !this._remoteRebootConfirmed || this._remoteSettingsBusy != null;
+        }
+      });
+    }
+    if (remoteReboot) {
+      remoteReboot.addEventListener("focusout", (event) => this._handlePollFocusOut(event));
+      remoteReboot.addEventListener("click", () => {
+        this._safeStep("remote_control_event", "binding", () => {
+          void this._rebootRemoteNode();
+        });
+      });
+    }
     if (remoteApply) {
       remoteApply.addEventListener("click", () => {
         this._safeStep(
@@ -4364,6 +4434,7 @@ class MeshNetPanel extends HTMLElement {
     this._remoteSettingsDraft = {};
     this._remoteSettingsPreview = null;
     this._remoteSettingsConfirmed = false;
+    this._remoteRebootConfirmed = false;
     this._remoteSettingsStatus = null;
     this._remoteSettingsBusy = null;
   }
@@ -4380,6 +4451,7 @@ class MeshNetPanel extends HTMLElement {
     }
     this._remoteSettingsPreview = null;
     this._remoteSettingsConfirmed = false;
+    this._remoteRebootConfirmed = false;
     this._remoteSettingsStatus = Object.keys(this._remoteSettingsDraft).length
       ? { kind: "warn", text: "Draft changed. Preview it before any remote write." }
       : null;
@@ -4506,6 +4578,7 @@ class MeshNetPanel extends HTMLElement {
     this._remoteSettingsDraft = {};
     this._remoteSettingsPreview = null;
     this._remoteSettingsConfirmed = false;
+    this._remoteRebootConfirmed = false;
     this._remoteSettingsBusy = "get";
     this._remoteSettingsStatus = { kind: "warn", text: "Loading remote settings with one read-only request…" };
     this._safeRender("render");
@@ -4532,6 +4605,7 @@ class MeshNetPanel extends HTMLElement {
       this._remoteSettingsDraft = {};
       this._remoteSettingsPreview = null;
       this._remoteSettingsConfirmed = false;
+      this._remoteRebootConfirmed = false;
       this._recordFailure(
         "remote_settings_get",
         this._safeErrorCode(error) === "timeout" ? "timeout" : this._safeErrorType(error) === "PanelSchemaError" ? "schema" : "websocket",
@@ -4565,6 +4639,7 @@ class MeshNetPanel extends HTMLElement {
       this._remoteSettingsDraft = {};
       this._remoteSettingsPreview = null;
       this._remoteSettingsConfirmed = false;
+      this._remoteRebootConfirmed = false;
       this._recordFailure("remote_settings_preview", "validation", error);
       this._remoteSettingsStatus = { kind: "bad", text: "The remote settings draft was invalid and has been cleared." };
       this._safeRender("render");
@@ -4574,6 +4649,7 @@ class MeshNetPanel extends HTMLElement {
     this._remoteSettingsBusy = "preview";
     this._remoteSettingsPreview = null;
     this._remoteSettingsConfirmed = false;
+    this._remoteRebootConfirmed = false;
     this._remoteSettingsStatus = { kind: "warn", text: "Preparing a value-free remote write preview…" };
     this._safeRender("render");
     try {
@@ -4606,6 +4682,7 @@ class MeshNetPanel extends HTMLElement {
       this._remoteSettingsDraft = {};
       this._remoteSettingsPreview = null;
       this._remoteSettingsConfirmed = false;
+      this._remoteRebootConfirmed = false;
       this._recordFailure(
         "remote_settings_preview",
         this._safeErrorCode(error) === "timeout" ? "timeout" : this._safeErrorType(error) === "PanelSchemaError" ? "schema" : "websocket",
@@ -4660,6 +4737,7 @@ class MeshNetPanel extends HTMLElement {
       this._remoteSettingsDraft = {};
       this._remoteSettingsPreview = null;
       this._remoteSettingsConfirmed = false;
+      this._remoteRebootConfirmed = false;
       this._remoteSettingsStatus = applied.status === "verified"
         ? { kind: "good", text: "Remote settings applied and verified." }
         : { kind: "warn", text: "Remote write completed, but readback did not verify every setting. Inspect the node locally before another write." };
@@ -4673,6 +4751,7 @@ class MeshNetPanel extends HTMLElement {
       this._remoteSettingsDraft = {};
       this._remoteSettingsPreview = null;
       this._remoteSettingsConfirmed = false;
+      this._remoteRebootConfirmed = false;
       this._recordFailure(
         "remote_settings_apply",
         this._safeErrorCode(error) === "timeout" ? "timeout" : this._safeErrorType(error) === "PanelSchemaError" ? "schema" : "websocket",
@@ -4682,6 +4761,53 @@ class MeshNetPanel extends HTMLElement {
         kind: "warn",
         text: this._remoteAdminErrorText(error, "apply"),
       };
+    } finally {
+      if (generation === this._remoteRequestGeneration) {
+        this._remoteSettingsBusy = null;
+        this._safeRender("render");
+      }
+    }
+  }
+
+  async _rebootRemoteNode() {
+    const snapshot = this._remoteSettingsSnapshot;
+    if (this._remoteSettingsBusy != null || !snapshot) return;
+    if (this._remoteRebootConfirmed !== true) {
+      this._remoteSettingsStatus = { kind: "bad", text: "Confirm the one remote reboot before sending it." };
+      this._safeRender("render");
+      return;
+    }
+    const request = this._remoteRebootRequest(snapshot);
+    if (!request) {
+      this._remoteSettingsStatus = { kind: "bad", text: "Reload the target before sending a reboot." };
+      this._safeRender("render");
+      return;
+    }
+    const generation = this._remoteRequestGeneration;
+    this._remoteSettingsBusy = "reboot";
+    this._remoteSettingsStatus = { kind: "warn", text: "Sending one reboot command over the mesh…" };
+    this._safeRender("render");
+    try {
+      const response = await this._withTimeout(this._hass.callWS(request), 130000);
+      if (generation !== this._remoteRequestGeneration || this._remoteSettingsSnapshot !== snapshot) return;
+      const outcome = this._validateRemoteRebootResponse(response, snapshot);
+      this._remoteRebootConfirmed = false;
+      this._remoteSettingsDraft = {};
+      this._remoteSettingsPreview = null;
+      this._remoteSettingsConfirmed = false;
+      this._remoteSettingsStatus = outcome.status === "acknowledged"
+        ? { kind: "good", text: "The node acknowledged the reboot. Load it again in a minute or two." }
+        : { kind: "warn", text: "The reboot command was sent once but not acknowledged. Wait a few minutes and load the node again; do not repeat it blindly." };
+      this._markOperationSuccess("remote_reboot");
+    } catch (error) {
+      if (generation !== this._remoteRequestGeneration || this._remoteSettingsSnapshot !== snapshot) return;
+      this._remoteRebootConfirmed = false;
+      this._recordFailure(
+        "remote_reboot",
+        this._safeErrorCode(error) === "timeout" ? "timeout" : this._safeErrorType(error) === "PanelSchemaError" ? "schema" : "websocket",
+        error,
+      );
+      this._remoteSettingsStatus = { kind: "warn", text: this._remoteAdminErrorText(error, "reboot") };
     } finally {
       if (generation === this._remoteRequestGeneration) {
         this._remoteSettingsBusy = null;
@@ -4736,6 +4862,9 @@ class MeshNetPanel extends HTMLElement {
     }
     if (phase === "apply") {
       return "The remote write outcome is unknown. Do not repeat it blindly; reload and inspect the node first.";
+    }
+    if (phase === "reboot") {
+      return "The reboot outcome is unknown. Wait a few minutes and load the node again before sending another.";
     }
     return "Remote settings could not be loaded. Verify the gateway and target, then try one explicit load.";
   }

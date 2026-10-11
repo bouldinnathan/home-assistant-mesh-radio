@@ -4889,3 +4889,159 @@ def test_entity_budget_is_inactive_without_a_registry_count(monkeypatch) -> None
         assert coordinator.node_window_diagnostics()["budget_evicted"] == 0
 
     asyncio.run(run())
+
+
+def _reboot_gateway(gateway_id: str, *, transport: str = "bluetooth", connected: bool = True, protocol: str = "meshtastic"):
+    from custom_components.meshnet.models import GatewayConfig, GatewayStatus
+
+    return SimpleNamespace(
+        config=GatewayConfig(gateway_id=gateway_id, name="Radio", protocol=protocol, transport=transport),
+        status=GatewayStatus(gateway_id=gateway_id, name="Radio", protocol=protocol, transport=transport, connected=connected),
+        async_reboot_radio=AsyncMock(return_value={"status": "acknowledged", "delay_seconds": 5, "scope": "local"}),
+    )
+
+
+def test_reboot_gateway_radio_targets_one_connected_bluetooth_gateway(monkeypatch) -> None:
+    """The service path reboots only the gateway's own radio and counts outcomes."""
+
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+        module = importlib.import_module(coordinator_class.__module__)
+        coordinator = object.__new__(coordinator_class)
+        radio = _reboot_gateway("ble-1")
+        coordinator.gateways = {"ble-1": radio}
+
+        result = await coordinator.async_reboot_gateway_radio()
+        assert result == {"schema_version": 1, "gateway_id": "ble-1", "status": "acknowledged", "delay_seconds": 5}
+        radio.async_reboot_radio.assert_awaited_once_with(delay_seconds=5)
+
+        result = await coordinator.async_reboot_gateway_radio("ble-1", delay_seconds=30)
+        assert result["delay_seconds"] == 30
+        assert radio.async_reboot_radio.await_args.kwargs == {"delay_seconds": 30}
+
+        radio.async_reboot_radio = AsyncMock(return_value={"status": "unconfirmed"})
+        assert (await coordinator.async_reboot_gateway_radio())["status"] == "unconfirmed"
+
+        for bad in (0, 301, True, "5"):
+            with pytest.raises(module.HomeAssistantError):
+                await coordinator.async_reboot_gateway_radio(delay_seconds=bad)  # type: ignore[arg-type]
+        with pytest.raises(module.HomeAssistantError):
+            await coordinator.async_reboot_gateway_radio("missing")
+
+        coordinator.gateways["serial-1"] = _reboot_gateway("serial-1", transport="serial")
+        assert (await coordinator.async_reboot_gateway_radio())["gateway_id"] == "ble-1"
+        with pytest.raises(module.HomeAssistantError):
+            await coordinator.async_reboot_gateway_radio("serial-1")
+
+        coordinator.gateways["ble-2"] = _reboot_gateway("ble-2", connected=False)
+        with pytest.raises(module.HomeAssistantError):
+            await coordinator.async_reboot_gateway_radio()
+        with pytest.raises(module.HomeAssistantError):
+            await coordinator.async_reboot_gateway_radio("ble-2")
+
+        coordinator.gateways.pop("ble-2")
+        radio.async_reboot_radio = AsyncMock(side_effect=RuntimeError("bluetooth write failed at AA:BB"))
+        with pytest.raises(module.HomeAssistantError) as failure:
+            await coordinator.async_reboot_gateway_radio()
+        assert "AA:BB" not in str(failure.value)
+
+        coordinator._radio_operations_accepting = False
+        with pytest.raises(module.HomeAssistantError):
+            await coordinator.async_reboot_gateway_radio()
+
+        diagnostics = coordinator.radio_reboot_diagnostics()
+        assert diagnostics["requests"] == 14
+        assert diagnostics["acknowledged"] == 2
+        assert diagnostics["unconfirmed"] == 2
+        assert diagnostics["failed"] == 1
+        assert diagnostics["rejected"] == 9
+        assert diagnostics["remote_requests"] == 0
+
+    asyncio.run(run())
+
+
+def test_remote_reboot_counts_outcomes_and_delegates_to_the_manager(monkeypatch) -> None:
+    async def run() -> None:
+        coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+        coordinator = object.__new__(coordinator_class)
+        coordinator.remote_admin = SimpleNamespace(
+            async_reboot=AsyncMock(return_value={"schema_version": 1, "status": "acknowledged"})
+        )
+        result = await coordinator.async_remote_reboot(gateway_id="g", target_node="!1234abcd", confirm_remote=True)
+        assert result["status"] == "acknowledged"
+        coordinator.remote_admin.async_reboot.assert_awaited_once_with("g", "!1234abcd", confirm_remote=True)
+        coordinator.remote_admin.async_reboot = AsyncMock(side_effect=RuntimeError("nope"))
+        with pytest.raises(RuntimeError):
+            await coordinator.async_remote_reboot(gateway_id="g", target_node="!1234abcd", confirm_remote=True)
+        diagnostics = coordinator.radio_reboot_diagnostics()
+        assert diagnostics["remote_requests"] == 2
+        assert diagnostics["remote_acknowledged"] == 1
+        assert diagnostics["remote_failed"] == 1
+
+    asyncio.run(run())
+
+
+def test_gateway_start_repair_text_tells_the_user_what_to_do(monkeypatch) -> None:
+    """The repair separates an unreachable radio from one that refuses connections."""
+    coordinator_class = _load_coordinator_without_home_assistant(monkeypatch)
+    coordinator = object.__new__(coordinator_class)
+    coordinator.gateways = {}
+    coordinator._gateway_configs = []
+
+    def gateway(context):
+        return SimpleNamespace(
+            config=SimpleNamespace(gateway_id="secret-gateway-id"),
+            start_failure_context=lambda: context,
+        )
+
+    error = RuntimeError("Bluetooth connect to AA:BB:CC timed out")
+    refusing = coordinator._gateway_start_failure_message(
+        gateway(
+            {
+                "transport": "bluetooth",
+                "phase": "bluetooth_connecting",
+                "error_subtype": "TimeoutError",
+                "resolution_result": "matched_verified_local_adapter",
+                "adapter_validation": "passed",
+            }
+        ),
+        error,
+    )
+    assert refusing.startswith("Gateway adapter unknown failed to start (bluetooth; RuntimeError).")
+    assert "advertising, so it is powered and in range" in refusing
+    assert "reset button or power-cycle it" in refusing
+    assert "secret-gateway-id" not in refusing
+    assert "AA:BB:CC" not in refusing
+
+    absent = coordinator._gateway_start_failure_message(
+        gateway({"transport": "bluetooth", "phase": "bluetooth_resolving_device", "adapter_validation": "passed"}),
+        error,
+    )
+    assert "not advertising" in absent
+    assert "powered off, out of battery, out of range" in absent
+
+    stale = coordinator._gateway_start_failure_message(
+        gateway({"transport": "bluetooth", "phase": "bluetooth_requesting_configuration", "adapter_validation": "passed"}),
+        error,
+    )
+    assert "never finished its configuration exchange" in stale
+    assert "Remove gateway with bond removal" in stale
+
+    host = coordinator._gateway_start_failure_message(
+        gateway({"transport": "bluetooth", "phase": "validating_bluetooth_adapter", "adapter_validation": "failed"}),
+        error,
+    )
+    assert "saved Bluetooth adapter on the Home Assistant host" in host
+
+    serial = coordinator._gateway_start_failure_message(gateway({"transport": "serial", "phase": "constructing_interface"}), error)
+    assert "/dev/serial/by-id" in serial
+
+    plain = coordinator._gateway_start_failure_message(
+        SimpleNamespace(config=SimpleNamespace(gateway_id="meshcore")), error
+    )
+    assert plain == "Gateway adapter unknown failed to start (bluetooth; RuntimeError)."
+
+    broken = coordinator._gateway_start_failure_message(
+        SimpleNamespace(config=SimpleNamespace(gateway_id="x"), start_failure_context=lambda: 1 / 0), error
+    )
+    assert broken == plain

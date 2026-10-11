@@ -2824,3 +2824,64 @@ def test_history_deletion_is_hidden_typed_and_server_verified() -> None:
   assert.ok(busy.includes('id="meshnet-history-confirm-text" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" value="permanently delete this data" disabled'));
         """
     )
+
+
+def test_remote_reboot_is_collapsed_confirmed_and_validated() -> None:
+    """Remote reboot hides behind a disclosure, needs a confirmation, and checks replies."""
+    source = _source()
+    assert '<details class="history-manage" id="meshnet-remote-reboot-manage">' in source
+    assert 'id="meshnet-remote-reboot-confirm" type="checkbox"' in source
+    assert 'id="meshnet-remote-reboot" type="button"' in source
+    assert 'type: "meshnet/remote_admin/reboot"' in source
+    assert "Reboot node once" in source
+    # The card only renders after a successful load proved admin access.
+    panel_start = source.index("  _remoteAdminPanel(nodes, gateways) {")
+    panel_end = source.index("  _remoteTargetLabel(target) {")
+    panel = source[panel_start:panel_end]
+    assert panel.index("${snapshotMatches ? `") < panel.index("${this._remoteRebootCard(snapshot)}")
+
+    _run_panel_script(
+        r"""
+  const snapshot = { gateway_id: "ble-gateway", target_node: "!1234abcd", target: { node_id: "!1234abcd" } };
+  assert.deepEqual(panel._remoteRebootRequest(snapshot), {
+    type: "meshnet/remote_admin/reboot",
+    gateway_id: "ble-gateway",
+    target_node: "!1234abcd",
+    confirm_remote: true,
+  });
+  assert.equal(panel._remoteRebootRequest(null), null);
+  assert.equal(panel._remoteRebootRequest({ gateway_id: "", target_node: "!1234abcd" }), null);
+  assert.equal(panel._remoteRebootRequest({ gateway_id: "ble-gateway", target_node: "Remote Node" }), null);
+  assert.equal(panel._remoteRebootRequest({ gateway_id: "ble-gateway", target_node: "!1234ABCD" }), null);
+
+  assert.deepEqual(
+    panel._validateRemoteRebootResponse(
+      { schema_version: 1, status: "acknowledged", gateway_id: "ble-gateway", target_node: "!1234abcd" },
+      snapshot,
+    ),
+    { status: "acknowledged" },
+  );
+  assert.deepEqual(
+    panel._validateRemoteRebootResponse(
+      { schema_version: 1, status: "unconfirmed", gateway_id: "ble-gateway", target_node: "!1234abcd" },
+      snapshot,
+    ),
+    { status: "unconfirmed" },
+  );
+  for (const bad of [
+    null,
+    [],
+    { schema_version: 2, status: "acknowledged", gateway_id: "ble-gateway", target_node: "!1234abcd" },
+    { schema_version: 1, status: "rebooted", gateway_id: "ble-gateway", target_node: "!1234abcd" },
+    { schema_version: 1, status: "acknowledged", gateway_id: "other", target_node: "!1234abcd" },
+    { schema_version: 1, status: "acknowledged", gateway_id: "ble-gateway", target_node: "!ffffffff" },
+  ]) {
+    assert.throws(() => panel._validateRemoteRebootResponse(bad, snapshot), (error) => error.name === "PanelSchemaError");
+  }
+  assert.equal(
+    panel._remoteAdminErrorText({ code: "nope" }, "reboot"),
+    "The reboot outcome is unknown. Wait a few minutes and load the node again before sending another.",
+  );
+  assert.equal(panel._safeOperation("remote_reboot", ["remote_reboot"]), "remote_reboot");
+"""
+    )

@@ -309,6 +309,12 @@ excluded destructive operations.
 
 ### Advanced local mesh tools
 
+Version 0.12.1 adds a `meshnet.reboot_gateway_radio` action and a blueprint
+that schedules it, a confirmed **Reboot this node** control for remote nodes
+in the panel, a gateway offline notification blueprint, and gateway repairs
+that say whether the radio is unreachable or is advertising but refusing
+connections, and what to do about it.
+
 Version 0.12.0 keeps a rolling window of cached node records (`node_limit`,
 default 250, range 25 to 1000). The least recently heard records beyond the
 window are evicted together with their Home Assistant devices and entities,

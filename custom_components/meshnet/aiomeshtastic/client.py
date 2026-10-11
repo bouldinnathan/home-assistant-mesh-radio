@@ -62,6 +62,8 @@ _SETTINGS_READBACK_TIMEOUT = 70.0
 # latency can never make MeshNet use a passkey beyond the firmware lifetime.
 _REMOTE_ADMIN_SESSION_SECONDS = 150.0
 _REMOTE_ADMIN_TIMEOUT_SECONDS = 105.0
+_REBOOT_DELAY_MIN_SECONDS = 1
+_REBOOT_DELAY_MAX_SECONDS = 300
 _REMOTE_CONFIG_TYPES = (
     "SESSIONKEY_CONFIG",
     "DISPLAY_CONFIG",
@@ -361,6 +363,8 @@ class MeshtasticBluetoothClient:
         self._admin_request_count = 0
         self._admin_response_count = 0
         self._admin_timeout_count = 0
+        self._reboot_request_count = 0
+        self._last_reboot_outcome: str | None = None
         self._admin_nak_count = 0
         self._traceroute_request_count = 0
         self._traceroute_response_count = 0
@@ -983,6 +987,95 @@ class MeshtasticBluetoothClient:
             },
         }
 
+    @staticmethod
+    def _validated_reboot_delay(delay_seconds: Any) -> int:
+        if isinstance(delay_seconds, bool) or not isinstance(delay_seconds, int):
+            raise MeshtasticConfigurationError("Meshtastic reboot delay must be a whole number of seconds")
+        if not _REBOOT_DELAY_MIN_SECONDS <= delay_seconds <= _REBOOT_DELAY_MAX_SECONDS:
+            raise MeshtasticConfigurationError("Meshtastic reboot delay is outside the supported range")
+        return delay_seconds
+
+    async def async_reboot_local(self, *, delay_seconds: int = 5) -> dict[str, Any]:
+        """Send one reboot command to the physically connected radio.
+
+        The radio acknowledges and then drops Bluetooth, so a lost ACK after
+        the single write is reported as ``unconfirmed`` and never resent. The
+        supervisor reconnects on its own once the radio is back.
+        """
+        delay = self._validated_reboot_delay(delay_seconds)
+        async with self._settings_lock:
+            if not self.connected or self._connection is None:
+                raise MeshtasticNotConnectedError("Meshtastic Bluetooth is not active")
+            connection = self._connection
+            request = admin_pb2.AdminMessage()
+            request.reboot_seconds = delay
+            self._reboot_request_count += 1
+            async with suppress_sensitive_library_logs("meshtastic"):
+                async with self._send_lock:
+                    self._require_transaction_connection(connection)
+                    try:
+                        response = await self._async_send_admin_locked(request, connection=connection)
+                    except (_AdminResponseTimeout, MeshtasticConnectionError, MeshtasticCleanupError):
+                        # The command was written exactly once. A lost ACK is
+                        # an unknown outcome and is deliberately never retried.
+                        self._last_reboot_outcome = "unconfirmed"
+                        return {"status": "unconfirmed", "delay_seconds": delay, "scope": "local"}
+            self._last_reboot_outcome = "acknowledged" if response.kind == "routing" else "unconfirmed"
+            return {"status": self._last_reboot_outcome, "delay_seconds": delay, "scope": "local"}
+
+    async def async_reboot_remote(self, target_node: str, *, delay_seconds: int = 5) -> dict[str, Any]:
+        """Send one reboot command to an exact remote node over the mesh.
+
+        Requires the same key evidence and session passkey as a remote
+        settings write. The target's cached session and settings are dropped
+        because a reboot invalidates both.
+        """
+        delay = self._validated_reboot_delay(delay_seconds)
+        target_num, target, target_key = self._remote_admin_target(target_node)
+        lock = self._remote_admin_locks.setdefault(target_num, asyncio.Lock())
+        async with lock:
+            try:
+                async with asyncio.timeout(_REMOTE_ADMIN_TIMEOUT_SECONDS):
+                    session = self._remote_admin_sessions.get(target_num)
+                    if session is None or session.expires_monotonic <= time.monotonic():
+                        await self._async_request_remote_session_locked(target_num, target_key)
+                        session = self._remote_admin_sessions.get(target_num)
+                    if session is None:
+                        raise self._remote_error("remote_admin_session_rejected")
+                    connection = self._connection
+                    if connection is None:
+                        raise MeshtasticNotConnectedError("Meshtastic Bluetooth is not active")
+                    request = admin_pb2.AdminMessage()
+                    request.reboot_seconds = delay
+                    self._reboot_request_count += 1
+                    async with suppress_sensitive_library_logs("meshtastic"):
+                        async with self._send_lock:
+                            self._require_transaction_connection(connection)
+                            response = await self._async_send_admin_locked(
+                                request,
+                                connection=connection,
+                                destination=target_num,
+                                public_key=target_key,
+                                session_passkey=session.passkey,
+                                remote_operation="write",
+                            )
+            except TimeoutError:
+                self._last_reboot_outcome = "unconfirmed"
+                raise self._remote_error("remote_admin_unknown_outcome") from None
+            finally:
+                self._remote_admin_sessions.pop(target_num, None)
+                self._remote_settings.pop(target_num, None)
+        self._last_reboot_outcome = "acknowledged" if response.kind == "routing" else "unconfirmed"
+        return {
+            "status": self._last_reboot_outcome,
+            "delay_seconds": delay,
+            "scope": "remote",
+            "target": {
+                "node_id": f"!{target_num:08x}",
+                "short_name": self._safe_node_label(target, short=True),
+            },
+        }
+
     async def _async_load_remote_settings_locked(self, target_num: int, target_key: bytes) -> MeshtasticSettingsState:
         """Fetch only sections whose contents have a reviewed projection."""
         await self._async_request_remote_session_locked(target_num, target_key)
@@ -1485,6 +1578,8 @@ class MeshtasticBluetoothClient:
             "admin_request_count": self._admin_request_count,
             "admin_response_count": self._admin_response_count,
             "admin_timeout_count": self._admin_timeout_count,
+            "reboot_request_count": self._reboot_request_count,
+            "last_reboot_outcome": self._last_reboot_outcome,
             "admin_nak_count": self._admin_nak_count,
             "admin_response_waiter_count": len(self._pending_admin_responses),
             "traceroute_request_count": self._traceroute_request_count,

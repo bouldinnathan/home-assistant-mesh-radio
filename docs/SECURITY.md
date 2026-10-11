@@ -106,6 +106,17 @@ it automatically. Reload and inspect live state before deciding on any next
 write. An integration removal or HACS uninstall cannot safely infer or reverse
 an intentional change stored by radio firmware.
 
+### Radio reboots
+
+`meshnet.reboot_gateway_radio` is the only reboot an automation can trigger,
+and it reaches only the radio physically connected to a Bluetooth gateway.
+Remote node reboots are administrator-only panel operations behind an
+explicit confirmation, use the same public-key authorization and session
+passkey as remote settings writes, are sent exactly once, and are never
+retried after a timeout. Serial, TCP, and MQTT gateways cannot reboot radios,
+for the same reason they cannot write settings. Reboot counters appear in
+diagnostics without node identities.
+
 ## USB Permissions
 
 Serial devices usually belong to groups such as `dialout`, `tty`, or `uucp`.

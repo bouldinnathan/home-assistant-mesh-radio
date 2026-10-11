@@ -123,3 +123,19 @@ refresh_gateway:
       required: false
       selector:
         text:
+
+reboot_gateway_radio:
+  fields:
+    gateway_id:
+      required: false
+      selector:
+        text:
+    delay_seconds:
+      required: false
+      default: 5
+      selector:
+        number:
+          min: 1
+          max: 300
+          unit_of_measurement: s
+          mode: box

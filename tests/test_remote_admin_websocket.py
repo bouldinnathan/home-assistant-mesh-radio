@@ -17,9 +17,11 @@ from custom_components.meshnet.coordinator import (  # noqa: E402
     NeighborInfoError,
     TracerouteError,
 )
+from custom_components.meshnet.remote_admin import RemoteAdminError  # noqa: E402
 from custom_components.meshnet.websocket_api import (  # noqa: E402
     websocket_neighbor_info,
     websocket_neighbor_info_status,
+    websocket_remote_reboot,
     websocket_remote_settings_apply,
     websocket_remote_settings_get,
     websocket_remote_settings_preview,
@@ -543,5 +545,51 @@ def test_malformed_remote_preview_is_rejected_without_value_echo() -> None:
             "One or more remote settings changes are invalid",
         )
         assert sentinel not in json.dumps(connection.send_error.call_args_list, default=str)
+
+    asyncio.run(run())
+
+
+def test_remote_reboot_is_admin_only_confirmed_and_delegates_exactly() -> None:
+    coordinator = SimpleNamespace(
+        async_remote_reboot=AsyncMock(return_value={"schema_version": 1, "status": "acknowledged"}),
+    )
+    hass = _hass(coordinator)
+    message = {
+        "id": 20,
+        "type": "meshnet/remote_admin/reboot",
+        "gateway_id": "ble-gateway",
+        "target_node": "!1234abcd",
+        "confirm_remote": True,
+    }
+    non_admin = SimpleNamespace(
+        user=SimpleNamespace(is_admin=False),
+        send_result=MagicMock(),
+        send_error=MagicMock(),
+    )
+    with pytest.raises(Unauthorized):
+        websocket_remote_reboot(hass, non_admin, message)
+    coordinator.async_remote_reboot.assert_not_awaited()
+
+    async def run() -> None:
+        connection = SimpleNamespace(send_message=MagicMock(), send_error=MagicMock())
+        await websocket_remote_reboot.__wrapped__.__wrapped__(hass, connection, dict(message))
+        coordinator.async_remote_reboot.assert_awaited_once_with(
+            gateway_id="ble-gateway",
+            target_node="!1234abcd",
+            confirm_remote=True,
+        )
+        connection.send_error.assert_not_called()
+
+        coordinator.async_remote_reboot = AsyncMock(side_effect=RemoteAdminError("remote_admin_no_response"))
+        await websocket_remote_reboot.__wrapped__.__wrapped__(hass, connection, dict(message))
+        connection.send_error.assert_called_once()
+        assert connection.send_error.call_args.args[1] == "remote_admin_no_response"
+
+        connection.send_error.reset_mock()
+        coordinator.async_remote_reboot = AsyncMock(side_effect=RuntimeError("provider text !1234abcd"))
+        await websocket_remote_reboot.__wrapped__.__wrapped__(hass, connection, dict(message))
+        code, text = connection.send_error.call_args.args[1:3]
+        assert code == "remote_admin_unknown_outcome"
+        assert "!1234abcd" not in text
 
     asyncio.run(run())

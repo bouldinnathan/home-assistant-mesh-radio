@@ -22,6 +22,7 @@ _SETTINGS_PREVIEW_TYPE = "meshnet/settings/preview"
 _REMOTE_SETTINGS_GET_TYPE = "meshnet/remote_settings/get"
 _REMOTE_SETTINGS_PREVIEW_TYPE = "meshnet/remote_settings/preview"
 _REMOTE_SETTINGS_APPLY_TYPE = "meshnet/remote_settings/apply"
+_REMOTE_REBOOT_TYPE = "meshnet/remote_admin/reboot"
 _TRACEROUTE_TYPE = "meshnet/traceroute"
 _NEIGHBOR_INFO_TYPE = "meshnet/neighbor_info"
 _NEIGHBOR_INFO_STATUS_TYPE = "meshnet/neighbor_info/status"
@@ -43,6 +44,7 @@ _SENSITIVE_COMMAND_FIELDS = {
     _REMOTE_SETTINGS_GET_TYPE: frozenset({"gateway_id", "target_node"}),
     _REMOTE_SETTINGS_PREVIEW_TYPE: frozenset({"gateway_id", "target_node", "changes"}),
     _REMOTE_SETTINGS_APPLY_TYPE: frozenset({"gateway_id", "target_node"}),
+    _REMOTE_REBOOT_TYPE: frozenset({"gateway_id", "target_node"}),
     _TRACEROUTE_TYPE: frozenset({"gateway_id", "target_node"}),
     _NEIGHBOR_INFO_TYPE: frozenset({"gateway_id", "target_node"}),
     _NEIGHBOR_INFO_STATUS_TYPE: frozenset({"target_node"}),

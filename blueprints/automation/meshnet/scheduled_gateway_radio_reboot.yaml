@@ -1,0 +1,45 @@
+blueprint:
+  name: MeshNet scheduled gateway radio reboot
+  description: >-
+    Reboot the Meshtastic radio behind a MeshNet Bluetooth gateway at a fixed
+    time each day. Meshtastic firmware has no periodic reboot setting, so this
+    clears a hung Bluetooth stack before it causes an outage. The reboot is
+    skipped while the gateway is offline, because a radio that is not
+    connected cannot receive the command. The gateway reconnects on its own
+    about a minute after the reboot.
+  domain: automation
+  source_url: https://github.com/bouldinnathan/home-assistant-mesh-radio/blob/main/blueprints/automation/meshnet/scheduled_gateway_radio_reboot.yaml
+  input:
+    reboot_time:
+      name: Reboot time
+      description: Pick a quiet time; the gateway is unreachable for about a minute.
+      default: "04:00:00"
+      selector:
+        time: {}
+    gateway_online:
+      name: Gateway online sensor
+      description: The MeshNet gateway's Online binary sensor. The reboot only runs while it is on.
+      selector:
+        entity:
+          filter:
+            - integration: meshnet
+              domain: binary_sensor
+    gateway_id:
+      name: Gateway ID (optional)
+      description: Leave empty when only one Meshtastic Bluetooth gateway is configured.
+      default: ""
+      selector:
+        text: {}
+mode: single
+triggers:
+  - trigger: time
+    at: !input reboot_time
+conditions:
+  - condition: state
+    entity_id: !input gateway_online
+    state: "on"
+actions:
+  - action: meshnet.reboot_gateway_radio
+    data:
+      gateway_id: !input gateway_id
+      delay_seconds: 5
