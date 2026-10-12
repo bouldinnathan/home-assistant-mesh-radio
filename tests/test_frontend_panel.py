@@ -2648,7 +2648,8 @@ def test_global_failure_handlers_are_safe_and_removed_on_disconnect() -> None:
     },
   };
   panel.connectedCallback();
-  assert.equal(listeners.size, 2);
+  assert.equal(listeners.size, 3);
+  assert.deepEqual([...listeners.keys()].sort(), ["error", "resize", "unhandledrejection"]);
 
   const privateError = new Error("private URL and coordinates");
   privateError.name = "PrivateNodeClass";

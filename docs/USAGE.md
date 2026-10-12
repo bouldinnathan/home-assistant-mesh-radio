@@ -30,14 +30,19 @@ The panel shows:
 - A **Gateway settings** tab for the physically connected radio and a
   **Remote nodes** tab for administering other Meshtastic nodes over the mesh
 
-On the main **Mesh** view, drag a side-card handle to reorder cards or use its
-accessible earlier/later buttons. Resize with the corner handle or its keyboard
-arrow controls. Card order and size persist in this browser across navigation
-and reloads. The versioned, strictly validated browser record contains only the
-fixed card IDs and bounded integer dimensions—never messages, nodes, gateways,
-drafts, settings, credentials, or keys. MeshNet does not send this layout to
-Home Assistant or a radio, and a storage failure simply leaves it in memory.
-Press **Reset** to restore defaults and delete the saved record. If you want no
+The main **Mesh** view is one dense grid of cards, and the topology graph and
+the overview tiles are cards like the others. Drag any card by its handle onto
+another card, or use its accessible earlier/later buttons, to place it
+anywhere: beside the graph, under it, or above it. Resize with the corner
+handle or its keyboard arrow controls; cards snap to grid cells, smaller cards
+fill the space beside taller ones, and the graph scales to fill a resized card.
+Card order and size persist in this browser across navigation and reloads. The
+versioned, strictly validated browser record contains only the fixed card IDs
+and bounded integer dimensions—never messages, nodes, gateways, drafts,
+settings, credentials, or keys. A card added by a newer release joins a saved
+layout at its default position. MeshNet does not send this layout to Home
+Assistant or a radio, and a storage failure simply leaves it in memory. Press
+**Reset** to restore defaults and delete the saved record. If you want no
 browser layout record after uninstall, press **Reset** before removing MeshNet.
 
 For the simplest test, open the sidebar panel, leave **Delivery** on

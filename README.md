@@ -315,7 +315,10 @@ as the tab opens, read locally with no mesh traffic, so the key can be added to
 a remote node before the first load. Both settings editors now present each
 section as a collapsed panel with its editable and read-only counts and a
 **Changed** badge, grouped under Radio configuration, Channels, Modules, and
-Device information, with **Expand all** and **Collapse all** controls.
+Device information, with **Expand all** and **Collapse all** controls. The
+Mesh view becomes one dense grid in which the topology graph and the overview
+tiles are cards like the others, so any card can be placed beside, under, or
+above the graph and smaller cards fill the space next to taller ones.
 
 Version 0.13.1 adds a **?** tooltip to every setting in both editors that
 explains what it does, its unit, the allowed range, and why a field is

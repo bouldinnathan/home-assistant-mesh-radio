@@ -26,7 +26,8 @@ def test_mesh_card_layout_is_persistent_bounded_and_presentation_only() -> None:
     assert "data-mesh-card" in source
     assert "data-mesh-drag-handle" in source
     assert "data-mesh-resize-handle" in source
-    assert "max-width: min(${MESH_CARD_MAX_WIDTH}px, 48vw" in source
+    assert "grid-auto-flow: row dense" in source
+    assert "MESH_CARD_MAX_WIDTH = 1600" in source
     assert ".mesh-card-resize-handle { display: none; }" in source
     assert "Layout is saved only in this browser; Reset removes it." in source
 
@@ -49,6 +50,8 @@ def test_mesh_card_layout_is_persistent_bounded_and_presentation_only() -> None:
 
   assert.equal(typeof panel._orderedMeshCards, "function");
   const requiredCards = [
+    "topology",
+    "overview",
     "send-message",
     "gateways",
     "traceroute",
@@ -101,7 +104,7 @@ def test_mesh_card_layout_is_persistent_bounded_and_presentation_only() -> None:
   }
   persistentPanel._setMeshCardSize("nodes", 1_000_000, 1_000_000);
   const clamped = persistentPanel._meshCardSizes.get("nodes");
-  assert.ok(Number.isSafeInteger(clamped.width) && clamped.width <= 720);
+  assert.ok(Number.isSafeInteger(clamped.width) && clamped.width <= 1600);
   assert.ok(Number.isSafeInteger(clamped.height) && clamped.height <= 1200);
 
   const beforeInvalidMove = [...persistentPanel._meshCardOrder];
@@ -165,7 +168,7 @@ def test_mesh_card_layout_storage_rejects_malformed_and_denied_state() -> None:
         r"""
   const key = "meshnet.frontend.mesh-workspace-layout.v1";
   const defaults = [
-    "send-message", "gateways", "traceroute", "neighbor-info",
+    "topology", "overview", "send-message", "gateways", "traceroute", "neighbor-info",
     "panel-diagnostics", "nodes", "recent-messages", "rf-heat",
   ];
   let value = null;
@@ -179,7 +182,7 @@ def test_mesh_card_layout_storage_rejects_malformed_and_denied_state() -> None:
     "{not-json",
     "x".repeat(4097),
     JSON.stringify({ schema_version: 2, order: defaults, sizes: {} }),
-    JSON.stringify({ schema_version: 1, order: defaults.slice(1), sizes: {} }),
+    JSON.stringify({ schema_version: 1, order: [...defaults, "nodes"], sizes: {} }),
     JSON.stringify({ schema_version: 1, order: [...defaults.slice(0, -1), "unknown"], sizes: {} }),
     JSON.stringify({ schema_version: 1, order: defaults, sizes: { nodes: { width: 279, height: 200 } } }),
     JSON.stringify({ schema_version: 1, order: defaults, sizes: { nodes: { width: 400, height: 200, secret: "x" } } }),
@@ -193,6 +196,17 @@ def test_mesh_card_layout_storage_rejects_malformed_and_denied_state() -> None:
     assert.equal(value, null, "invalid state is removed instead of partially recovered");
   }
   assert.equal(removes, invalid.length);
+
+  // A layout saved before a card existed keeps its order; the new card joins
+  // at its default position instead of resetting the arrangement.
+  value = JSON.stringify({ schema_version: 1, order: ["nodes", "gateways", "rf-heat"], sizes: { nodes: { width: 400, height: 300 } } });
+  const merged = new PanelClass();
+  assert.deepEqual(merged._meshCardOrder, [
+    "topology", "overview", "send-message", "nodes", "traceroute", "neighbor-info",
+    "panel-diagnostics", "gateways", "recent-messages", "rf-heat",
+  ]);
+  assert.deepEqual(merged._meshCardSizes.get("nodes"), { width: 400, height: 300 });
+  assert.equal(removes, invalid.length, "a mergeable layout is not removed");
 
   Object.defineProperty(window, "localStorage", {
     configurable: true,
@@ -440,8 +454,8 @@ def test_pointer_resize_clamps_owns_pointer_and_removes_every_listener() -> None
   handlers.get("pointermove")({ pointerId: 8, clientX: 1000, clientY: 1000 });
   assert.equal(panel._meshCardSizes.has("nodes"), false, "a different pointer cannot resize");
   handlers.get("pointermove")({ pointerId: 7, clientX: 1_000_100, clientY: 1_000_200 });
-  assert.deepEqual(panel._meshCardSizes.get("nodes"), { width: 720, height: 1200 });
-  assert.deepEqual(card.style, { width: "720px", height: "1200px" });
+  assert.deepEqual(panel._meshCardSizes.get("nodes"), { width: 1600, height: 1200 });
+  assert.deepEqual(card.style, { gridColumn: "span 8", gridRow: "span 17" });
 
   handlers.get("pointerup")({ pointerId: 8 });
   assert.ok(panel._meshLayoutInteraction, "a different pointer cannot finish the gesture");
@@ -509,11 +523,13 @@ def test_drag_order_keyboard_order_and_reset_remain_allowlisted() -> None:
     _run_panel_script(
         r"""
   const defaults = [...panel._meshCardOrder];
-  assert.equal(panel._moveMeshCard("send-message", "earlier"), false);
+  assert.equal(panel._moveMeshCard("topology", "earlier"), false);
+  assert.equal(panel._moveMeshCard("topology", "later"), true);
+  assert.deepEqual(panel._meshCardOrder.slice(0, 2), ["overview", "topology"]);
   assert.equal(panel._moveMeshCard("send-message", "later"), true);
-  assert.deepEqual(panel._meshCardOrder.slice(0, 2), ["gateways", "send-message"]);
+  assert.deepEqual(panel._meshCardOrder.slice(2, 4), ["gateways", "send-message"]);
   assert.equal(panel._moveMeshCardTo("rf-heat", "gateways", false), true);
-  assert.deepEqual(panel._meshCardOrder.slice(0, 2), ["rf-heat", "gateways"]);
+  assert.deepEqual(panel._meshCardOrder.slice(2, 4), ["rf-heat", "gateways"]);
   assert.equal(panel._moveMeshCardTo("send-message", "neighbor-info", true), true);
   assert.equal(
     panel._meshCardOrder.indexOf("send-message"),
@@ -657,5 +673,106 @@ def test_operator_candidates_reject_duplicate_alias_and_invalid_identity() -> No
     "meshtastic:!00000000",
     "meshtastic:!ffffffff",
   ]) assert.doesNotMatch(html, new RegExp(rejected.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
+"""
+    )
+
+
+def test_mesh_grid_places_graph_and_overview_as_cards_that_snap_to_cells() -> None:
+    """The graph is a card in one dense grid, so any card can sit beside or under it."""
+    source = PANEL.read_text(encoding="utf-8")
+    assert 'data-mesh-card="topology"' in source
+    assert 'data-mesh-card="overview"' in source
+    assert "<aside" not in source[source.index("  _render() {") : source.index("  _remoteGatewayCandidates(")]
+    _run_panel_script(
+        r"""
+  panel.querySelectorAll = () => [];
+  panel.querySelector = () => null;
+  panel.contains = () => false;
+  panel._snapshot = { nodes: {}, gateways: {}, recent_messages: [] };
+  panel._activeView = "mesh";
+  panel._safeRender("render");
+  const html = panel.innerHTML;
+  const markup = html.slice(html.indexOf("</style>"));
+  const cards = [...markup.matchAll(/data-mesh-card="([a-z-]+)"/g)].map((match) => match[1]);
+  assert.deepEqual(cards, [
+    "topology", "overview", "send-message", "gateways", "traceroute", "neighbor-info",
+    "panel-diagnostics", "nodes", "recent-messages", "rf-heat",
+  ]);
+  assert.equal(markup.includes("<main"), false);
+  assert.equal(markup.includes("<aside"), false);
+  const topologyAt = markup.indexOf('data-mesh-card="topology"');
+  const graphAt = markup.indexOf('id="meshnet-topology-graph"');
+  const overviewAt = markup.indexOf('data-mesh-card="overview"');
+  assert.ok(topologyAt < graphAt && graphAt < overviewAt, "the graph renders inside the topology card");
+  assert.ok(markup.indexOf("Cached health") > overviewAt);
+  assert.ok(markup.indexOf('id="meshnet-layout-reset"') < markup.indexOf('id="meshnet-mesh-cards"'));
+  assert.ok(html.includes("grid-template-columns: repeat(auto-fill, minmax(180px, 1fr))"));
+  assert.ok(html.includes("grid-auto-rows: 60px"));
+
+  // Spans come from stored pixel sizes or, for unsized cards, measured content.
+  const fake = (id, extra = {}) => ({
+    style: {},
+    classes: new Set(),
+    getAttribute(name) { return name === "data-mesh-card" ? id : null; },
+    classList: {
+      toggle: (name, on) => { if (on) extra.classes.add(name); else extra.classes.delete(name); },
+    },
+    ...extra,
+  });
+  const topology = fake("topology", { classes: new Set() });
+  const overview = fake("overview", { scrollHeight: 300, classes: new Set() });
+  const nodes = fake("nodes", { scrollHeight: 900, classes: new Set() });
+  panel._fitMeshCards([["topology", topology], ["overview", overview], ["nodes", nodes]], 7);
+  assert.deepEqual(topology.style, { gridColumn: "span 5", gridRow: "span 10" });
+  assert.deepEqual(overview.style, { gridColumn: "span 2", gridRow: "span 5" });
+  assert.deepEqual(nodes.style, { gridColumn: "span 2", gridRow: "span 13" });
+  assert.equal(topology.classes.has("mesh-card-sized"), false);
+
+  panel._fitMeshCards([["topology", topology]], 2);
+  assert.equal(topology.style.gridColumn, "span 2", "the graph never exceeds the column count");
+  panel._fitMeshCards([["topology", topology]], null);
+  assert.equal(topology.style.gridColumn, "span 4", "an unknown width keeps a usable default");
+
+  panel._meshCardSizes.set("nodes", { width: 900, height: 500 });
+  panel._fitMeshCards([["nodes", nodes]], 4);
+  assert.deepEqual(nodes.style, { gridColumn: "span 4", gridRow: "span 8" });
+  assert.ok(nodes.classes.has("mesh-card-sized"));
+  panel._meshCardSizes.delete("nodes");
+  panel._fitMeshCards([["nodes", nodes]], 4);
+  assert.equal(nodes.classes.has("mesh-card-sized"), false);
+  panel._fitMeshCards([["unknown", fake("unknown", { classes: new Set() })]], 4);
+
+  assert.equal(panel._meshGridColumns({ clientWidth: 1400 }), 7);
+  assert.equal(panel._meshGridColumns({ clientWidth: 150 }), 1);
+  assert.equal(panel._meshGridColumns({ clientWidth: 0 }), null);
+  assert.equal(panel._meshGridColumns({}), null);
+  assert.equal(panel._meshGridColumns(null), null);
+
+  // Dropping on the top-left half inserts before, the bottom-right half after.
+  const rect = { left: 0, top: 0, width: 200, height: 100 };
+  assert.equal(panel._meshDropAfter({ clientX: 150, clientY: 20 }, rect), false);
+  assert.equal(panel._meshDropAfter({ clientX: 150, clientY: 60 }, rect), true);
+  assert.equal(panel._meshDropAfter({ clientX: 20, clientY: 90 }, rect), true);
+  assert.equal(panel._meshDropAfter({ clientX: 20, clientY: 20 }, rect), false);
+
+  // A viewport resize refits once per frame and only while the Mesh view shows.
+  let frames = 0;
+  let applied = 0;
+  const resizeHandlers = new Map();
+  window.addEventListener = (type, callback) => resizeHandlers.set(type, callback);
+  window.removeEventListener = (type) => resizeHandlers.delete(type);
+  window.requestAnimationFrame = (callback) => { frames += 1; callback(); return frames; };
+  panel._applyMeshCardOrder = () => { applied += 1; };
+  panel._connected = true;
+  panel._attachMeshResizeHandler();
+  assert.equal(typeof resizeHandlers.get("resize"), "function");
+  resizeHandlers.get("resize")();
+  assert.equal(applied, 1);
+  panel._activeView = "settings";
+  resizeHandlers.get("resize")();
+  assert.equal(applied, 1, "other views have no card grid to refit");
+  panel._detachMeshResizeHandler();
+  assert.equal(resizeHandlers.size, 0);
+  assert.equal(panel._windowResizeHandler, null);
 """
     )

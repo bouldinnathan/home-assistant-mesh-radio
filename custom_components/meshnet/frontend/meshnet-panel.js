@@ -1,4 +1,6 @@
 const MESH_CARD_IDS = Object.freeze([
+  "topology",
+  "overview",
   "send-message",
   "gateways",
   "traceroute",
@@ -9,9 +11,16 @@ const MESH_CARD_IDS = Object.freeze([
   "rf-heat",
 ]);
 const MESH_CARD_MIN_WIDTH = 280;
-const MESH_CARD_MAX_WIDTH = 720;
+const MESH_CARD_MAX_WIDTH = 1600;
 const MESH_CARD_MIN_HEIGHT = 120;
 const MESH_CARD_MAX_HEIGHT = 1200;
+// The Mesh view is a dense grid of fixed-size cells, like a dashboard. A card
+// occupies whole columns and rows; stored pixel sizes are snapped to cells.
+const MESH_GRID_COLUMN = 180;
+const MESH_GRID_ROW = 60;
+const MESH_GRID_GAP = 12;
+const MESH_CARD_DEFAULT_COLUMNS = 2;
+const MESH_CARD_MIN_ROWS = 2;
 const MESH_LAYOUT_SCHEMA_VERSION = 1;
 const MESH_LAYOUT_STORAGE_KEY = "meshnet.frontend.mesh-workspace-layout.v1";
 const MESH_LAYOUT_STORAGE_MAX_LENGTH = 4096;
@@ -80,6 +89,8 @@ class MeshNetPanel extends HTMLElement {
     this._meshCardSizes = new Map();
     this._meshLayoutInteraction = null;
     this._meshLayoutCleanup = null;
+    this._windowResizeHandler = null;
+    this._meshRefitFrame = null;
     this._loadMeshCardLayout();
     this._remoteGatewayId = "";
     this._remoteTargetNode = "";
@@ -145,6 +156,7 @@ class MeshNetPanel extends HTMLElement {
   connectedCallback() {
     this._connected = true;
     this._attachWindowFailureHandlers();
+    this._attachMeshResizeHandler();
     this._startPolling();
     this._drainPanelReports();
     this._maybeLoadSettings();
@@ -153,6 +165,7 @@ class MeshNetPanel extends HTMLElement {
   disconnectedCallback() {
     this._connected = false;
     this._detachWindowFailureHandlers();
+    this._detachMeshResizeHandler();
     this._loaded = false;
     this._pollRenderPending = false;
     this._focusFlushGeneration += 1;
@@ -872,6 +885,48 @@ class MeshNetPanel extends HTMLElement {
     }
   }
 
+  _attachMeshResizeHandler() {
+    if (
+      this._windowResizeHandler
+      || typeof window === "undefined"
+      || typeof window.addEventListener !== "function"
+    ) return;
+    const handler = () => {
+      if (!this._connected || this._activeView !== "mesh" || this._meshLayoutInteraction) return;
+      this._scheduleMeshLayoutRefit();
+    };
+    try {
+      window.addEventListener("resize", handler);
+      this._windowResizeHandler = handler;
+    } catch (error) {
+      this._recordFailure("event_handler", "lifecycle", error);
+    }
+  }
+
+  _detachMeshResizeHandler() {
+    const handler = this._windowResizeHandler;
+    this._windowResizeHandler = null;
+    if (!handler || typeof window === "undefined" || typeof window.removeEventListener !== "function") return;
+    try {
+      window.removeEventListener("resize", handler);
+    } catch (error) {
+      this._recordFailure("event_handler", "lifecycle", error);
+    }
+  }
+
+  _scheduleMeshLayoutRefit() {
+    if (this._meshRefitFrame != null) return;
+    const schedule = typeof window !== "undefined" && typeof window.requestAnimationFrame === "function"
+      ? (callback) => window.requestAnimationFrame(callback)
+      : (callback) => { callback(); return null; };
+    const run = () => {
+      this._meshRefitFrame = null;
+      this._safeStep("bind_mesh_layout", "binding", () => this._applyMeshCardOrder());
+    };
+    this._meshRefitFrame = schedule(run);
+    if (this._meshRefitFrame == null) this._meshRefitFrame = null;
+  }
+
   _render() {
     const composerFocus = this._composerFocusState() || this._settingsFocusState();
     const meshCardScroll = this._captureMeshCardScrollState();
@@ -941,9 +996,6 @@ class MeshNetPanel extends HTMLElement {
           font-family: var(--paper-font-body1_-_font-family);
         }
         .wrap {
-          display: grid;
-          grid-template-columns: minmax(0, 1fr) max-content;
-          gap: 16px;
           padding: 16px;
           box-sizing: border-box;
         }
@@ -991,9 +1043,8 @@ class MeshNetPanel extends HTMLElement {
         }
         .stats {
           display: grid;
-          grid-template-columns: repeat(4, minmax(120px, 1fr));
+          grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
           gap: 8px;
-          margin-bottom: 12px;
         }
         .stat, .panel {
           border: 1px solid var(--divider-color);
@@ -1054,19 +1105,40 @@ class MeshNetPanel extends HTMLElement {
         }
         .side {
           display: grid;
-          align-content: start;
-          justify-items: start;
-          gap: 12px;
+          grid-template-columns: repeat(auto-fill, minmax(${MESH_GRID_COLUMN}px, 1fr));
+          grid-auto-rows: ${MESH_GRID_ROW}px;
+          grid-auto-flow: row dense;
+          gap: ${MESH_GRID_GAP}px;
         }
         .panel {
           padding: 12px;
           box-sizing: border-box;
-          width: 360px;
-          min-width: ${MESH_CARD_MIN_WIDTH}px;
-          max-width: min(${MESH_CARD_MAX_WIDTH}px, 48vw, calc(100vw - 32px));
+          min-width: 0;
           min-height: ${MESH_CARD_MIN_HEIGHT}px;
           position: relative;
           overflow: auto;
+        }
+        .panel[data-mesh-card="topology"] {
+          display: flex;
+          flex-direction: column;
+        }
+        .panel[data-mesh-card="topology"] .topology {
+          flex: 1 1 auto;
+          display: flex;
+          flex-direction: column;
+          min-height: 0;
+          border: 0;
+          border-radius: 0;
+          background: transparent;
+        }
+        .panel[data-mesh-card="topology"] .topology svg {
+          flex: 0 0 auto;
+          height: auto;
+          min-height: 0;
+        }
+        .panel.mesh-card-sized[data-mesh-card="topology"] .topology svg {
+          flex: 1 1 auto;
+          min-height: 240px;
         }
         .mesh-layout-help {
           display: flex;
@@ -1074,8 +1146,7 @@ class MeshNetPanel extends HTMLElement {
           justify-content: space-between;
           gap: 8px;
           box-sizing: border-box;
-          width: 360px;
-          max-width: calc(100vw - 32px);
+          margin-bottom: 12px;
           color: var(--secondary-text-color);
           font-size: 11px;
         }
@@ -1316,43 +1387,44 @@ class MeshNetPanel extends HTMLElement {
         }
         text { fill: var(--primary-text-color); font-size: 12px; }
         @media (max-width: 900px) {
-          .wrap { grid-template-columns: 1fr; padding: 10px; }
-          .side { width: 100%; }
-          .mesh-layout-help { width: 100%; max-width: 100%; }
+          .wrap { padding: 10px; }
+          .side { grid-template-columns: 1fr; grid-auto-rows: auto; grid-auto-flow: row; }
           .panel[data-mesh-card] {
-            min-width: 0;
-            width: 100% !important;
+            grid-column: auto !important;
+            grid-row: auto !important;
             height: auto !important;
-            max-width: 100%;
           }
           .mesh-card-resize-handle { display: none; }
           .stats { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
-          .topology svg { min-height: 360px; height: 56vh; }
+          .panel[data-mesh-card="topology"] .topology svg { min-height: 360px; height: 56vh; }
         }
       </style>
       <div class="wrap">
-        <main>
-          <div class="toolbar">
-            <h1>MeshNet</h1>
-            <div class="toolbar-actions">
-              <a class="map-link" href="/map">Map · ${locatedNodeCount} cached locations</a>
-              <span class="${this._error ? "bad" : "good"}">${this._escape(this._error || "Snapshot current")}</span>
+        <div class="toolbar">
+          <h1>MeshNet</h1>
+          <div class="toolbar-actions">
+            <a class="map-link" href="/map">Map · ${locatedNodeCount} cached locations</a>
+            <span class="${this._error ? "bad" : "good"}">${this._escape(this._error || "Snapshot current")}</span>
+          </div>
+        </div>
+        ${this._viewTabs()}
+        <div class="mesh-layout-help">
+          <span>Every card, including the topology graph, can be dragged by its handle onto any other card or moved with its arrows, so cards sit beside or under the graph. Resize from the corner on wider screens; cards snap to the grid. Layout is saved only in this browser; Reset removes it.</span>
+          <button class="mesh-layout-reset" id="meshnet-layout-reset" type="button">Reset</button>
+        </div>
+        <div class="side" id="meshnet-mesh-cards">
+          <section class="panel" data-mesh-card="topology">
+            ${this._graph(topology)}
+          </section>
+          <section class="panel" data-mesh-card="overview">
+            <h2>Overview</h2>
+            <div class="stats">
+              ${this._stat("Nodes", nodes.length)}
+              ${this._stat("Recently seen", nodes.filter((node) => node.online).length)}
+              ${this._stat("Gateways", gateways.filter((gateway) => gateway.connected).length + "/" + gateways.length)}
+              ${this._stat("Cached health", snapshot.mesh_health_score == null ? "n/a" : snapshot.mesh_health_score + "%")}
             </div>
-          </div>
-          ${this._viewTabs()}
-          <div class="stats">
-            ${this._stat("Nodes", nodes.length)}
-            ${this._stat("Recently seen", nodes.filter((node) => node.online).length)}
-            ${this._stat("Gateways", gateways.filter((gateway) => gateway.connected).length + "/" + gateways.length)}
-            ${this._stat("Cached health", snapshot.mesh_health_score == null ? "n/a" : snapshot.mesh_health_score + "%")}
-          </div>
-          ${this._graph(topology)}
-        </main>
-        <aside class="side" id="meshnet-mesh-cards">
-          <div class="mesh-layout-help">
-            <span>Drag or use arrows to reorder. Resize from the corner on wider screens. Layout is saved only in this browser; Reset removes it.</span>
-            <button class="mesh-layout-reset" id="meshnet-layout-reset" type="button">Reset</button>
-          </div>
+          </section>
           <section class="panel" data-mesh-card="send-message">
             <h2>Send message</h2>
             <form class="composer" id="meshnet-send-form">
@@ -1475,7 +1547,7 @@ class MeshNetPanel extends HTMLElement {
               }).join("") || `<div class="label">Waiting for RSSI/SNR packets</div>`}
             </div>
           </section>
-        </aside>
+        </div>
       </div>
     `;
     this._safeStep("bind_views", "binding", () => this._bindViewControls());
@@ -6731,8 +6803,8 @@ class MeshNetPanel extends HTMLElement {
       || rootKeys[2] !== "sizes"
       || value.schema_version !== MESH_LAYOUT_SCHEMA_VERSION
       || !Array.isArray(value.order)
-      || value.order.length !== MESH_CARD_IDS.length
-      || new Set(value.order).size !== MESH_CARD_IDS.length
+      || value.order.length > MESH_CARD_IDS.length
+      || new Set(value.order).size !== value.order.length
       || value.order.some((cardId) => !this._isMeshCardId(cardId))
       || !value.sizes
       || typeof value.sizes !== "object"
@@ -6761,7 +6833,18 @@ class MeshNetPanel extends HTMLElement {
       ) return null;
       sizes.set(cardId, { width: size.width, height: size.height });
     }
-    return { order: [...value.order], sizes };
+    return { order: this._completeMeshCardOrder(value.order), sizes };
+  }
+
+  _completeMeshCardOrder(order) {
+    // A card added by a newer release joins a saved layout at its default
+    // position instead of discarding the operator's arrangement.
+    const next = [...order];
+    MESH_CARD_IDS.forEach((cardId, index) => {
+      if (next.includes(cardId)) return;
+      next.splice(Math.min(index, next.length), 0, cardId);
+    });
+    return next;
   }
 
   _removeStoredMeshCardLayout(storage = null) {
@@ -6908,9 +6991,7 @@ class MeshNetPanel extends HTMLElement {
     if (!this._isMeshCardId(cardId) || typeof this.querySelector !== "function") return;
     const card = this.querySelector(`[data-mesh-card="${cardId}"]`);
     if (!card || !card.style) return;
-    const size = this._meshCardSizes.get(cardId);
-    card.style.width = size ? `${size.width}px` : "";
-    card.style.height = size ? `${size.height}px` : "";
+    this._fitMeshCards([[cardId, card]], this._meshGridColumns(this.querySelector("#meshnet-mesh-cards")));
   }
 
   _applyMeshCardOrder() {
@@ -6923,11 +7004,71 @@ class MeshNetPanel extends HTMLElement {
     const byId = new Map(cards.map(
       (card) => [card.getAttribute("data-mesh-card"), card],
     ));
+    const ordered = [];
     for (const cardId of this._orderedMeshCards([...byId.keys()])) {
       const card = byId.get(cardId);
-      if (card && typeof container.appendChild === "function") container.appendChild(card);
-      this._applyMeshCardSize(cardId);
+      if (!card) continue;
+      if (typeof container.appendChild === "function") container.appendChild(card);
+      ordered.push([cardId, card]);
     }
+    this._fitMeshCards(ordered, this._meshGridColumns(container));
+  }
+
+  _meshGridColumns(container) {
+    const width = container && typeof container.clientWidth === "number" ? container.clientWidth : NaN;
+    if (!Number.isFinite(width) || width <= 0) return null;
+    return Math.max(1, Math.floor((width + MESH_GRID_GAP) / (MESH_GRID_COLUMN + MESH_GRID_GAP)));
+  }
+
+  _meshCardDefaultColumns(cardId, columns) {
+    if (cardId === "topology") {
+      return Math.max(MESH_CARD_DEFAULT_COLUMNS, (columns || 6) - MESH_CARD_DEFAULT_COLUMNS);
+    }
+    return MESH_CARD_DEFAULT_COLUMNS;
+  }
+
+  _meshCardDefaultRows(cardId) {
+    return cardId === "topology" ? 10 : 4;
+  }
+
+  _fitMeshCards(entries, columns) {
+    const spanColumns = (width) => Math.max(
+      1,
+      Math.round((width + MESH_GRID_GAP) / (MESH_GRID_COLUMN + MESH_GRID_GAP)),
+    );
+    const spanRows = (height) => Math.max(
+      MESH_CARD_MIN_ROWS,
+      Math.ceil((height + MESH_GRID_GAP) / (MESH_GRID_ROW + MESH_GRID_GAP)),
+    );
+    const unsized = [];
+    for (const [cardId, card] of entries) {
+      if (!card || !card.style || !this._isMeshCardId(cardId)) continue;
+      const size = this._meshCardSizes.get(cardId);
+      let span = size ? spanColumns(size.width) : this._meshCardDefaultColumns(cardId, columns);
+      if (columns) span = Math.min(span, columns);
+      card.style.gridColumn = `span ${span}`;
+      if (card.classList && typeof card.classList.toggle === "function") {
+        card.classList.toggle("mesh-card-sized", Boolean(size));
+      }
+      if (size) {
+        card.style.gridRow = `span ${spanRows(size.height)}`;
+      } else {
+        // Measure the natural content height in one pass after every column
+        // span is known, so a reflow happens once rather than once per card.
+        card.style.gridRow = "span 1";
+        unsized.push([cardId, card]);
+      }
+    }
+    const heights = unsized.map(([, card]) => (
+      typeof card.scrollHeight === "number" ? card.scrollHeight : NaN
+    ));
+    unsized.forEach(([cardId, card], index) => {
+      const height = heights[index];
+      const rows = Number.isFinite(height) && height > 0
+        ? spanRows(height + 2)
+        : this._meshCardDefaultRows(cardId);
+      card.style.gridRow = `span ${rows}`;
+    });
   }
 
   _resetMeshCardLayout() {
@@ -6947,6 +7088,14 @@ class MeshNetPanel extends HTMLElement {
       </div>
       <button type="button" class="mesh-card-resize-handle" data-mesh-resize-handle="${cardId}" aria-label="Resize ${this._escape(label)} card" title="Drag to resize; arrow keys resize">↘</button>
     `;
+  }
+
+  _meshDropAfter(event, rect) {
+    // Cards sit beside as well as below each other, so split the target on
+    // its diagonal: the top-left half inserts before, the bottom-right after.
+    const relativeX = rect && rect.width > 0 ? (event.clientX - rect.left) / rect.width : 0.5;
+    const relativeY = rect && rect.height > 0 ? (event.clientY - rect.top) / rect.height : 0.5;
+    return relativeX + relativeY >= 1;
   }
 
   _captureMeshCardScrollState() {
@@ -7127,7 +7276,7 @@ class MeshNetPanel extends HTMLElement {
         if (!this._meshLayoutInteraction || this._meshLayoutInteraction.kind !== "drag") return;
         event.preventDefault();
         const rect = card.getBoundingClientRect();
-        card.dataset.meshDropAfter = String(event.clientY >= rect.top + rect.height / 2);
+        card.dataset.meshDropAfter = String(this._meshDropAfter(event, rect));
       });
       card.addEventListener("drop", (event) => {
         if (!this._meshLayoutInteraction || this._meshLayoutInteraction.kind !== "drag") return;

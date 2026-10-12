@@ -8,9 +8,14 @@ identity** card that reads the gateway radio's public key locally, through
 the new administrator-only `meshnet/remote_admin/controller` command, so the
 key can be copied and added to a remote node before the first
 **Load / test access**. Nothing is sent over the mesh for that read and the
-private key never leaves the radio. The Mesh view's saved card layout no
-longer has a remote-admin card; a layout saved by an earlier version is
-discarded once and the default order returns.
+private key never leaves the radio.
+
+The Mesh view becomes one dense card grid. The topology graph and the
+overview tiles are now cards, so every card can be dragged beside, under, or
+above the graph, and resizing snaps to grid cells. A layout saved by 0.13.1
+or earlier is discarded once because it names the removed remote-admin card;
+from 0.13.2 on, a card added by a newer release joins a saved layout at its
+default position instead of resetting it.
 
 Both settings editors now render each category as a collapsed section with
 its editable and read-only counts and a **Changed** badge, grouped under
