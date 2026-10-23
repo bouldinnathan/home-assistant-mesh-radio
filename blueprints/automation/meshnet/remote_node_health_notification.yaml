@@ -1,0 +1,139 @@
+blueprint:
+  name: MeshNet remote node health and firmware notification
+  description: >-
+    Check one maintained Meshtastic node using fresh encrypted metadata through
+    a Bluetooth gateway. A missing reply is checked again five minutes later.
+    Gateway/authentication failures are reported separately from a missing node
+    response. Optionally compare firmware with a minimum release you approve.
+    Creates or updates one persistent notification and dismisses it when checks
+    pass. Optional notification actions run on each check that needs attention.
+    This automation does not reboot, reset, or update firmware.
+  domain: automation
+  source_url: https://github.com/bouldinnathan/home-assistant-mesh-radio/blob/main/blueprints/automation/meshnet/remote_node_health_notification.yaml
+  input:
+    gateway_id:
+      name: Gateway ID
+      description: Exact configured Meshtastic Bluetooth gateway ID.
+      selector:
+        text: {}
+    target_node:
+      name: Remote node ID
+      description: One exact lowercase ID, such as !1234abcd. The gateway must be authorized on this node.
+      selector:
+        text: {}
+    check_interval:
+      name: Check interval
+      default: "/6"
+      selector:
+        select:
+          options:
+            - {label: Every hour, value: "/1"}
+            - {label: Every 3 hours, value: "/3"}
+            - {label: Every 6 hours, value: "/6"}
+            - {label: Every 12 hours, value: "/12"}
+    check_minute:
+      name: Minute of the hour
+      description: Stagger different nodes and avoid scheduled reboot times. Probes share a one-minute mesh rate limit.
+      default: 17
+      selector:
+        number:
+          min: 0
+          max: 59
+          mode: box
+    minimum_firmware:
+      name: Minimum approved firmware (optional)
+      description: A release such as 2.7.11. Leave empty for responsiveness only. Custom or unknown versions are reported as unknown.
+      default: ""
+      selector:
+        text: {}
+    notify_actions:
+      name: Additional notification actions (optional)
+      description: >-
+        Add a phone notification or another action. Templates can use
+        notification_title, notification_message, and notification_id.
+        These actions repeat at the check interval while attention is needed.
+      default: []
+      selector:
+        action: {}
+mode: single
+max_exceeded: silent
+triggers:
+  - trigger: time_pattern
+    hours: !input check_interval
+    minutes: !input check_minute
+variables:
+  gateway_id: !input gateway_id
+  target_node: !input target_node
+  minimum_firmware: !input minimum_firmware
+  notification_id: "{{ 'meshnet_health_' ~ gateway_id ~ '_' ~ target_node }}"
+  health: {status: not_checked, reason: check_failed, firmware_status: unknown, firmware_version: null}
+actions:
+  - action: meshnet.check_remote_node
+    data:
+      gateway_id: !input gateway_id
+      target_node: !input target_node
+      minimum_firmware: !input minimum_firmware
+    response_variable: health
+    continue_on_error: true
+  # Keep the report in the same variable scope as the most recent response.
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ health.status == 'no_response' }}"
+        sequence:
+          - delay: "00:05:00"
+          - variables:
+              health: {status: not_checked, reason: check_failed, firmware_status: unknown, firmware_version: null}
+          - action: meshnet.check_remote_node
+            data:
+              gateway_id: !input gateway_id
+              target_node: !input target_node
+              minimum_firmware: !input minimum_firmware
+            response_variable: health
+            continue_on_error: true
+          - choose: []
+            default: &report_health
+              # A busy mesh is not a node failure. Keep the previous alert until a real check.
+              - condition: template
+                value_template: "{{ health.get('reason') != 'remote_admin_rate_limited' }}"
+              - variables:
+                  needs_attention: "{{ health.status != 'responding' or (minimum_firmware != '' and health.firmware_status != 'current') }}"
+                  notification_title: >-
+                    {% if health.status == 'no_response' %}MeshNet remote node not responding
+                    {% elif health.status != 'responding' %}MeshNet remote health check unavailable
+                    {% elif health.firmware_status == 'outdated' %}MeshNet remote firmware needs maintenance
+                    {% else %}MeshNet remote firmware unknown{% endif %}
+                  notification_message: >-
+                    {% if health.status == 'no_response' %}
+                      {{ target_node }} did not reply to the latest health check through
+                      {{ gateway_id }}. A missing reply can mean a sleeping node or a mesh
+                      route problem; it does not prove the node is powered off. Inspect the
+                      route, power, and expected sleep schedule. No reboot was sent.
+                    {% elif health.status != 'responding' %}
+                      Could not check {{ target_node }} through {{ gateway_id }}
+                      ({{ health.get('reason', 'check_failed') }}). Check the gateway
+                      connection and admin authorization before diagnosing the remote node.
+                    {% elif health.firmware_status == 'outdated' %}
+                      {{ target_node }} is responding but reports {{ health.firmware_version }},
+                      below your approved minimum {{ minimum_firmware }}. Plan a firmware
+                      update using the supported method for this hardware.
+                    {% else %}
+                      {{ target_node }} is responding, but its firmware could not be compared
+                      with {{ minimum_firmware }}. Inspect its version manually.
+                    {% endif %}
+              - if:
+                  - condition: template
+                    value_template: "{{ needs_attention }}"
+                then:
+                  - action: persistent_notification.create
+                    data:
+                      notification_id: "{{ notification_id }}"
+                      title: "{{ notification_title }}"
+                      message: "{{ notification_message }}"
+                  - choose: []
+                    default: !input notify_actions
+                else:
+                  - action: persistent_notification.dismiss
+                    data:
+                      notification_id: "{{ notification_id }}"
+    default: *report_health

@@ -126,14 +126,32 @@ boundary.
 
 ### Radio reboots
 
-`meshnet.reboot_gateway_radio` is the only reboot an automation can trigger,
-and it reaches only the radio physically connected to a Bluetooth gateway.
-Remote node reboots are administrator-only panel operations behind an
-explicit confirmation, use the same public-key authorization and session
-passkey as remote settings writes, are sent exactly once, and are never
-retried after a timeout. Serial, TCP, and MQTT gateways cannot reboot radios,
-for the same reason they cannot write settings. Reboot counters appear in
-diagnostics without node identities.
+`meshnet.reboot_gateway_radio` reaches only the radio physically connected to
+a Bluetooth gateway. Remote node reboots use the same public-key authorization
+and session passkey as remote settings writes and are never retried after a
+timeout. The panel requires explicit confirmation. The separate
+`meshnet.reboot_remote_node` action requires an exact gateway, exact node ID,
+and `confirm_remote: true`; direct user calls require a Home Assistant
+administrator, and system automations may call it. Creating a schedule is
+authorization for each scheduled run, so restrict who can edit or trigger
+those automations. No private key import or identity switching is involved.
+
+The automation action durably reserves the target before attempting a reboot.
+It allows at most one attempt per node per hour across gateways, including
+after an uncertain outcome or Home Assistant restart. Storage failure prevents
+the command. Manual panel reboots remain separately confirmed operations.
+Serial, TCP, and MQTT gateways cannot reboot radios, for the same reason they
+cannot write settings. Reboot counters appear in diagnostics without node
+identities. An acknowledgement is not proof that the reboot completed.
+
+`meshnet.check_remote_node` has the same administrator/system caller boundary
+and reads fresh encrypted metadata from one exact node. It shares the durable
+one-minute metadata airtime floor with traceroute and NeighborInfo. Gateway,
+authorization, and rate-limit failures are distinct from a missing reply;
+neither a missing reply nor a stale passive timestamp proves a node is off.
+The notification blueprint repeats a missing-response check after five minutes
+and never reboots or flashes firmware. Service responses omit node and gateway
+identities, incoming service logs redact them, and session keys stay internal.
 
 ## USB Permissions
 

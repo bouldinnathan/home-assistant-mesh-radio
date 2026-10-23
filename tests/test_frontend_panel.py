@@ -3294,7 +3294,11 @@ def test_remote_nodes_view_shows_gateway_key_before_any_remote_load() -> None:
   let html = good.innerHTML;
   assert.ok(html.includes('data-meshnet-view="remote" aria-current="page"'));
   assert.ok(html.includes('id="meshnet-remote-gateway-card"'));
-  assert.ok(html.includes(`id="meshnet-controller-public-key">${KEY}<`));
+  assert.ok(html.includes(`id="meshnet-controller-public-key">${KEY.slice(7)}<`));
+  assert.equal(html.includes(KEY), false, "the app-facing key must not include the CLI prefix");
+  assert.ok(html.includes('id="meshnet-controller-key-help"'));
+  assert.ok(html.includes("Security → Admin key"));
+  assert.ok(html.includes("safe to display here"));
   assert.ok(html.includes('id="meshnet-controller-key-copy"'));
   assert.ok(html.includes('id="meshnet-remote-authorize-help"'));
   assert.ok(html.includes('id="meshnet-remote-admin-panel"'));
@@ -3319,9 +3323,21 @@ def test_remote_nodes_view_shows_gateway_key_before_any_remote_load() -> None:
   let copied = null;
   Object.defineProperty(globalThis, "navigator", { configurable: true, value: { clipboard: { async writeText(value) { copied = value; } } } });
   await good._copyControllerPublicKey();
-  assert.equal(copied, KEY);
+  assert.equal(copied, KEY.slice(7));
+  assert.equal(Buffer.from(copied, "base64").length, 32, "copy only the public key bytes, without a CLI prefix");
   assert.equal(good._controllerIdentityStatus.kind, "good");
   assert.equal(good._remoteSettingsSnapshot, null);
+
+  // Manual copying uses the same app-ready value on non-HTTPS installations
+  // and when the browser declines clipboard permission.
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: {} });
+  await good._copyControllerPublicKey();
+  assert.match(good._controllerIdentityStatus.text, /copy.*manually/);
+  assert.ok(good.innerHTML.includes(`id="meshnet-controller-public-key">${KEY.slice(7)}<`));
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: { clipboard: { async writeText() { throw new Error("denied"); } } } });
+  await good._copyControllerPublicKey();
+  assert.match(good._controllerIdentityStatus.text, /denied.*copy.*manually/);
+  assert.equal(good._remoteSettingsSnapshot, null, "copying never loads a remote node");
 
   // A malformed key fails closed: nothing is shown and nothing retries by itself.
   const bad = makePanel((payload) => ({ ...identity, gateway_id: payload.gateway_id, controller: { ...identity.controller, public_key: "base64:short" } }));

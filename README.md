@@ -309,6 +309,13 @@ excluded destructive operations.
 
 ### Advanced local mesh tools
 
+Version 0.14.0 adds remote maintenance automations that schedule a reboot for one explicitly selected
+Meshtastic node and notify you when it stops responding or falls below an
+approved firmware version. The two [remote maintenance blueprints](docs/USAGE.md#maintain-remote-nodes)
+use an authorized Bluetooth gateway, check fresh responses, and never retry an
+uncertain reboot. Automated reboot attempts have a persistent one-hour per-node
+limit. No private-key import or firmware flashing is involved.
+
 Version 0.13.2 moves remote node administration to its own **Remote nodes**
 tab. Its **Gateway identity** card shows the gateway radio's public key as soon
 as the tab opens, read locally with no mesh traffic, so the key can be added to

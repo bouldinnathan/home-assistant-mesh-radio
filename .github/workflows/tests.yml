@@ -87,6 +87,8 @@ jobs:
           tests/test_remote_admin_interface.py
           tests/test_remote_admin_safety.py
           tests/test_remote_admin_websocket.py
+          tests/test_remote_health.py
+          tests/test_remote_maintenance_blueprints.py
           tests/test_sensitive_logging.py
           tests/test_entity_sensor_values.py
           tests/test_websocket_api.py

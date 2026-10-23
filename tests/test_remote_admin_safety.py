@@ -173,6 +173,8 @@ def _active_remote_client(
                     response.get_channel_response.index = max(
                         0, int(admin.get_channel_request) - 1
                     )
+                elif operation == "get_device_metadata_request":
+                    response.get_device_metadata_response.firmware_version = "2.7.11.abcdef0"
 
                 if inject_bad_correlations:
                     bad_length = admin_pb2.AdminMessage()
@@ -387,6 +389,10 @@ def test_remote_admin_is_rejected_outside_meshtastic_bluetooth(
             "remote_admin_requires_bluetooth"
         )
 
+        with pytest.raises(RuntimeError) as health_raised:
+            await gateway.async_check_remote_node(TARGET_ID)
+        assert getattr(health_raised.value, "code", None) == "remote_admin_requires_bluetooth"
+
         with pytest.raises(RuntimeError) as identity_raised:
             await gateway.async_get_remote_controller_identity()
 
@@ -557,6 +563,35 @@ def test_cached_reads_diagnostics_and_refresh_never_send_remote_admin() -> None:
         await client.async_node_snapshot()
 
         assert connection.packets == []
+
+    asyncio.run(run())
+
+
+def test_remote_health_uses_one_fresh_encrypted_correlated_read() -> None:
+    async def run() -> None:
+        client, connection = _active_remote_client(inject_bad_correlations=True)
+        result = await client.async_check_remote_node(TARGET_ID)
+        assert result == {"firmware_version": "2.7.11.abcdef0"}
+        assert connection.operations == ["get_device_metadata_request"]
+        assert connection.write_operations == []
+        assert "session_passkey" not in json.dumps(result)
+        assert TARGET_NUM in client._remote_admin_sessions
+
+        connection.operations.clear()
+        await client.async_check_remote_node(TARGET_ID)
+        assert connection.operations == ["get_device_metadata_request"]
+
+    asyncio.run(run())
+
+
+def test_remote_health_denied_is_not_reported_as_a_reply() -> None:
+    async def run() -> None:
+        client, connection = _active_remote_client(route_error="ADMIN_BAD_SESSION_KEY")
+        with pytest.raises(Exception) as raised:
+            await client.async_check_remote_node(TARGET_ID)
+        assert raised.value.code == "remote_admin_session_rejected"
+        assert len(connection.packets) == 1
+        assert connection.write_operations == []
 
     asyncio.run(run())
 

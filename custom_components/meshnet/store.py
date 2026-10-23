@@ -166,6 +166,14 @@ class MeshStore:
             )
             """
         )
+        await self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS remote_reboots (
+                target_node TEXT PRIMARY KEY,
+                next_allowed_at TEXT NOT NULL
+            )
+            """
+        )
         # Upgrade an existing database without opening a one-time gap between
         # the previously separate traceroute and NeighborInfo cooldowns.  The
         # most conservative legacy reservation wins; an expired row is
@@ -777,6 +785,55 @@ class MeshStore:
             (timestamp_to_json(when.astimezone(UTC)),),
         )
         return int(row["count"] if row else 0)
+
+    async def async_reserve_remote_reboot(
+        self, gateway_id: str, target_node: str, *, now: datetime | None = None
+    ) -> bool:
+        """Reserve before sending; retain a one-hour floor even after a crash."""
+        _, target_node = self._validated_traceroute_key(gateway_id, target_node)
+        reserved_at = self._traceroute_now(now)
+        now_text = timestamp_to_json(reserved_at)
+        next_text = timestamp_to_json(reserved_at + timedelta(hours=1))
+
+        def reserve(conn: sqlite3.Connection) -> bool:
+            def body() -> bool:
+                # Expired targets need not accumulate indefinitely.
+                conn.execute("DELETE FROM remote_reboots WHERE next_allowed_at <= ?", (now_text,))
+                cursor = conn.execute(
+                    "INSERT OR IGNORE INTO remote_reboots(target_node, next_allowed_at) VALUES(?, ?)",
+                    (target_node, next_text),
+                )
+                return cursor.rowcount == 1
+
+            return self._run_immediate_transaction(conn, body)
+
+        return bool(await self._run_serialized(reserve))
+
+    async def async_reserve_remote_probe(self, *, now: datetime | None = None) -> bool:
+        """Share the durable metadata airtime floor with other mesh probes."""
+        reserved_at = self._traceroute_now(now)
+        now_text = timestamp_to_json(reserved_at)
+        next_text = timestamp_to_json(reserved_at + timedelta(seconds=60))
+
+        def reserve(conn: sqlite3.Connection) -> bool:
+            def body() -> bool:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO metadata_airtime(scope, reserved_at, next_allowed_at, operation)
+                    VALUES('integration', ?, ?, 'remote_health')
+                    ON CONFLICT(scope) DO UPDATE SET
+                        reserved_at=excluded.reserved_at,
+                        next_allowed_at=excluded.next_allowed_at,
+                        operation=excluded.operation
+                    WHERE metadata_airtime.next_allowed_at <= excluded.reserved_at
+                    """,
+                    (now_text, next_text),
+                )
+                return cursor.rowcount == 1
+
+            return self._run_immediate_transaction(conn, body)
+
+        return bool(await self._run_serialized(reserve))
 
     async def async_reserve_traceroute(
         self,

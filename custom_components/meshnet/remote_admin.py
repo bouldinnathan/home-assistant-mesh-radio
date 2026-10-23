@@ -27,6 +27,7 @@ from .const import (
     PROTOCOL_MESHTASTIC,
     TRANSPORT_BLUETOOTH,
 )
+from .remote_health import approved_firmware, firmware_status
 from .settings_contracts import preview_warning, remote_write_allowed
 from .settings_help import setting_help, setting_unit
 
@@ -75,6 +76,7 @@ _PUBLIC_ERROR_MESSAGES = {
         "The requested remote-admin operation is not supported"
     ),
     "remote_admin_unknown_outcome": ("The remote write could not be verified; do not repeat it blindly"),
+    "remote_admin_reboot_cooldown": "An automated reboot was already attempted for this node within the last hour",
 }
 _PASSTHROUGH_PROVIDER_CODES = frozenset(
     {
@@ -181,6 +183,47 @@ class RemoteAdminManager:
                 "gateway_id": gateway_id,
                 "controller": self._project_controller(raw),
             }
+
+    async def async_check(
+        self, gateway_id: str, target_node: str, *, minimum_firmware: str = ""
+    ) -> dict[str, Any]:
+        """Observe one exact remote node; lack of a reply is not proof it is off."""
+        gateway_id = self._validate_gateway_id(gateway_id)
+        target_node = self._validate_target(target_node)
+        minimum_firmware = approved_firmware(minimum_firmware)
+        result: dict[str, Any] = {
+            "schema_version": 1,
+            "gateway_id": gateway_id,
+            "target_node": target_node,
+            "checked_at": datetime.now(UTC).isoformat(),
+            "status": "not_checked",
+            "reason": None,
+            **firmware_status(None, minimum_firmware),
+        }
+        try:
+            async with self._operation(gateway_id):
+                gateway = self._gateway(gateway_id)
+                checker = getattr(gateway, "async_check_remote_node", None)
+                if not callable(checker):
+                    raise RemoteAdminError("remote_admin_unavailable")
+                key = (gateway_id, target_node)
+                async with self._locks.setdefault(key, asyncio.Lock()):
+                    if not await self._coordinator.store.async_reserve_remote_probe():
+                        result["reason"] = "remote_admin_rate_limited"
+                        return result
+                    raw = await checker(target_node)
+                if not isinstance(raw, Mapping):
+                    raise RemoteAdminError("remote_admin_snapshot_invalid")
+                result.update(firmware_status(raw.get("firmware_version"), minimum_firmware))
+                result["status"] = "responding"
+        except Exception as err:
+            code = getattr(err, "code", None)
+            if not isinstance(code, str) or code not in _PUBLIC_ERROR_MESSAGES:
+                code = "remote_admin_unavailable"
+            result["reason"] = code
+            if code in {"remote_admin_no_response", "remote_admin_no_route"}:
+                result["status"] = "no_response"
+        return result
 
     async def async_preview(
         self,

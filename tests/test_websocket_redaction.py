@@ -6,6 +6,8 @@ import json
 import logging
 from types import SimpleNamespace
 
+import pytest
+
 from custom_components.meshnet.websocket_redaction import (
     _MeshNetWebSocketRedactionFilter,
     install_websocket_secret_redaction,
@@ -197,8 +199,10 @@ def test_filter_redacts_send_message_inside_batch() -> None:
     assert command["message"] == "batched private message"
 
 
-def test_filter_redacts_meshnet_call_service_payload_without_mutation() -> None:
+@pytest.mark.parametrize("service", ["send_message", "check_remote_node", "reboot_remote_node"])
+def test_filter_redacts_meshnet_call_service_payload_without_mutation(service: str) -> None:
     command = _service_command("private service message")
+    command["service"] = service
     original_data = dict(command["service_data"])
     record = logging.LogRecord(
         "homeassistant.components.websocket_api.http.connection",

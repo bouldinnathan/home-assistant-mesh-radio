@@ -1391,6 +1391,21 @@ class MeshtasticClient(MeshGateway):
             )
         return await self._async_run_bluetooth_operation(apply_plan(target_node, changes))
 
+    async def async_check_remote_node(self, target_node: str) -> dict[str, Any]:
+        """Read fresh remote metadata through the owned Bluetooth client."""
+        from .aiomeshtastic.errors import MeshtasticRemoteAdminError
+
+        if self.config.transport != TRANSPORT_BLUETOOTH:
+            raise MeshtasticRemoteAdminError(
+                "remote_admin_requires_bluetooth",
+                "Remote administration requires a Meshtastic Bluetooth gateway",
+            )
+        client = getattr(self._ble_transport, "_client", None)
+        check = getattr(client, "async_check_remote_node", None)
+        if not callable(check):
+            raise MeshtasticRemoteAdminError("remote_admin_unavailable", "Remote health checks are unavailable")
+        return await self._async_run_bluetooth_operation(check(target_node))
+
     async def async_reboot_radio(self, *, delay_seconds: int = 5) -> dict[str, Any]:
         """Delegate one explicit reboot of the connected radio to the BLE client.
 

@@ -1743,11 +1743,12 @@ class MeshNetPanel extends HTMLElement {
       keyHtml = `
             <div class="field-help">Controller ${this._escape(this._remoteControllerLabel(identity))}</div>
             <label>Controller public key (copy-only)
-              <code class="controller-key" id="meshnet-controller-public-key">${this._escape(identity.public_key)}</code>
+              <code class="controller-key" id="meshnet-controller-public-key">${this._escape(this._controllerPublicKeyForApp(identity))}</code>
             </label>
             <div class="operator-actions">
               <button class="operator-button" id="meshnet-controller-key-copy" type="button">Copy controller public key</button>
-            </div>`;
+            </div>
+            <div class="field-help" id="meshnet-controller-key-help">On each remote node you maintain, paste this into <strong>Security → Admin key</strong> and save. Keep that remote node’s own <strong>Public key</strong> and <strong>Private key</strong> fields unchanged.</div>`;
     } else if (this._controllerIdentityBusy) {
       keyHtml = '<div class="field-help">Reading the gateway radio’s public key…</div>';
     } else if (selectedGateway) {
@@ -1761,7 +1762,7 @@ class MeshNetPanel extends HTMLElement {
     return `
       <section class="settings-card" id="meshnet-remote-gateway-card">
         <h2>Gateway identity</h2>
-        <div class="field-help">The gateway radio has exactly one key pair. A remote node accepts changes only from a radio whose public key is on its admin key list, so this public key is added to each remote node once. MeshNet never handles the private key.</div>
+        <div class="field-help">This public key is safe to display here. It cannot authorize commands by itself; the gateway uses its matching private key, which is never displayed or exported here. Add this public key to each remote node’s admin key list to allow maintenance from this gateway.</div>
         <div class="operator-controls">
           <label>Gateway
             <select id="meshnet-remote-gateway"${compatibleGateways.length ? "" : " disabled"}>
@@ -5100,8 +5101,8 @@ class MeshNetPanel extends HTMLElement {
       return;
     }
     try {
-      await clipboard.writeText(identity.public_key);
-      this._controllerIdentityStatus = { kind: "good", text: "Controller public key copied." };
+      await clipboard.writeText(this._controllerPublicKeyForApp(identity));
+      this._controllerIdentityStatus = { kind: "good", text: "Controller public key copied. Paste it into an Admin key slot on the remote node." };
     } catch (error) {
       this._recordFailure("remote_control_event", "lifecycle", error);
       this._controllerIdentityStatus = {
@@ -5110,6 +5111,12 @@ class MeshNetPanel extends HTMLElement {
       };
     }
     this._safeRender("render");
+  }
+
+  _controllerPublicKeyForApp(identity) {
+    // The API uses the CLI's typed-byte prefix; app Admin key fields expect
+    // plain Base64. Keep the visible/manual-copy and clipboard values equal.
+    return this._sanitizeControllerPublicKey(identity.public_key).slice(7);
   }
 
   _remoteSettingsChanges() {

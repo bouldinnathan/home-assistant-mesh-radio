@@ -139,3 +139,38 @@ reboot_gateway_radio:
           max: 300
           unit_of_measurement: s
           mode: box
+
+check_remote_node:
+  fields:
+    gateway_id:
+      required: true
+      selector:
+        text:
+    target_node:
+      required: true
+      example: "!1234abcd"
+      selector:
+        text:
+    minimum_firmware:
+      required: false
+      default: ""
+      example: "2.7.11"
+      selector:
+        text:
+
+reboot_remote_node:
+  fields:
+    gateway_id:
+      required: true
+      selector:
+        text:
+    target_node:
+      required: true
+      example: "!1234abcd"
+      selector:
+        text:
+    confirm_remote:
+      required: true
+      default: false
+      selector:
+        boolean:

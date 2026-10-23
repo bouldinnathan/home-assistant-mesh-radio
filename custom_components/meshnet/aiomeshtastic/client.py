@@ -938,6 +938,25 @@ class MeshtasticBluetoothClient:
             raise self._remote_error("remote_admin_no_response") from None
         return self._remote_public_snapshot(target_num, target, state)
 
+    async def async_check_remote_node(self, target_node: str) -> dict[str, Any]:
+        """Request fresh encrypted device metadata once, without settings writes."""
+        target_num, _target, target_key = self._remote_admin_target(target_node)
+        lock = self._remote_admin_locks.setdefault(target_num, asyncio.Lock())
+        try:
+            async with lock:
+                async with asyncio.timeout(_REMOTE_ADMIN_TIMEOUT_SECONDS):
+                    request = admin_pb2.AdminMessage()
+                    request.get_device_metadata_request = True
+                    response = await self._async_remote_admin_request_locked(
+                        target_num,
+                        request,
+                        target_key=target_key,
+                        expected_response="get_device_metadata_response",
+                    )
+        except TimeoutError:
+            raise self._remote_error("remote_admin_no_response") from None
+        return {"firmware_version": response.get_device_metadata_response.firmware_version}
+
     async def async_apply_remote_settings_plan(
         self,
         target_node: str,

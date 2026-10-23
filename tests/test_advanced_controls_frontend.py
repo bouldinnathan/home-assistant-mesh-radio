@@ -23,8 +23,9 @@ def test_remote_admin_and_traceroute_are_visible_explicit_controls_only() -> Non
         assert command in source
     assert "Controller public key" in source
     assert "copy-only" in source.casefold()
-    assert "Private key" not in source
-    assert "admin key slot" not in source.casefold()
+    # Help text can name the remote app's fields; MeshNet exposes no key setters.
+    assert "private_key" not in source
+    assert "config.security.admin_key" not in source
     assert "sessionStorage" not in source
     persistence = source[
         source.index("  _persistMeshCardLayout()") : source.index("  _orderedMeshCards(")

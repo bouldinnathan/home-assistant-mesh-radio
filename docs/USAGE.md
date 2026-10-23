@@ -196,11 +196,16 @@ put the gateway's public key on that list:
    read from the gateway over Bluetooth, sends nothing over the mesh, and is
    copy-only; MeshNet never handles the controller private key. The collapsed
    **How a remote node authorizes this gateway** note repeats these steps.
-2. Press **Copy controller public key**.
+2. Press **Copy controller public key**. The displayed and copied value is plain
+   Base64, ready to paste into the Meshtastic app. It is safe to display the
+   public key; it does not permit administration without the matching private
+   key. If the browser blocks clipboard access, select and copy the displayed
+   text manually.
 3. With the Meshtastic app connected to the remote node, open **Radio
    configuration -> Security**, paste the key into a free **Admin key** slot,
-   and save. The CLI equivalent is `meshtastic --set security.admin_key
-   base64:<key>`.
+   and save. Keep the remote node's own **Public key** and **Private key** fields
+   unchanged. For the CLI, add the `base64:` prefix exactly once:
+   `meshtastic --set security.admin_key "base64:<copied-public-key>"`.
 4. Back in the **Remote nodes** tab, select the exact target in **Remote node
    administration** and press **Load / test access**. A successful load proves
    the authorization and shows the node's settings; a load before the key is
@@ -438,7 +443,7 @@ If the gateway is offline, MeshNet queues the message and replays it when a conn
 
 ### Blueprints
 
-Two blueprints ship in the repository. Import each one in Home Assistant under
+Blueprints ship in the repository. Import one in Home Assistant under
 **Settings -> Automations & scenes -> Blueprints -> Import blueprint** by
 pasting its URL:
 
@@ -446,6 +451,15 @@ pasting its URL:
   `https://github.com/bouldinnathan/home-assistant-mesh-radio/blob/main/blueprints/automation/meshnet/scheduled_gateway_radio_reboot.yaml`
 - Gateway offline notification:
   `https://github.com/bouldinnathan/home-assistant-mesh-radio/blob/main/blueprints/automation/meshnet/gateway_offline_notification.yaml`
+- Scheduled remote node reboot:
+  `https://github.com/bouldinnathan/home-assistant-mesh-radio/blob/main/blueprints/automation/meshnet/scheduled_remote_node_reboot.yaml`
+- Remote node health and firmware notification:
+  `https://github.com/bouldinnathan/home-assistant-mesh-radio/blob/main/blueprints/automation/meshnet/remote_node_health_notification.yaml`
+
+When testing unpublished changes, copy the chosen YAML file from this checkout
+into Home Assistant's `blueprints/automation/meshnet/` directory instead of
+importing the repository URL. Install the matching integration code and reload
+Home Assistant before creating an automation from the blueprint.
 
 The reboot blueprint calls `meshnet.reboot_gateway_radio` at a time you pick
 and skips the reboot while the gateway is offline. Meshtastic firmware has no
@@ -459,10 +473,51 @@ repair, which names the action to take.
 
 `meshnet.reboot_gateway_radio` reboots the radio behind a Bluetooth gateway
 from **Developer tools -> Actions** or any automation. Remote nodes are
-rebooted from the panel instead: open the **Remote nodes** tab, load
+also rebooted from the panel: open the **Remote nodes** tab, load
 the node, expand **Reboot this node**, confirm, and send. Remote reboots need
-the same admin authorization as remote settings writes and are never
-available to automations.
+the same admin authorization as remote settings writes. The administrator-only
+`meshnet.reboot_remote_node` action also supports explicitly configured schedules.
+
+### Maintain remote nodes
+
+Use the two remote-node blueprints for nodes you maintain. First copy the
+controller public key from **Remote nodes** and authorize it in an Admin Key
+slot on the target using the official app or an already authorized controller.
+Load the target once to verify access. The private key remains on the gateway
+radio; there is no need to clone a node or import a private key into Home Assistant.
+
+Create one reboot automation per node, choosing its exact gateway ID, lowercase
+node ID, time, and weekdays. The default is Sunday at 04:00; choose all days for
+a daily schedule. Reboots are opt-in, not a requirement for healthy nodes.
+The blueprint requests a fresh response first, skips the reboot if that fails,
+sends one reboot command, waits three minutes by default, and checks again.
+Missed schedules are not replayed. An uncertain outcome is reported rather than
+retried, and the action enforces a durable one-hour per-node attempt limit.
+
+Create a health automation for each node you want monitored. It checks every
+six hours by default, with an optional approved minimum firmware such as
+`2.7.11` (an example, not a recommended release). It does not fetch or install
+new releases. Unknown firmware is reported separately from an outdated version.
+A missing response is checked again five minutes later before notifying you;
+an unavailable gateway or rejected admin authorization is reported as a checking
+problem. Sleeping nodes and broken routes can both cause missing replies.
+
+Stagger checks using **Minute of the hour**, and keep them away from reboot
+times. Health probes, traceroute, and NeighborInfo share a one-minute airtime
+floor. A rate-limited health run keeps the previous alert and waits for its next
+scheduled run. Choose a grace period that covers your node's normal boot time.
+
+Both blueprints create or update a persistent notification when attention is
+needed and dismiss it after a successful run. In **Additional notification
+actions**, add a Companion app notification if you want phone alerts. Use
+`{{ notification_title }}` and `{{ notification_message }}` as its title/message;
+use `{{ notification_id }}` as its notification tag to replace the same phone
+alert. Extra health notifications repeat at the check interval while attention
+is needed. Existing phone alerts are not automatically cleared.
+
+These automations handle rebooting and reporting maintenance needs. Factory
+reset, erase, and firmware flashing remain outside their scope. A fresh reply
+after a reboot establishes responsiveness, not proof the reboot occurred.
 
 Example: alert when a gateway goes offline.
 

@@ -140,6 +140,8 @@ def test_action_metadata_has_no_unsupported_target_and_is_translated() -> None:
         },
         "refresh_gateway": {"gateway_id"},
         "reboot_gateway_radio": {"gateway_id", "delay_seconds"},
+        "check_remote_node": {"gateway_id", "target_node", "minimum_firmware"},
+        "reboot_remote_node": {"gateway_id", "target_node", "confirm_remote"},
     }
     assert strings["services"] == english["services"]
     for service, fields in expected_fields.items():

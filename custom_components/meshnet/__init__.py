@@ -344,6 +344,9 @@ def _async_register_services(hass) -> None:
         schema=service_reboot_schema,
         supports_response=response_mode,
     )
+    from .remote_services import register_remote_services
+
+    register_remote_services(hass, response_mode)
 
 
 def _coerce_delay_seconds(value: Any) -> int:

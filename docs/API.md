@@ -294,6 +294,11 @@ never returns the private key. Errors use the same `remote_admin_*` codes as
 the settings commands, for example `remote_admin_requires_bluetooth` or
 `remote_admin_controller_public_key_unavailable`.
 
+The API retains the `base64:` prefix. The **Gateway identity** card displays
+and copies just the Base64 value for the Meshtastic app's **Admin key** field.
+CLI callers use the prefixed form. The key is available before loading or
+authorizing a remote node; copying it performs no remote operation.
+
 ## Remote Node Settings
 
 The three commands below are administrator-only and supported only through a
@@ -364,9 +369,9 @@ Assistant service or generic admin command for this feature.
 
 ## Remote Node Reboot
 
-Administrator-only, Bluetooth gateway only, and panel only. The node must have
-been loaded with `meshnet/remote_settings/get` first, which proves the
-controller radio is authorized on the target.
+Administrator-only and Bluetooth gateway only. The panel loads the node with
+`meshnet/remote_settings/get` first. The backend acquires an authorized session
+when needed before sending the reboot.
 
 ```json
 {
@@ -393,14 +398,67 @@ Result:
 unconfirmed reboot is never resent automatically; wait and load the node
 again. The target's cached session and loaded settings are dropped, because a
 reboot invalidates both. Errors use the same `remote_admin_*` codes as the
-settings commands. There is deliberately no Home Assistant service for remote
-reboots; only the gateway's own radio can be rebooted from an automation.
+settings commands. The separate action below supports explicit maintenance
+automations without exposing general remote configuration writes.
+
+## Remote Maintenance Actions
+
+`meshnet.check_remote_node` and `meshnet.reboot_remote_node` require an exact
+configured Bluetooth gateway and one known lowercase `!xxxxxxxx` node ID.
+Direct user calls require a Home Assistant administrator; system automations
+are allowed. No alternate gateway is selected if the specified one is offline.
+Authorize the gateway radio's public key on the remote node first.
+
+```yaml
+action: meshnet.check_remote_node
+data:
+  gateway_id: garage_radio
+  target_node: "!1234abcd"  # replace with the maintained node
+  minimum_firmware: "2.7.11"  # example approved baseline, not a recommended release
+response_variable: remote_health
+```
+
+The response contains `schema_version: 1`, `checked_at`, `status`, `reason`,
+`firmware_version`, `minimum_firmware`, and `firmware_status`. It does not return
+node identities, private keys, or session passkeys. Status is `responding` only
+after a fresh encrypted, correlated device-metadata reply; `no_response` means
+no reply or no route, and `not_checked` covers gateway, authorization, rate-limit,
+or other checking failures. The fixed `reason` code explains a failure.
+
+Firmware comparison is numeric against the chosen release, not an internet
+lookup: `current` means at least that baseline, `outdated` means below it,
+`unknown` means the version could not be compared, and `not_checked` means no
+baseline was supplied. Standard versions with a commit-hash suffix are accepted;
+unrecognized/custom versions are not assumed current. A missing firmware
+version does not mean the node failed to respond. Metadata checks share the
+durable 60-second integration-wide airtime floor; a deferred check returns
+`not_checked` with `remote_admin_rate_limited` and sends nothing.
+
+```yaml
+action: meshnet.reboot_remote_node
+data:
+  gateway_id: garage_radio
+  target_node: "!1234abcd"  # replace with the maintained node
+  confirm_remote: true
+response_variable: reboot_result
+```
+
+The reboot response contains `schema_version: 1` and `status` (`acknowledged`
+or `unconfirmed`). Failures raise fixed public errors. The action reserves a
+one-hour per-target cooldown before sending, shared across gateways and retained
+across Home Assistant restarts. An uncertain attempt consumes the cooldown;
+the action never automatically retries or queues a missed reboot. A routing
+acknowledgement does not establish that the node restarted. After a grace
+period, use a fresh health check to establish that it is responding again.
+
+See [remote maintenance blueprints](USAGE.md#maintain-remote-nodes) for schedules,
+follow-up checks, and persistent or phone notifications.
 
 ## Reboot Gateway Radio Action
 
 `meshnet.reboot_gateway_radio` sends one reboot command to the Meshtastic radio
-behind a Bluetooth gateway. It is the only reboot path an automation may call
-and exists so a hung radio Bluetooth stack can be cleared on a schedule.
+behind a Bluetooth gateway. Use the separate remote-node action above for
+nodes reached over the mesh.
 
 ```yaml
 action: meshnet.reboot_gateway_radio

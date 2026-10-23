@@ -319,8 +319,8 @@ def test_remote_admin_quiesce_cancels_active_work_and_fences_new_requests() -> N
     asyncio.run(run())
 
 
-def test_remote_admin_has_no_service_or_automatic_callsite() -> None:
-    """Remote RF administration is administrator WebSocket/panel only."""
+def test_remote_admin_has_no_generic_service() -> None:
+    """Maintenance exposes narrow check/reboot actions, never raw admin."""
     services = open("custom_components/meshnet/services.yaml", encoding="utf-8").read()
     integration = open("custom_components/meshnet/__init__.py", encoding="utf-8").read()
     assert "remote_admin:" not in services
@@ -328,7 +328,7 @@ def test_remote_admin_has_no_service_or_automatic_callsite() -> None:
 
 
 def test_remote_reboot_requires_bluetooth_confirmation_and_clears_cached_state() -> None:
-    """Remote reboot is panel-only, confirmed, one-shot, and never echoes providers."""
+    """Remote reboot is confirmed, one-shot, and never echoes providers."""
 
     async def run() -> None:
         manager, gateway = _manager()

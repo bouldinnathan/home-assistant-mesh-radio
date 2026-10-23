@@ -2807,6 +2807,15 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
             confirm_remote=confirm_remote,
         )
 
+    async def async_check_remote_node(
+        self, *, gateway_id: str, target_node: str, minimum_firmware: str = ""
+    ) -> dict[str, Any]:
+        """Check an explicitly maintained node without inferring health from silence."""
+        self._record_network_activity()
+        return await self.remote_admin.async_check(
+            gateway_id, target_node, minimum_firmware=minimum_firmware
+        )
+
     async def async_remote_reboot(
         self,
         *,
@@ -2842,8 +2851,7 @@ class MeshNetCoordinator(DataUpdateCoordinator[MeshSnapshot]):
     ) -> dict[str, Any]:
         """Send one reboot command to a gateway's own Bluetooth radio.
 
-        This is the only reboot path an automation may call. Remote nodes are
-        rebooted from the administrator panel with an explicit confirmation.
+        Remote nodes use the separate, explicitly targeted admin action.
         """
         self._record_network_activity()
         stats = self._reboot_stats()

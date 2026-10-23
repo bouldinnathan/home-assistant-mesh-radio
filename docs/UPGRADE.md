@@ -1,5 +1,28 @@
 # Upgrade Guide
 
+## From 0.13.2
+
+0.14.0 adds `meshnet.reboot_remote_node` and `meshnet.check_remote_node` actions
+for explicitly selected Meshtastic nodes through an authorized Bluetooth gateway.
+The new scheduled-reboot blueprint checks responsiveness before and after each
+reboot. Automated reboot attempts are limited to once per node per hour across
+gateways and Home Assistant restarts; an uncertain attempt is never retried.
+The health-notification blueprint checks a missing response again after five
+minutes and optionally compares firmware against a minimum release you approve.
+Gateway and authorization failures are reported separately from a missing reply.
+
+The **Remote nodes → Gateway identity** card now displays and copies the public
+key in the plain Base64 format expected by the Meshtastic app. It explains where
+to paste that key on the remote node. The API keeps its `base64:` prefix for CLI
+callers; no private key is displayed or exported.
+
+Restart Home Assistant after installing the integration and hard-refresh its
+browser tab to load the new panel. Import the new blueprints and configure one
+automation per node you maintain; upgrading does not activate any schedule.
+Existing radio identities, admin permissions, and settings are unchanged.
+The local database adds a table for the reboot cooldown automatically. See
+[remote maintenance setup](USAGE.md#maintain-remote-nodes).
+
 ## From 0.13.1
 
 0.13.2 moves **Remote node administration** out of the Mesh view into its own
@@ -66,7 +89,9 @@ radio reboot** blueprint schedules it, which is the only way to get a periodic
 reboot because Meshtastic firmware has no such setting. Remote nodes gain a
 collapsed **Reboot this node** control in the panel's remote administration
 card; it needs the same authorization and confirmation as a remote settings
-write and has no Home Assistant service on purpose. Serial, TCP, and MQTT
+write. Later remote-maintenance support adds a narrowly scoped
+`meshnet.reboot_remote_node` action for explicit schedules; see
+[remote maintenance](USAGE.md#maintain-remote-nodes). Serial, TCP, and MQTT
 gateways stay read-only for reboots, like for settings.
 
 The **MeshNet gateway issue** repair now explains the failed Bluetooth phase

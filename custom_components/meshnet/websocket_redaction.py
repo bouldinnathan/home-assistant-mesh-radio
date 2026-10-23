@@ -37,6 +37,8 @@ _SENSITIVE_MESHNET_SERVICES = frozenset(
         "broadcast_message",
         "schedule_message",
         "refresh_gateway",
+        "check_remote_node",
+        "reboot_remote_node",
     }
 )
 _SENSITIVE_SERVICE_FIELDS = frozenset({"message", "target_node", "gateway_id", "channel"})

@@ -243,13 +243,14 @@ def _maintenance_options_flow(
     """Attach the config entry using the supported HA-owned flow shape."""
     flow = MeshNetOptionsFlow()
     entry = SimpleNamespace(
+        entry_id="maintenance-test-entry",
         data={CONF_GATEWAYS: gateways},
         options=dict(options or {}),
     )
-    try:
-        flow.config_entry = entry
-    except AttributeError:
-        flow._config_entry = entry
+    flow.handler = entry.entry_id
+    flow.hass = SimpleNamespace(
+        config_entries=SimpleNamespace(async_get_known_entry=lambda entry_id: entry if entry_id == entry.entry_id else None)
+    )
     return flow
 
 

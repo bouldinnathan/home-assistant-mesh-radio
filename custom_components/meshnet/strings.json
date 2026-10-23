@@ -392,6 +392,42 @@
           "description": "Seconds the radio waits before it reboots (1 to 300)."
         }
       }
+    },
+    "check_remote_node": {
+      "name": "Check remote node",
+      "description": "Requests fresh encrypted metadata from one remote node. Returns response status and compares firmware with an optional approved minimum. Administrator or system automation only; shares the mesh metadata rate limit.",
+      "fields": {
+        "gateway_id": {
+          "name": "Gateway ID",
+          "description": "Exact configured Meshtastic Bluetooth gateway. No automatic gateway fallback."
+        },
+        "target_node": {
+          "name": "Remote node ID",
+          "description": "One exact lowercase node ID, for example !1234abcd. The node must be known to the gateway."
+        },
+        "minimum_firmware": {
+          "name": "Minimum firmware",
+          "description": "Optional approved release such as 2.7.11. Leave empty to check responsiveness only. Unknown or custom versions are not assumed current."
+        }
+      }
+    },
+    "reboot_remote_node": {
+      "name": "Reboot remote node",
+      "description": "Sends one authorized remote reboot, never retries it, and limits automation attempts to once per node per hour, including across restarts. Administrator or system automation only. Confirmed schedules authorize each future run.",
+      "fields": {
+        "gateway_id": {
+          "name": "Gateway ID",
+          "description": "Exact configured Meshtastic Bluetooth gateway. No automatic gateway fallback."
+        },
+        "target_node": {
+          "name": "Remote node ID",
+          "description": "One exact lowercase node ID, for example !1234abcd. The node must be known to the gateway."
+        },
+        "confirm_remote": {
+          "name": "Confirm remote reboot",
+          "description": "Must be enabled to authorize rebooting this exact node. A routing acknowledgement does not prove that the node rebooted."
+        }
+      }
     }
   },
   "issues": {

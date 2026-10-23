@@ -1,0 +1,134 @@
+blueprint:
+  name: MeshNet scheduled remote node reboot
+  description: >-
+    Reboot one remote Meshtastic node on selected days. The connected Bluetooth
+    gateway's public key must already be authorized on the target. Checks for a
+    fresh reply first, sends one reboot, then checks again after a grace period.
+    Creates a persistent notification if the operation cannot be confirmed.
+    Choose different times for different nodes. No missed runs are replayed.
+  domain: automation
+  source_url: https://github.com/bouldinnathan/home-assistant-mesh-radio/blob/main/blueprints/automation/meshnet/scheduled_remote_node_reboot.yaml
+  input:
+    gateway_id:
+      name: Gateway ID
+      description: Exact configured Meshtastic Bluetooth gateway ID.
+      selector:
+        text: {}
+    target_node:
+      name: Remote node ID
+      description: One exact lowercase ID, such as !1234abcd. Create one automation per maintained node.
+      selector:
+        text: {}
+    reboot_time:
+      name: Reboot time
+      default: "04:00:00"
+      selector:
+        time: {}
+    reboot_days:
+      name: Reboot days
+      default: [sun]
+      selector:
+        select:
+          multiple: true
+          options:
+            - {label: Monday, value: mon}
+            - {label: Tuesday, value: tue}
+            - {label: Wednesday, value: wed}
+            - {label: Thursday, value: thu}
+            - {label: Friday, value: fri}
+            - {label: Saturday, value: sat}
+            - {label: Sunday, value: sun}
+    grace_minutes:
+      name: Reboot grace period
+      description: Wait this long before checking for a fresh reply. A reply proves responsiveness, not that a reboot occurred.
+      default: 3
+      selector:
+        number:
+          min: 2
+          max: 30
+          mode: box
+          unit_of_measurement: min
+    notify_actions:
+      name: Additional notification actions (optional)
+      description: >-
+        Add a phone notification or another action. Templates can use
+        notification_title, notification_message, and notification_id.
+      default: []
+      selector:
+        action: {}
+mode: single
+max_exceeded: silent
+triggers:
+  - trigger: time
+    at: !input reboot_time
+conditions:
+  - condition: time
+    weekday: !input reboot_days
+variables:
+  gateway_id: !input gateway_id
+  target_node: !input target_node
+  notification_id: "{{ 'meshnet_reboot_' ~ gateway_id ~ '_' ~ target_node }}"
+  notification_title: MeshNet remote reboot needs attention
+  notification_message: "{{ target_node }}: scheduled reboot was skipped because a fresh reply could not be obtained. Check the selected gateway, route, and admin authorization."
+  needs_attention: true
+  preflight: {status: not_checked, reason: check_failed}
+  reboot_result: {status: unconfirmed}
+  postflight: {status: not_checked, reason: check_failed}
+actions:
+  - action: meshnet.check_remote_node
+    data:
+      gateway_id: !input gateway_id
+      target_node: !input target_node
+    response_variable: preflight
+    continue_on_error: true
+  - if:
+      - condition: template
+        value_template: "{{ preflight.status != 'responding' }}"
+    then:
+      - action: persistent_notification.create
+        data:
+          notification_id: "{{ notification_id }}"
+          title: "{{ notification_title }}"
+          message: "{{ notification_message }}"
+      - choose: []
+        default: !input notify_actions
+  - condition: template
+    value_template: "{{ preflight.status == 'responding' }}"
+  - action: meshnet.reboot_remote_node
+    data:
+      gateway_id: !input gateway_id
+      target_node: !input target_node
+      confirm_remote: true
+    response_variable: reboot_result
+    continue_on_error: true
+  - delay:
+      minutes: !input grace_minutes
+  - action: meshnet.check_remote_node
+    data:
+      gateway_id: !input gateway_id
+      target_node: !input target_node
+    response_variable: postflight
+    continue_on_error: true
+  - variables:
+      needs_attention: "{{ reboot_result.status != 'acknowledged' or postflight.status != 'responding' }}"
+      notification_message: >-
+        {{ target_node }}: reboot command {{ reboot_result.status }};
+        follow-up check {{ postflight.status }}
+        {% if postflight.get('reason') %}({{ postflight.reason }}){% endif %}.
+        The reboot was not retried. A missing acknowledgement does not mean
+        the command failed. Inspect the node before attempting another reboot.
+  - if:
+      - condition: template
+        value_template: "{{ needs_attention }}"
+    then:
+      - action: persistent_notification.create
+        data:
+          notification_id: "{{ notification_id }}"
+          title: "{{ notification_title }}"
+          message: "{{ notification_message }}"
+      - choose: []
+        default: !input notify_actions
+    else:
+      - action: persistent_notification.dismiss
+        data:
+          notification_id: "{{ notification_id }}"
